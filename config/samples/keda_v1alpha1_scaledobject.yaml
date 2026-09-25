@@ -1,0 +1,29 @@
+# In every member: add Plumb as one more trigger next to the existing ones. KEDA scales to
+# the maximum across triggers, so Plumb can only raise replicas. The trigger reports the
+# floor the hub asks of this cluster, and 0 (no influence) in shadow mode, once the floor
+# expires, or when the hub that set it no longer holds the fleet lease.
+#
+# external-push keeps a stream open, so a new floor activates the target (0 → N) at once
+# instead of on KEDA's next poll. Changes between non-zero counts still go through the
+# HPA sync period (15s by default).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: llm-inference
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: llm-inference
+  minReplicaCount: 2
+  maxReplicaCount: 40
+  triggers:
+    - type: prometheus            # your existing load-based trigger stays in charge
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: sum(rate(vllm:request_success_total{model_name="llama"}[2m]))
+        threshold: "4"
+    - type: external-push
+      metadata:
+        scalerAddress: plumb-scaler.plumb:6000
+        policy: llm-inference
+        policyNamespace: inference

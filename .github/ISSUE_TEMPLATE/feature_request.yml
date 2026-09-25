@@ -1,0 +1,25 @@
+name: Feature request
+description: A problem Plumb could solve, or solve better.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Plumb turns knobs other components expose (KEDA floors, cluster-level route weights) and stays out of what they do: scheduling pods, launching nodes, routing requests. See [scope](https://github.com/bluayer/plumb/blob/main/docs/architecture.md#scope-knobs-not-mechanisms).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do, and what gets in the way. Describe the problem before a solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would like Plumb to do. If it changes the API or a decision, how would it work in `shadow` mode first?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What you do today, or other ways to solve it.

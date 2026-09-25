@@ -1,0 +1,95 @@
+# Install this chart in every member cluster, with the same AdaptivePolicies everywhere.
+image:
+  repository: ghcr.io/bluayer/plumb  # one binary: `plumb agent`, `plumb scaler`
+  tag: ""                            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# This member's name: its ClusterProfile name in the other members, and its entry in
+# spec.clusters. Required.
+clusterName: ""
+
+# This cluster's Prometheus, for spec.signals (demand, saturation). Empty: no metric signals.
+prometheusURL: ""
+
+# EXPERIMENTAL. Rules rank clusters. Optionally, a model (TypeSafe Jev) is asked too:
+#   provider    "" (rules only, default), or who serves Jev:
+#               typesafe    TypeSafe's API, or any /v1/systemone server you host (set url)
+#               cloudflare  Cloudflare Workers AI; url: https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run
+#               vercel      Vercel AI Gateway
+#   mode        shadow: its pick is only recorded in the decision log, the rules decide
+#               apply:  its pick is carried out when confident enough
+# A provider's hosted default is only called when an API key is set; it receives a compact
+# per-cluster summary (replicas, room, errors, cost rank). On errors, rules rank.
+# Values and flags here may change between releases.
+model:
+  provider: ""
+  mode: shadow
+  url: ""   # "": the provider's default
+  name: ""  # "": the provider's default (jev-latest, typesafe/jev, typesafe-ai/jev)
+  timeout: 1s
+  apiKeySecret:  # exposed as PLUMB_MODEL_API_KEY (TypeSafe or AI Gateway API key, or Cloudflare API token)
+    name: ""
+    key: api-key
+
+# EXPERIMENTAL. The planner model for policies with spec.experimental.adaptive: it proposes
+# plans, Plumb validates them, and the model above (Jev) picks one. Both are needed; without
+# either, those policies follow the rules. Called in the background, at most once per
+# interval per policy, only while a member is short or the fleet is not Steady.
+#   provider    "" (none, default) or bedrock (Amazon Bedrock Converse; credentials from IRSA
+#               or EKS Pod Identity, see agent.serviceAccountAnnotations)
+planner:
+  provider: ""
+  model: ""      # e.g. a Bedrock model or inference profile id
+  region: ""     # "": the provider's default
+  endpoint: ""
+  interval: 2m
+  timeout: 1m
+
+# How this member reaches the others: ClusterProfile access providers (KEP-5339), matched
+# by name against status.accessProviders of the ClusterProfiles in this namespace. Their
+# exec commands must exist in the agent container (see agent.extraVolumes). Empty: this
+# cluster alone. Example with the cluster-inventory-api kubeconfig-secretreader plugin:
+#   - name: kubeconfig-secretreader
+#     execConfig:
+#       apiVersion: client.authentication.k8s.io/v1
+#       command: /plugins/kubeconfig-secretreader
+#       provideClusterInfo: true
+accessProviders: []
+
+agent:
+  replicas: 2        # one is elected per cluster; the other takes over on failure
+  interval: 30s      # member reports
+  hubInterval: 10s   # hub planning, while this member is the hub
+  # Decision log. "-" writes JSONL to stdout for a log shipper.
+  decisionLog: "-"
+  # E.g. eks.amazonaws.com/role-arn for IRSA, when the planner is on Bedrock.
+  serviceAccountAnnotations: {}
+  extraVolumes: []
+  extraVolumeMounts: []
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+scaler:
+  replicas: 2
+  # Serve gRPC over TLS from a kubernetes.io/tls Secret. Give KEDA the CA as caCert in a
+  # TriggerAuthentication referenced by the trigger.
+  tlsSecretName: ""
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+# Scrape /metrics with the Prometheus Operator.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}

@@ -1,0 +1,73 @@
+# Apply the same policy in every member cluster (e.g. with GitOps). Each member reports on
+# itself; the elected hub plans for all. Shadow mode (the default) records the plan in
+# status.fleet and the decision log and changes nothing. Set mode: auto to opt in.
+apiVersion: plumb-k8s.github.io/v1alpha1
+kind: AdaptivePolicy
+metadata:
+  name: llm-inference
+  namespace: inference
+spec:
+  mode: shadow
+  workload:
+    name: llm-inference
+  clusters:
+    - name: use1                   # ClusterProfile name and the agent's --cluster-name
+      nodePools: [gpu]             # only these NodePools are Plumb's: their nodes and limits
+      # region: us-east-1          # default: the nodes' topology.kubernetes.io/region
+      maxReplicas: 40
+      costRank: 0
+      backend: {name: llm-use1}    # backendRef in the route below that sends traffic here
+      weight: 70                   # share in the Steady phase, percent
+    - name: usw2
+      nodePools: [gpu]
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: reserved-gpu   # also the reserved node group; narrows gpu's nodes too
+      maxReplicas: 40
+      costRank: 10
+      backend: {name: llm-usw2}
+      weight: 30
+  # Evaluated by each member against its own Prometheus (--prometheus-url). Metric names
+  # from vLLM's vllm/v1/metrics/loggers.py; errorRate comes from your gateway.
+  signals:
+    demand: sum(rate(vllm:request_success_total{model_name="llama"}[2m]))
+    saturation: sum(vllm:num_requests_waiting{model_name="llama"})
+    saturationThreshold: "50"
+    pressure: avg(vllm:num_requests_waiting{model_name="llama"})   # per replica; traffic balances it
+    latency: histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{model_name="llama"}[2m])))
+    latencySLO: "2"            # seconds of TTFT p95
+    errorRate: sum(rate(gateway_requests_total{code=~"5.."}[2m])) / sum(rate(gateway_requests_total[2m]))
+    errorRateSLO: "0.01"
+  # How much may move: the hub computes within these limits.
+  capacity:
+    replicaCapacity: "4"   # requests/s one replica serves; weights follow ready capacity
+    step: 2                # replicas added to or released from a cluster per step
+  # A short cluster uses its own existing nodes first. LocalFirst: then its own NodePools,
+  # then other clusters' existing nodes, then their NodePools. StaticFirst: other clusters'
+  # existing nodes before its own NodePools. Given back in reverse.
+  placement: LocalFirst
+  escalation:
+    after: 2m              # the most a short cluster tries on its own before the fleet steps in
+    earlyAfter: 30s        # sooner when its NodePools cannot add nodes (or, StaticFirst, idle nodes elsewhere)
+    readyTimeout: 10m      # above this model's node launch + load time; unscheduled replicas move elsewhere after it
+    calmFor: 10m
+    cooldown: 1m
+  traffic:
+    routes:
+      - {cluster: use1, namespace: inference, name: llm}
+    stepPercent: 10
+  confidenceThresholdPercent: 90
+---
+# In every other member, one ClusterProfile per peer (usually written by your cluster
+# manager). The agent connects with the access provider whose name matches one of its
+# --clusterprofile-provider-file providers.
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ClusterProfile
+metadata:
+  name: usw2
+  namespace: plumb
+spec:
+  clusterManager: {name: my-fleet}
+# status (written by the cluster manager):
+#   accessProviders:
+#   - name: eks
+#     cluster: {server: https://XXXX.gr7.us-west-2.eks.amazonaws.com, certificate-authority-data: ...}

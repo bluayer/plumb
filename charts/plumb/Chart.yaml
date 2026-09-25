@@ -1,0 +1,12 @@
+apiVersion: v2
+name: plumb
+description: Multi-cluster adaptive capacity for inference on Karpenter, KEDA, Prometheus and Gateway API (shadow mode by default)
+type: application
+# helm push copies these into the OCI annotations org.opencontainers.image.url and .source
+# (helm v4.3.0 pkg/registry/chart.go); GHCR links the chart package to the repository by
+# the source, as it does the image by the Dockerfile's label.
+home: https://github.com/bluayer/plumb
+sources:
+  - https://github.com/bluayer/plumb
+version: 0.1.0
+appVersion: "0.1.0"
