@@ -9,4 +9,4 @@ RUN pip install --no-cache-dir ".[laya]"
 USER 65532:65532
 ENV HF_HOME=/tmp/hf
 EXPOSE 50051
-ENTRYPOINT ["python", "-m", "plumb_decision", "--address", "127.0.0.1:50051"]
+ENTRYPOINT ["python", "-m", "plumb_decision.server", "--address", "127.0.0.1:50051"]

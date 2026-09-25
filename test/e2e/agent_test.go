@@ -18,21 +18,17 @@ import (
 
 	"github.com/bluayer/agent-inference-scheduler/api/v1alpha1"
 	"github.com/bluayer/agent-inference-scheduler/internal/adapters"
-	"github.com/bluayer/agent-inference-scheduler/internal/adapters/aws/capacity"
-	k "github.com/bluayer/agent-inference-scheduler/internal/adapters/aws/karpenter"
-	"github.com/bluayer/agent-inference-scheduler/internal/adapters/aws/provisioner"
-	"github.com/bluayer/agent-inference-scheduler/internal/adapters/kube"
+	"github.com/bluayer/agent-inference-scheduler/internal/adapters/aws"
 	"github.com/bluayer/agent-inference-scheduler/internal/controller"
-	"github.com/bluayer/agent-inference-scheduler/internal/core/decisionlog"
-	"github.com/bluayer/agent-inference-scheduler/internal/core/engine"
+	"github.com/bluayer/agent-inference-scheduler/internal/core"
 	"github.com/bluayer/agent-inference-scheduler/internal/scaler"
 	"github.com/bluayer/agent-inference-scheduler/internal/scaler/externalscaler"
 )
 
 // agent runs the real reconciler in-process against the home cluster, like
-// cmd/plumb-agent, with short poll intervals.
+// `plumb agent`, with short poll intervals.
 type agent struct {
-	log    *decisionlog.Memory
+	log    *core.Memory
 	reader client.Reader
 }
 
@@ -51,21 +47,14 @@ func startAgent(t *testing.T) *agent {
 	if err != nil {
 		t.Fatal(err)
 	}
-	log := &decisionlog.Memory{}
-	hub := controller.NewHub(ctx, time.Hour)
-	factory := func(c client.Client, spec v1alpha1.RegionSpec) adapters.Region {
-		src := capacity.NewSource(c, spec.Name)
-		src.Interval = 500 * time.Millisecond
-		return adapters.Region{Name: spec.Name, Provisioner: provisioner.New(c, spec.Name), Signals: src,
-			Workloads: &kube.DeploymentObserver{Client: c, Region: spec.Name}}
-	}
-	r := &controller.Reconciler{
-		Client:   mgr.GetClient(),
-		Registry: &controller.Registry{Local: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Factory: factory},
-		Hub:      hub,
-		Engine:   engine.New(nil, log),
-		Interval: 2 * time.Second,
-	}
+	log := &core.Memory{}
+	r := &controller.Reconciler{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme,
+		Hub: controller.NewHub(ctx, time.Hour), Engine: core.NewEngine(nil, log), Interval: 2 * time.Second,
+		Factory: func(c client.Client, spec v1alpha1.RegionSpec) adapters.Region {
+			reg := aws.NewRegion(c, spec)
+			reg.Signals.(*aws.Source).Interval = 500 * time.Millisecond
+			return reg
+		}}
 	if err := r.SetupWithManager(mgr); err != nil {
 		t.Fatal(err)
 	}
@@ -86,12 +75,12 @@ func ptrTo[T any](v T) *T { return &v }
 func (e *env) nodePool(name, capacityType string, gpuLimit int64) {
 	e.t.Helper()
 	np := &unstructured.Unstructured{}
-	np.SetGroupVersionKind(k.NodePoolGVK)
+	np.SetGroupVersionKind(aws.NodePoolGVK)
 	np.SetName(name)
 	np.Object["spec"] = map[string]any{
 		"template": map[string]any{"spec": map[string]any{
 			"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"},
-			"requirements": []any{map[string]any{"key": k.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}}},
+			"requirements": []any{map[string]any{"key": aws.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}}},
 		}},
 		"limits":     map[string]any{string(gpu): fmt.Sprint(gpuLimit)},
 		"disruption": map[string]any{"consolidateAfter": "30s"},
@@ -112,14 +101,14 @@ func (e *env) ice(pool, capacityType, code string, n int) {
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("%s-%s-%d-%d", pool, e.scenario, time.Now().UnixNano()%100000, i)
 		nc := &unstructured.Unstructured{}
-		nc.SetGroupVersionKind(k.NodeClaimGVK)
+		nc.SetGroupVersionKind(aws.NodeClaimGVK)
 		nc.SetName(name)
-		nc.SetLabels(map[string]string{k.NodePoolLabelKey: pool})
+		nc.SetLabels(map[string]string{aws.NodePoolLabelKey: pool})
 		nc.Object["spec"] = map[string]any{
 			"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"},
 			"requirements": []any{
-				map[string]any{"key": k.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}},
-				map[string]any{"key": k.InstanceTypeLabelKey, "operator": "In", "values": []any{"p5.48xlarge"}},
+				map[string]any{"key": aws.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}},
+				map[string]any{"key": aws.InstanceTypeLabelKey, "operator": "In", "values": []any{"p5.48xlarge"}},
 			},
 		}
 		if err := e.cl.c.Create(ctx, nc); err != nil {
@@ -130,7 +119,7 @@ func (e *env) ice(pool, capacityType, code string, n int) {
 		ev := &corev1.Event{
 			ObjectMeta:     metav1.ObjectMeta{Name: name + ".ice", Namespace: "default"},
 			InvolvedObject: corev1.ObjectReference{Kind: "NodeClaim", Name: name, APIVersion: "karpenter.sh/v1", UID: nc.GetUID()},
-			Reason:         k.EventReasonInsufficientCapacity,
+			Reason:         aws.EventReasonInsufficientCapacity,
 			Message: fmt.Sprintf("NodeClaim %s event: creating instance, insufficient capacity, with fleet error(s), "+
 				"%s: We currently do not have sufficient p5.48xlarge capacity in the Availability Zone you requested.", name, code),
 			Type: corev1.EventTypeWarning, Count: 1, FirstTimestamp: now, LastTimestamp: now,
@@ -171,7 +160,7 @@ func (e *env) waitDecision(a *agent, match func(*v1alpha1.AdaptivePolicy) bool) 
 		if err := e.cl.c.Get(ctx, client.ObjectKey{Namespace: e.ns, Name: "llm"}, p); err != nil {
 			return false, err
 		}
-		return p.Status.LastDecision != nil && p.Status.LastDecision.Trigger == engine.TriggerICE && match(p), nil
+		return p.Status.LastDecision != nil && p.Status.LastDecision.Trigger == core.TriggerICE && match(p), nil
 	})
 	if err != nil {
 		e.t.Fatalf("decision not reached: status=%+v lastDecision=%+v", p.Status.Conditions, p.Status.LastDecision)
@@ -203,7 +192,7 @@ func TestAgentStaticFirst(t *testing.T) {
 	a := startAgent(t)
 	e.policy(v1alpha1.ModeShadow, region("home", 10))
 
-	e.ice("gpu", "on-demand", k.CodeInsufficientInstanceCapacity, 1)
+	e.ice("gpu", "on-demand", aws.CodeInsufficientInstanceCapacity, 1)
 	p := e.waitDecision(a, func(p *v1alpha1.AdaptivePolicy) bool { return true })
 	if d := p.Status.LastDecision; d.Action != "use_static" || d.Source != "guardrail" {
 		t.Fatalf("decision = %+v", d)
@@ -211,7 +200,7 @@ func TestAgentStaticFirst(t *testing.T) {
 	if f := floor(p, "home"); f != 0 {
 		t.Fatalf("static-first must not set floors, got %d", f)
 	}
-	recs := a.log.ByKind(decisionlog.KindDecision)
+	recs := a.log.ByKind(core.KindDecision)
 	if len(recs) == 0 || recs[len(recs)-1].Capacity["home"].Static != 2 {
 		t.Fatalf("decision log capacity = %+v", recs)
 	}
@@ -233,7 +222,7 @@ func TestAgentSpotFallback(t *testing.T) {
 			a := startAgent(t)
 			e.policy(mode, region("home", 10))
 
-			e.ice("gpu", "spot", k.CodeInsufficientInstanceCapacity, 3)
+			e.ice("gpu", "spot", aws.CodeInsufficientInstanceCapacity, 3)
 			p := e.waitDecision(a, func(p *v1alpha1.AdaptivePolicy) bool {
 				return p.Status.LastDecision.Action == "fallback_in_region"
 			})
@@ -241,7 +230,7 @@ func TestAgentSpotFallback(t *testing.T) {
 				t.Fatalf("applied = %v in %s mode", p.Status.LastDecision.Applied, mode)
 			}
 			np := &unstructured.Unstructured{}
-			np.SetGroupVersionKind(k.NodePoolGVK)
+			np.SetGroupVersionKind(aws.NodePoolGVK)
 			if err := e.cl.c.Get(context.Background(), client.ObjectKey{Name: "gpu"}, np); err != nil {
 				t.Fatal(err)
 			}
@@ -301,7 +290,7 @@ func TestAgentShiftToOtherRegion(t *testing.T) {
 
 	a := startAgent(t)
 	e.policy(v1alpha1.ModeShadow, region("home", 10), remoteRegion)
-	e.ice("gpu", "on-demand", k.CodeInsufficientInstanceCapacity, 3)
+	e.ice("gpu", "on-demand", aws.CodeInsufficientInstanceCapacity, 3)
 	p := e.waitDecision(a, func(p *v1alpha1.AdaptivePolicy) bool {
 		return p.Status.LastDecision.Action == "shift_to_other_region"
 	})

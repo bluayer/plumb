@@ -1,6 +1,5 @@
 image:
-  agent: ghcr.io/bluayer/plumb-agent:0.1.0
-  scaler: ghcr.io/bluayer/plumb-scaler:0.1.0
+  plumb: ghcr.io/bluayer/plumb:0.1.0  # one binary: `plumb agent`, `plumb scaler`
   decisionService: ghcr.io/bluayer/plumb-decision:0.1.0
   pullPolicy: IfNotPresent
 
@@ -20,7 +19,7 @@ decisionService:
   default: laya
   # Model instances. Each is a plugin (laya, jev, uniform, an entry point, or
   # "package.module:Class") and is shadowed by the agent with its own timeout and
-  # circuit breaker. Temperatures are per instance (see plumb_decision/calibration.py).
+  # circuit breaker. Temperatures are per instance, keyed by question type or id.
   models:
     laya:
       enabled: true

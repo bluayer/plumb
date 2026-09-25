@@ -1,88 +1,100 @@
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from plumb_decision import models, plugins
-from plumb_decision.plugins.uniform import UniformPlugin
+from plumb_decision import plugins
+from plumb_decision.plugins import JevPlugin, Rejected, Unavailable
+
+QUESTIONS = {
+    "action": {"type": "choice", "instructions": "?", "criteria": {"wait": "", "move": ""}},
+    "urgency": {"type": "score", "criteria": ["low", "high"]},
+    "transient": {"type": "noul", "instructions": "?"},
+}
 
 
-def test_builtins_resolve():
-    assert set(plugins.BUILTINS) == {"laya", "jev", "uniform"}
-    assert plugins.resolve("uniform") is UniformPlugin
+def test_registry():
+    assert isinstance(plugins.create("u", "uniform", {}), plugins.UniformPlugin)
+    assert plugins.create("f", "conftest:FakePlugin", {}).instance == "f"
+    for bad in ["nope", "json:dumps", "json:JSONDecoder"]:
+        with pytest.raises(ValueError):
+            plugins.create("x", bad, {})
 
 
-def test_import_path_resolves():
-    assert plugins.resolve("fakes:FakePlugin").plugin_name == "fake"
+class FakeJev(BaseHTTPRequestHandler):
+    status, seen = 200, []
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FakeJev.seen.append((self.path, dict(self.headers), body))
+        # Response shape from typesafe-sdk 0.7.1 _schemas/models.py.
+        payload = {"model": body["model"], "usage": {"input_tokens": 1, "output_tokens": 0}, "answers": {
+            "action": {"type": "choice", "choice": "move", "confidence": 0.7, "probabilities": {"wait": 0.3, "move": 0.7}},
+            "transient": {"type": "noul", "noul": 0.25}}}
+        data = json.dumps(payload if FakeJev.status == 200 else {"detail": "nope"}).encode()
+        self.send_response(FakeJev.status)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
 
 
-@pytest.mark.parametrize("name", ["nope", "json:dumps", "json:JSONDecoder"])
-def test_bad_plugins(name):
-    with pytest.raises((ValueError, AttributeError)):
-        plugins.resolve(name)
+@pytest.fixture
+def jev_url():
+    FakeJev.status, FakeJev.seen = 200, []
+    srv = HTTPServer(("127.0.0.1", 0), FakeJev)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}"
+    srv.shutdown()
 
 
-def test_models_config(tmp_path):
-    cfg = {
-        "default": "u2",
-        "models": {
-            "u1": {"plugin": "uniform", "temperatures": {"choice": 2.0}},
-            "u2": {"plugin": "fakes:FakePlugin", "options": {"model": "custom"}},
-            "off": {"plugin": "uniform", "enabled": False},
-        },
-    }
-    p = tmp_path / "models.json"
-    p.write_text(json.dumps(cfg))
-    ms = models.load(str(p))
-    assert ms.default == "u2"
-    assert ms.get().plugin.model_id == "custom"
-    assert ms.get("u1").temperatures.choice == 2.0
-    assert ms.get("off") is None
+def test_jev_request_and_answers(jev_url, monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "sk-test")
+    p = JevPlugin("jev", {"base_url": jev_url})
+    assert p.ready() and not p.remote
+    assert p.predict({"v": 1}, QUESTIONS)["transient"]["noul"] == 0.25
+    path, headers, body = FakeJev.seen[0]
+    assert path == "/v1/systemone" and headers["Authorization"] == "Bearer sk-test"
+    assert body == {"state": {"v": 1}, "model": "jev-latest", "questions": QUESTIONS}
 
 
-@pytest.mark.parametrize("cfg", [
-    {},
-    {"models": {"x": {}}},
-    {"models": {"x": {"plugin": "uniform"}}, "default": "y"},
-    {"models": {"x": {"plugin": "uniform", "temperatures": {"choice": 999}}}},
-])
-def test_bad_configs(cfg):
+def test_jev_keys(jev_url, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    hosted = JevPlugin("jev", {})
+    assert not hosted.ready() and hosted.remote
+    JevPlugin("self-hosted", {"base_url": jev_url, "api_key_env": ""}).predict({}, QUESTIONS)
+    assert "Authorization" not in FakeJev.seen[0][1]
+
+
+@pytest.mark.parametrize("status,exc", [(429, Unavailable), (503, Unavailable), (401, Rejected), (422, Rejected)])
+def test_jev_http_errors(jev_url, status, exc):
+    FakeJev.status = status
+    with pytest.raises(exc):
+        JevPlugin("jev", {"base_url": jev_url, "api_key_env": ""}).predict({}, QUESTIONS)
+
+
+def test_jev_unreachable():
+    with pytest.raises(Unavailable):
+        JevPlugin("jev", {"base_url": "http://127.0.0.1:1", "timeout": 0.5, "api_key_env": ""}).predict({}, QUESTIONS)
+
+
+@pytest.mark.parametrize("url", ["http://api.example.com", "ftp://x", "not a url"])
+def test_jev_rejects_unsafe_urls(url):
     with pytest.raises(ValueError):
-        models.from_dict(cfg)
+        JevPlugin("jev", {"base_url": url})
 
 
-def test_legacy_env_builds_laya(monkeypatch):
-    monkeypatch.setenv("LAYA_MODEL", "my/ckpt")
-    ms = models.load(None)
-    assert ms.default == "laya" and ms.get().plugin.model_id == "my/ckpt"
-    assert not ms.get().plugin.capabilities.remote
+def test_jev_in_cluster_is_not_remote():
+    assert not JevPlugin("l", {"base_url": "http://laya-serve.ml.svc.cluster.local:8000", "allow_http": True}).remote
 
 
-def test_uniform_has_minimum_confidence():
-    from plumb_decision import answers, calibration, questions
+def test_uniform_is_never_confident():
+    from plumb_decision.answers import answer
+    from plumb_decision.server import build_questions
 
-    qs = questions.build(questions.load("ice_event"), ["b", "c"])
-    raw = UniformPlugin("u", {}).predict({}, qs)
-    for qid, q in qs.items():
-        a = calibration.calibrate(qid, answers.normalize(qid, q, raw[qid]), calibration.Temperatures())
-        assert a["confidence"] <= 0.5 + 1e-9
-
-
-def test_example_config_and_plugin(monkeypatch):
-    import os
-    import sys
-
-    from plumb_decision import answers, questions
-
-    examples = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
-    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
-    ms = models.load(os.path.join(examples, "models.json"))
-    assert {i.name for i in ms} == {"laya", "jev"}
-    assert ms.get("jev").plugin.capabilities.remote
-
-    monkeypatch.syspath_prepend(examples)
-    p = plugins.create("mine", "my_plugin:KeywordPlugin", {"word": "quota"})
-    qs = questions.build(questions.load("ice_event"), ["b"])
-    raw = p.predict({"ev": {"kind": "quota"}}, qs)
-    for qid, q in qs.items():
-        answers.normalize(qid, q, raw[qid])
-    sys.modules.pop("my_plugin", None)
+    qs = build_questions("ice_event", ["b", "c"], 20)
+    raw = plugins.UniformPlugin("u", {}).predict({}, qs)
+    assert all(answer(qid, q, raw[qid], {})["confidence"] <= 0.5 + 1e-9 for qid, q in qs.items())

@@ -19,9 +19,10 @@ spec:
       securityContext: {runAsNonRoot: true}
       containers:
         - name: agent
-          image: {{ .Values.image.agent }}
+          image: {{ .Values.image.plumb }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - agent
             - --leader-elect
             - --resync-interval={{ .Values.agent.resyncInterval }}
             - --decision-log={{ .Values.agent.decisionLog }}
@@ -52,7 +53,7 @@ spec:
             {{- end }}
             {{- end }}
           # No readiness probe: a model still loading must not make the agent pod unready.
-          # Per-instance readiness is on the gRPC health service and ListModels.
+          # Model load failures show up as errors in the decision log.
           livenessProbe:
             grpc: {port: 50051}
             periodSeconds: 20

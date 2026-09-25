@@ -47,7 +47,7 @@ Karpenter events + cluster state
 
 Plumb normalizes Karpenter insufficient-capacity signals, estimates static and dynamic capacity per region, and chooses a rule action. Validation, cooldowns, relative margins, and replica floors guard the result. Each decision, shadow model response, and later outcome can be joined by `decisionId` in the JSONL log.
 
-The detailed decision path, constraints, and repository layout are below. See [CLAUDE.md](CLAUDE.md) for design principles and scope.
+The detailed decision path, design principles, constraints, and repository layout are below.
 
 ## Getting started
 
@@ -67,7 +67,7 @@ The E2E suite uses the real kube-scheduler with KWOK fake GPU nodes. It does not
 
 ```sh
 make test          # go vet + go test -race ./..., pytest
-make manifests     # regenerate CRD/RBAC and sync the chart
+make generate     # DeepCopy, CRD and RBAC, written into the chart
 make proto         # regenerate Go/Python gRPC code
 ```
 
@@ -86,46 +86,46 @@ make proto         # regenerate Go/Python gRPC code
 ## Flow
 
 ```
-Karpenter NodeClaim/Event ─▶ adapters/aws/capacity (ICE normalization: capacity/quota/config/unknown)
+Karpenter NodeClaim/Event ─▶ adapters/aws (ICE normalization: capacity/quota/config/unknown)
                                      │
-Deployment·Node·NodePool ─▶ adapters/aws/provisioner, adapters/kube (static/dynamic capacity, pending pods)
+Deployment·Node·NodePool ─▶ adapters/aws + adapters.Fit (static/dynamic capacity, pending pods)
                                      ▼
                          controller (AdaptivePolicy reconcile)
                                      ▼
- core/state (compressed JSON ≤320 tokens) → guardrail.StaticFirst → decision.DecideICE (rules)
-      → guardrail.Validate → hysteresis (cooldown + margin) → region replica floors
-      └▶ (OOD check passed) decision.Shadow ×N → decision-service (model plugins: laya, jev, ...), shadow only, never waited on
+ core: Summarize (JSON ≤320 tokens) → StaticFirst → DecideICE (rules)
+      → Validate → Gate (cooldown + margin) → region replica floors
+      └▶ (OOD check passed) Shadow ×N → decision-service (model plugins: laya, jev, ...), shadow only, never waited on
                                      ▼
-       AdaptivePolicy.status (floors, heartbeat)      decisionlog JSONL (decision / model / outcome)
+       AdaptivePolicy.status (floors, heartbeat)      decision log JSONL (decision / model / outcome)
                                      ▼
-       cmd/plumb-scaler (KEDA external scaler, reads the cache only)
+       plumb scaler (KEDA external scaler, reads the cache only)
 ```
 
 | Principle | Implementation |
 |---|---|
-| Static capacity first | `guardrail.StaticFirst`: if existing nodes (including reserved and non-Karpenter node groups) can take the pending demand, the result is `use_static`, with no model call and no move. `RegionScore` also ranks any region with static room above every region that would need provisioning. Static room comes from `kube.Fit`, a placement simulation that applies the scheduler's hard constraints to the Deployment's pod template: node selector and required affinity, taints and tolerations, resources and pod count, required pod (anti-)affinity in both directions, and `DoNotSchedule` topology spread |
-| Don't fight the controllers | Nodes and pods are never created or deleted. Only NodePool `weight`/`limits`/capacity-type requirements (auto mode) and the status the KEDA trigger reads are changed |
+| Static capacity first | `core.StaticFirst`: if existing nodes (including reserved and non-Karpenter node groups) can take the pending demand, the result is `use_static`, with no model call and no move. `RegionScore` also ranks any region with static room above every region that would need provisioning. Static room comes from `adapters.Fit`, a placement simulation that applies the scheduler's hard constraints to the Deployment's pod template: node selector and required affinity, taints and tolerations, resources and pod count, required pod (anti-)affinity in both directions, and `DoNotSchedule` topology spread |
+| Don't fight the controllers | Nodes and pods are never created or deleted. Only the NodePool capacity-type requirement (auto mode) and the status the KEDA trigger reads are changed |
 | No model call on the hot path | The scaler reads only the informer cache. Model calls are async with a timeout, an in-flight limit and a circuit breaker |
 | Safe without the agent | The scaler returns 0 (no influence) in shadow mode, on a stale heartbeat, or on a generation mismatch. KEDA takes the max across triggers, so the existing triggers keep working unchanged |
-| Oscillation prevention | `hysteresis.Gate` (cooldown + relative margin), per-action cooldown for fallback hints, event bursts coalesced into one decision per region per reconcile |
+| Oscillation prevention | `core.Gate` (cooldown + relative margin), per-action cooldown for fallback hints, event bursts coalesced into one decision per region per reconcile |
 | Shadow first | `spec.mode` defaults to `shadow`; `auto` is an explicit opt-in |
 
 ## Layout
 
 ```
-api/v1alpha1/                 AdaptivePolicy CRD types
-cmd/plumb-agent, plumb-scaler  operator / KEDA external scaler
-internal/adapters/            interfaces.go (CSP-neutral), kube/ (Deployment observer, placement simulation)
-internal/adapters/aws/        karpenter/ (constants verified against source), capacity/, provisioner/
-internal/core/                state, guardrail, decision(+decisionpb), hysteresis, decisionlog, engine
-internal/controller/          reconciler, event hub, per-region adapter registry
-internal/scaler/              external scaler (+ proto generated from KEDA v2.21.0)
-decision-service/             Python model sidecar (gRPC, package plumb_decision): plugins/, questions/*.json, examples/
-proto/                        decision.v1, externalscaler
-config/ charts/               CRD, RBAC, samples, Helm chart
+api/v1alpha1/          AdaptivePolicy CRD types
+cmd/plumb/             one binary: `plumb agent` (operator), `plumb scaler` (KEDA external scaler)
+internal/adapters/     adapters.go (CSP-neutral interfaces), kube.go (Deployment observer, placement simulation)
+internal/adapters/aws/ karpenter.go (constants verified against source, ICE normalization), capacity.go, provisioner.go
+internal/core/         state.go, rules.go (rules, guardrails, gate), model.go (shadow models), log.go, engine.go
+internal/controller/   reconciler + per-region adapters, event hub
+internal/scaler/       external scaler; externalscaler/ holds KEDA v2.21.0's .proto and its generated code
+decision-service/      Python model sidecar: plumb_decision/{server,plugins,answers}.py, decision.proto (agent ↔ sidecar API), questions/*.json
+charts/plumb/          Helm chart; CRD and agent ClusterRole are generated into it
+config/samples/        AdaptivePolicy and ScaledObject examples
 ```
 
-The CSP import boundary is enforced by `internal/adapters/boundary_test.go`, and Go/Python question-set consistency by `internal/core/decision/questions_test.go`.
+The CSP import boundary is enforced by `internal/adapters/boundary_test.go`, and Go/Python question-set consistency by `TestQuestionSetMatchesPython`.
 
 ## E2E scheduling tests (no GPUs needed)
 
@@ -137,7 +137,7 @@ make e2e                        # ~1 min
 make e2e-down
 ```
 
-`hack/e2e/up.sh` creates two small clusters (`home`, `remote`), installs the KWOK controller in them (rendered from the pinned Go module, no GitHub download), and writes kubeconfigs to `.e2e/`. With `PROVIDER=kwok` it uses `kwokctl` and needs no containers at all. `REMOTE=0` creates only one cluster; the multi-region test then skips. The suite refuses to run against a kubeconfig whose context is not `kind-*`, `kwok-*`, `minikube` or `plumb-e2e*` unless `PLUMB_E2E_ALLOW_ANY_CLUSTER=1`.
+`hack/e2e.sh up` creates two small clusters (`home`, `remote`), installs the KWOK controller in them (rendered from the pinned Go module, no GitHub download), and writes kubeconfigs to `.e2e/`. With `PROVIDER=kwok` it uses `kwokctl` and needs no containers at all. `REMOTE=0` creates only one cluster; the multi-region test then skips. The suite refuses to run against a kubeconfig whose context is not `kind-*`, `kwok-*`, `minikube` or `plumb-e2e*` unless `PLUMB_E2E_ALLOW_ANY_CLUSTER=1`.
 
 | Test | What it checks |
 |---|---|
@@ -160,9 +160,9 @@ Every decision model sits behind a plugin in `decision-service/plumb_decision/pl
 
 The Jev wire format was taken from `typesafe-sdk` 0.7.1 source. The plugin uses only the standard library and refuses plain HTTP to non-local hosts unless `allow_http` is set.
 
-Instances are configured in a JSON file (`--models-config`, see `decision-service/examples/models.json`, or `decisionService.models` in the chart). Each instance has its own plugin options and temperatures. The agent shadows every enabled instance independently (`--decision-models=laya=500ms,jev=3s`): separate timeout, in-flight limit and circuit breaker, and a separate `model` record in the decision log. A slow or failing hosted model never affects a local one or the rule decision.
+Instances are configured in a JSON file (`--models-config`, format in `plumb_decision/server.py`, or `decisionService.models` in the chart). Each instance has its own plugin options and temperatures. The agent shadows every enabled instance independently (`--decision-models=laya=500ms,jev=3s`): separate timeout, in-flight limit and circuit breaker, and a separate `model` record in the decision log. A slow or failing hosted model never affects a local one or the rule decision.
 
-To add a model, implement `ModelPlugin.predict(state, questions)` and return raw probabilities (see `plugins/base.py`). The service validates the output against the question (labels, levels, finite values), renormalizes it and applies the instance's calibration, so a plugin cannot hand malformed answers to the agent. Reference the plugin as `"plugin": "pkg.module:Class"` or publish it under the `plumb.decision.plugins` entry point group. `examples/my_plugin.py` is a minimal example.
+To add a model, implement `ModelPlugin.predict(state, questions)` and return raw probabilities (see `plumb_decision/plugins.py`). The service validates the output against the question (labels, levels, finite values), renormalizes it and applies the instance's calibration, so a plugin cannot hand malformed answers to the agent. Reference the plugin as `"plugin": "pkg.module:Class"` or publish it under the `plumb.decision.plugins` entry point group.
 
 ## Decision log (fine-tuning data)
 
@@ -174,10 +174,10 @@ JSONL, joined on `decisionId`:
 
 ## Known limits (MVP)
 
-- The static capacity simulation (`kube.Fit`) leaves out soft constraints (preferred affinity, `ScheduleAnyway` spread), volume/CSI topology, host ports, DRA and preemption. It evaluates a pod (anti-)affinity `namespaceSelector` as all namespaces, which can only err toward blocking more placements.
+- The static capacity simulation (`adapters.Fit`) leaves out soft constraints (preferred affinity, `ScheduleAnyway` spread), volume/CSI topology, host ports, DRA and preemption. It evaluates a pod (anti-)affinity `namespaceSelector` as all namespaces, which can only err toward blocking more placements.
 - The dynamic NodePool compatibility check covers taints and node selector/affinity only; Karpenter's own scheduler has the final say.
 - A shift only raises the destination region's replica floor. Traffic weights are out of scope, so moving the actual traffic is a separate job.
 - In-flight decisions awaiting an outcome record are kept in memory and are lost on restart.
 - Rotating a kubeconfig secret rebuilds the region client, but the existing signal watcher keeps running until the agent restarts.
-- Laya's base checkpoint is close to random zero-shot on this domain. Temperatures (per instance, `plumb_decision/calibration.py`) should be fitted after fine-tuning.
+- Laya's base checkpoint is close to random zero-shot on this domain. Temperatures (per instance and question type or id, `plumb_decision/answers.py`) should be fitted after fine-tuning.
 - The agent keeps the region choice at 20 options (Laya's limit) for every model, even though Jev accepts more. Plugins report their own `max_choices`, and the service enforces it.

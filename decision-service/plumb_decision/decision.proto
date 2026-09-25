@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package plumb.decision.v1;
+
+option go_package = "github.com/bluayer/agent-inference-scheduler/internal/core/decisionpb;decisionpb";
+
+// DecisionService fronts one or more decision model plugins (Laya, Jev, ...). It is
+// called asynchronously by the agent and never on a scaling hot path.
+service DecisionService {
+  rpc Decide(DecideRequest) returns (DecideResponse);
+}
+
+message DecideRequest {
+  string request_id = 1;
+  // question_set names a set defined in decision-service/questions, e.g. "ice_event".
+  string question_set = 2;
+  // state_json is the compressed summary produced by internal/core/state.
+  string state_json = 3;
+  // region_choices are the candidate regions for the target_region question.
+  repeated string region_choices = 4;
+  // model is the configured instance name to use (e.g. "laya", "jev"); empty = default.
+  string model = 5;
+}
+
+message Answer {
+  string question_id = 1;
+  // type is choice, score or noul.
+  string type = 2;
+  string choice = 3;
+  double score = 4;
+  // noul is P(true).
+  double noul = 5;
+  // confidence is the calibrated confidence after the instance's temperature scaling.
+  double confidence = 6;
+  map<string, double> probabilities = 7;
+}
+
+message DecideResponse {
+  string request_id = 1;
+  // model is the provider's model identifier (e.g. "convaiinnovations/laya", "jev-latest").
+  string model = 2;
+  repeated Answer answers = 3;
+  double latency_ms = 4;
+  // instance is the configured instance name that answered.
+  string instance = 5;
+  // plugin is the plugin type that served the instance (e.g. "laya", "jev").
+  string plugin = 6;
+}

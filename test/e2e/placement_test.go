@@ -10,8 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/bluayer/agent-inference-scheduler/internal/adapters"
-	"github.com/bluayer/agent-inference-scheduler/internal/adapters/aws/provisioner"
-	"github.com/bluayer/agent-inference-scheduler/internal/adapters/kube"
+	"github.com/bluayer/agent-inference-scheduler/internal/adapters/aws"
 )
 
 var llm = map[string]string{"app": "llm"}
@@ -136,8 +135,8 @@ func TestStaticCapacityMatchesScheduler(t *testing.T) {
 			e.waitNodesReady()
 			e.deployment("llm", 0, llm, spec)
 
-			rep, err := provisioner.New(e.cl.c, "e2e").Capacity(context.Background(), adapters.ResourceRequest{
-				PodRequests: kube.PodRequests(spec), Namespace: e.ns, PodLabels: llm, PodSpec: &spec, Limit: 100,
+			rep, err := (&aws.Provisioner{Client: e.cl.c}).Capacity(context.Background(), adapters.ResourceRequest{
+				PodRequests: adapters.PodRequests(spec), Namespace: e.ns, PodLabels: llm, PodSpec: &spec, Limit: 100,
 			})
 			if err != nil {
 				t.Fatal(err)

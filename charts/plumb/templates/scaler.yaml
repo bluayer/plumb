@@ -15,9 +15,9 @@ spec:
       securityContext: {runAsNonRoot: true}
       containers:
         - name: scaler
-          image: {{ .Values.image.scaler }}
+          image: {{ .Values.image.plumb }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: [--max-staleness={{ .Values.scaler.maxStaleness }}]
+          args: [scaler, --max-staleness={{ .Values.scaler.maxStaleness }}]
           ports:
             - {name: grpc, containerPort: 6000}
           readinessProbe: {grpc: {port: 6000}}

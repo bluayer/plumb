@@ -10,8 +10,6 @@ metadata:
   name: {{ include "plumb.name" . }}-scaler
   labels: {{- include "plumb.labels" . | nindent 4 }}
 ---
-{{ .Files.Get "files/agent-role.yaml" }}
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:

@@ -307,8 +307,6 @@ spec:
                       description: CurrentReplicas observed on the Deployment.
                       format: int32
                       type: integer
-                    reason:
-                      type: string
                     recommendedReplicas:
                       description: |-
                         RecommendedReplicas is a replica floor the KEDA external scaler serves in auto mode.
@@ -336,8 +334,6 @@ spec:
                       description: CurrentReplicas observed on the Deployment.
                       format: int32
                       type: integer
-                    reason:
-                      type: string
                     recommendedReplicas:
                       description: |-
                         RecommendedReplicas is a replica floor the KEDA external scaler serves in auto mode.

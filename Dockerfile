@@ -5,11 +5,9 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/ cmd/
 COPY internal/ internal/
-# BIN selects the binary: plumb-agent or plumb-scaler.
-ARG BIN=plumb-agent
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${BIN}
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/plumb ./cmd/plumb
 
 FROM gcr.io/distroless/static:nonroot
-COPY --from=build /out/app /app
+COPY --from=build /out/plumb /plumb
 USER 65532:65532
-ENTRYPOINT ["/app"]
+ENTRYPOINT ["/plumb"]

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,20 +15,19 @@ import (
 )
 
 // Hub runs one capacity signal watcher per region cluster, keeps recent events for
-// counting, and wakes the policies that use the region when something new arrives.
+// counting, and wakes the policies using a region when something new arrives.
 type Hub struct {
 	ctx     context.Context
 	retain  time.Duration
 	trigger chan event.GenericEvent
-	// Now is the clock used to expire events.
-	Now func() time.Time
 
 	mu      sync.Mutex
 	streams map[string]*stream
-	cursors map[types.NamespacedName]map[string]uint64
+	cursors map[types.NamespacedName]map[string]uint64 // last seq each policy drained, per stream
 }
 
 type stream struct {
+	watching    bool
 	seq         uint64
 	events      []seqEvent
 	subscribers map[types.NamespacedName]bool
@@ -38,65 +38,59 @@ type seqEvent struct {
 	adapters.CapacityEvent
 }
 
-// NewHub starts watchers under ctx. Events older than retain are dropped.
+// NewHub runs watchers under ctx and drops events older than retain.
 func NewHub(ctx context.Context, retain time.Duration) *Hub {
 	return &Hub{ctx: ctx, retain: retain, trigger: make(chan event.GenericEvent, 128),
-		streams: map[string]*stream{}, cursors: map[types.NamespacedName]map[string]uint64{}, Now: time.Now}
+		streams: map[string]*stream{}, cursors: map[types.NamespacedName]map[string]uint64{}}
 }
 
-// Trigger is fed to the controller as a watch source.
-func (h *Hub) Trigger() <-chan event.GenericEvent { return h.trigger }
-
-// Ensure starts watching src under key (once) and subscribes the policy to it.
-func (h *Hub) Ensure(key string, policy types.NamespacedName, src adapters.CapacitySignalSource) error {
-	h.mu.Lock()
+func (h *Hub) stream(key string) *stream {
 	s, ok := h.streams[key]
 	if !ok {
 		s = &stream{subscribers: map[types.NamespacedName]bool{}}
 		h.streams[key] = s
 	}
+	return s
+}
+
+// Ensure subscribes the policy to key and starts watching src the first time.
+func (h *Hub) Ensure(key string, policy types.NamespacedName, src adapters.CapacitySignalSource) error {
+	h.mu.Lock()
+	s := h.stream(key)
 	s.subscribers[policy] = true
+	start := !s.watching && src != nil
+	s.watching = s.watching || start
 	h.mu.Unlock()
-	if ok || src == nil {
+	if !start {
 		return nil
 	}
 	ch, err := src.Watch(h.ctx)
 	if err != nil {
 		h.mu.Lock()
-		delete(h.streams, key)
+		s.watching = false
 		h.mu.Unlock()
 		return err
 	}
-	go h.consume(key, ch)
+	go func() {
+		for ev := range ch {
+			h.Publish(key, ev)
+		}
+		log.FromContext(h.ctx).Info("capacity signal stream ended", "stream", key)
+		h.mu.Lock()
+		s.watching = false
+		h.mu.Unlock()
+	}()
 	return nil
 }
 
-func (h *Hub) consume(key string, ch <-chan adapters.CapacityEvent) {
-	for ev := range ch {
-		h.Publish(key, ev)
-	}
-	log.FromContext(h.ctx).Info("capacity signal stream ended", "stream", key)
-	h.mu.Lock()
-	delete(h.streams, key)
-	h.mu.Unlock()
-}
-
-// Publish records an event and wakes subscribers. Exposed for tests.
+// Publish records an event and wakes the stream's subscribers.
 func (h *Hub) Publish(key string, ev adapters.CapacityEvent) {
 	h.mu.Lock()
-	s, ok := h.streams[key]
-	if !ok {
-		s = &stream{subscribers: map[types.NamespacedName]bool{}}
-		h.streams[key] = s
-	}
+	s := h.stream(key)
 	s.seq++
-	s.events = append(s.events, seqEvent{seq: s.seq, CapacityEvent: ev})
-	cutoff := h.Now().Add(-h.retain)
-	i := 0
-	for i < len(s.events) && s.events[i].ObservedAt.Before(cutoff) {
-		i++
-	}
-	s.events = s.events[i:]
+	s.events = append(s.events, seqEvent{s.seq, ev})
+	cutoff := time.Now().Add(-h.retain)
+	s.events = slices.DeleteFunc(s.events, func(e seqEvent) bool { return e.ObservedAt.Before(cutoff) })
 	var subs []types.NamespacedName
 	for p := range s.subscribers {
 		subs = append(subs, p)
@@ -107,25 +101,20 @@ func (h *Hub) Publish(key string, ev adapters.CapacityEvent) {
 		obj.Name, obj.Namespace = p.Name, p.Namespace
 		select {
 		case h.trigger <- event.GenericEvent{Object: obj}:
-		default: // a reconcile is already queued; it will drain all new events
+		default: // a reconcile is already queued and will drain everything new
 		}
 	}
 }
 
-// Drain returns events on key the policy has not seen and that match one of its node pools
-// (events with no known pool always match).
+// Drain returns the events on key the policy has not seen, for its pools (events with no
+// known pool always match).
 func (h *Hub) Drain(policy types.NamespacedName, key string, pools []string) []adapters.CapacityEvent {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	s, ok := h.streams[key]
-	if !ok {
-		return nil
+	if h.cursors[policy] == nil {
+		h.cursors[policy] = map[string]uint64{}
 	}
-	cur := h.cursors[policy]
-	if cur == nil {
-		cur = map[string]uint64{}
-		h.cursors[policy] = cur
-	}
+	s, cur := h.stream(key), h.cursors[policy]
 	var out []adapters.CapacityEvent
 	for _, e := range s.events {
 		if e.seq > cur[key] && poolMatch(e.NodePool, pools) {
@@ -136,16 +125,12 @@ func (h *Hub) Drain(policy types.NamespacedName, key string, pools []string) []a
 	return out
 }
 
-// Count returns how many events for the pools arrived on key within window.
+// Count is how many non-config events for the pools arrived on key within window.
 func (h *Hub) Count(key string, pools []string, window time.Duration, now time.Time) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	s, ok := h.streams[key]
-	if !ok {
-		return 0
-	}
 	n := 0
-	for _, e := range s.events {
+	for _, e := range h.stream(key).events {
 		if now.Sub(e.ObservedAt) <= window && poolMatch(e.NodePool, pools) && e.Kind != adapters.ErrorKindConfig {
 			n++
 		}
@@ -163,14 +148,4 @@ func (h *Hub) Forget(policy types.NamespacedName) {
 	}
 }
 
-func poolMatch(pool string, pools []string) bool {
-	if pool == "" {
-		return true
-	}
-	for _, p := range pools {
-		if p == pool {
-			return true
-		}
-	}
-	return false
-}
+func poolMatch(pool string, pools []string) bool { return pool == "" || slices.Contains(pools, pool) }

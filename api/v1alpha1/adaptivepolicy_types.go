@@ -1,8 +1,19 @@
+// Package v1alpha1 contains the AdaptivePolicy API.
+// +kubebuilder:object:generate=true
+// +groupName=plumb.bluayer.io
 package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
+)
+
+var (
+	GroupVersion  = schema.GroupVersion{Group: "plumb.bluayer.io", Version: "v1alpha1"}
+	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	AddToScheme   = SchemeBuilder.AddToScheme
 )
 
 // Mode controls whether decisions are applied.
@@ -112,8 +123,6 @@ type RegionTarget struct {
 	// RecommendedReplicas is a replica floor the KEDA external scaler serves in auto mode.
 	// 0 means no opinion: the scaler reports 0 and the ScaledObject's other triggers decide.
 	RecommendedReplicas int32 `json:"recommendedReplicas"`
-	// +optional
-	Reason string `json:"reason,omitempty"`
 }
 
 // DecisionSummary is the last decision the agent made.

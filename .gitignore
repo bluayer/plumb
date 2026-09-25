@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 *.jsonl
 .e2e/
+CLAUDE.md
