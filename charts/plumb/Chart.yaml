@@ -1,0 +1,6 @@
+apiVersion: v2
+name: plumb
+description: Vendor-neutral adaptive scheduling agent on top of Karpenter and KEDA (shadow mode by default)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

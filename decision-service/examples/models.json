@@ -1,0 +1,19 @@
+{
+  "default": "laya",
+  "models": {
+    "laya": {
+      "plugin": "laya",
+      "options": {"model": "convaiinnovations/laya", "max_len": 512},
+      "temperatures": {"choice": 1.0, "score": 1.0, "noul": 1.0}
+    },
+    "jev": {
+      "plugin": "jev",
+      "options": {"model": "jev-latest", "timeout": 3}
+    },
+    "laya-serve": {
+      "enabled": false,
+      "plugin": "jev",
+      "options": {"base_url": "http://laya-serve.ml.svc.cluster.local:8000", "allow_http": true, "api_key_env": ""}
+    }
+  }
+}

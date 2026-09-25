@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "plumb.name" . }}-agent
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "plumb.name" . }}-scaler
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+---
+{{ .Files.Get "files/agent-role.yaml" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "plumb.name" . }}-agent
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "plumb.name" . }}-agent
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: plumb-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "plumb.name" . }}-scaler
+rules:
+  - apiGroups: [plumb.bluayer.io]
+    resources: [adaptivepolicies]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "plumb.name" . }}-scaler
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "plumb.name" . }}-scaler
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "plumb.name" . }}-scaler

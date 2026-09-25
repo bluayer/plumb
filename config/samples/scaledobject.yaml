@@ -1,0 +1,26 @@
+# Add the agent as one more trigger next to the existing ones. KEDA scales to the maximum
+# across triggers, so the agent can only raise replicas, and it reports 0 (no influence)
+# in shadow mode or when its heartbeat is stale. Deploy one ScaledObject per region with
+# that region's name in `region`.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: llm-inference
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: llm-inference
+  minReplicaCount: 2
+  maxReplicaCount: 40
+  triggers:
+    - type: prometheus            # your existing load-based trigger stays in charge
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: sum(rate(llm_requests_total[1m]))
+        threshold: "20"
+    - type: external
+      metadata:
+        scalerAddress: plumb-scaler.plumb:6000
+        policy: llm-inference
+        policyNamespace: inference
+        region: us-west-2

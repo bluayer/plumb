@@ -1,0 +1,38 @@
+{
+  "_comment": "Question set for capacity (ICE) events. Option keys must match internal/core/decision/types.go (checked by questions_test.go). target_region is added at request time from region_choices.",
+  "questions": {
+    "ice_kind": {
+      "type": "choice",
+      "instructions": "What kind of launch failure is described in ev?",
+      "criteria": {
+        "capacity": "the cloud has no free instances of the requested type right now",
+        "quota": "an account or service limit such as vCPU or spot quota was hit",
+        "config": "a misconfiguration such as permissions, AMI, subnet or launch template",
+        "unknown": "none of the above or not enough information"
+      }
+    },
+    "transient": {
+      "type": "noul",
+      "instructions": "Will a short wait and retry in the same region likely succeed?"
+    },
+    "action": {
+      "type": "choice",
+      "instructions": "What should the scheduler do about the pending replicas in the home region?",
+      "criteria": {
+        "wait_and_retry": "keep the demand here and let the provisioner retry",
+        "fallback_in_region": "stay in the region but allow other capacity types or instance types",
+        "shift_to_other_region": "raise replicas in another region that has room",
+        "escalate": "no safe automatic action; notify a human"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is acting on this?",
+      "criteria": ["nothing pending", "some replicas pending", "failures keep repeating", "blocked, act now"]
+    }
+  },
+  "target_region": {
+    "type": "choice",
+    "instructions": "If load moves, which region should receive it?"
+  }
+}

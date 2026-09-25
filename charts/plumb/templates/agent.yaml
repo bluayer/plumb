@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "plumb.name" . }}-agent
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ include "plumb.name" . }}-agent}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: {{ include "plumb.name" . }}-agent}
+      {{- if .Values.decisionService.enabled }}
+      annotations:
+        checksum/models: {{ include "plumb.modelsConfig" . | sha256sum }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "plumb.name" . }}-agent
+      securityContext: {runAsNonRoot: true}
+      containers:
+        - name: agent
+          image: {{ .Values.image.agent }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --leader-elect
+            - --resync-interval={{ .Values.agent.resyncInterval }}
+            - --decision-log={{ .Values.agent.decisionLog }}
+            {{- if .Values.decisionService.enabled }}
+            - --decision-service=127.0.0.1:50051
+            - --decision-models={{ include "plumb.shadowSpecs" . }}
+            {{- end }}
+          ports:
+            - {name: metrics, containerPort: 8080}
+            - {name: probes, containerPort: 8081}
+          livenessProbe: {httpGet: {path: /healthz, port: probes}}
+          readinessProbe: {httpGet: {path: /readyz, port: probes}}
+          resources: {{- toYaml .Values.agent.resources | nindent 12 }}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        {{- if .Values.decisionService.enabled }}
+        # The agent never waits on this sidecar: calls are async with a timeout and a circuit
+        # breaker, and rules decide whether it is up or not.
+        - name: decision-service
+          image: {{ .Values.image.decisionService }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [--models-config=/etc/plumb/models.json]
+          env:
+            {{- range $name, $m := .Values.decisionService.models }}
+            {{- if and $m.enabled $m.apiKeySecret $m.apiKeySecret.name }}
+            - name: {{ (get ($m.options | default dict) "api_key_env") | default "TYPESAFE_API_KEY" }}
+              valueFrom:
+                secretKeyRef: {name: {{ $m.apiKeySecret.name }}, key: {{ $m.apiKeySecret.key }}}
+            {{- end }}
+            {{- end }}
+          # No readiness probe: a model still loading must not make the agent pod unready.
+          # Per-instance readiness is on the gRPC health service and ListModels.
+          livenessProbe:
+            grpc: {port: 50051}
+            periodSeconds: 20
+          resources: {{- toYaml .Values.decisionService.resources | nindent 12 }}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: hf-cache, mountPath: /tmp/hf}
+            - {name: models-config, mountPath: /etc/plumb, readOnly: true}
+        {{- end }}
+      volumes:
+        - name: hf-cache
+          emptyDir: {}
+        {{- if .Values.decisionService.enabled }}
+        - name: models-config
+          configMap: {name: {{ include "plumb.name" . }}-models}
+        {{- end }}

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Creates two disposable clusters for the e2e suite ("home" and "remote" regions) and
+# makes KWOK manage fake nodes in them, so tests can create GPU nodes without GPUs.
+#
+#   PROVIDER=kind     ./hack/e2e/up.sh   # default; needs docker + kind
+#   PROVIDER=minikube ./hack/e2e/up.sh   # needs minikube
+#   PROVIDER=kwok     ./hack/e2e/up.sh   # kwokctl; no containers at all (fastest)
+#
+# The real kube-scheduler places pods in every mode; KWOK only simulates the kubelet
+# of nodes annotated kwok.x-k8s.io/node=fake. Kubeconfigs land in .e2e/.
+# REMOTE=0 skips the second cluster (multi-region tests are then skipped).
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+PROVIDER=${PROVIDER:-kind}
+REMOTE=${REMOTE:-1}
+KWOK_VERSION=${KWOK_VERSION:-v0.8.0}
+KIND_IMAGE=${KIND_IMAGE:-}          # e.g. kindest/node:v1.33.7
+PREFIX=${PREFIX:-plumb-e2e}
+OUT=.e2e
+mkdir -p "$OUT"
+
+names=(home)
+[[ "$REMOTE" == "1" ]] && names+=(remote)
+
+# KWOK in-cluster manifests, rendered from the pinned Go module (no GitHub download).
+kwok_manifests() {
+  local dir
+  dir=$(go mod download -json "sigs.k8s.io/kwok@${KWOK_VERSION}" | sed -n 's/.*"Dir": "\(.*\)".*/\1/p')
+  kubectl kustomize "$dir/kustomize/kwok" |
+    sed "s#image: registry.k8s.io/kwok/kwok\$#image: registry.k8s.io/kwok/kwok:${KWOK_VERSION}#"
+  echo "---"
+  kubectl kustomize "$dir/kustomize/stage/fast"
+}
+
+install_kwok() {
+  local kc=$1
+  kwok_manifests | kubectl --kubeconfig "$kc" apply --server-side -f - >/dev/null
+  kubectl --kubeconfig "$kc" -n kube-system rollout status deploy/kwok-controller --timeout=180s
+}
+
+for n in "${names[@]}"; do
+  cluster="${PREFIX}-${n}"
+  kc="$OUT/$n.kubeconfig"
+  case "$PROVIDER" in
+    kind)
+      kind get clusters 2>/dev/null | grep -qx "$cluster" ||
+        kind create cluster --name "$cluster" ${KIND_IMAGE:+--image "$KIND_IMAGE"} --wait 120s
+      kind get kubeconfig --name "$cluster" >"$kc"
+      install_kwok "$kc"
+      ;;
+    minikube)
+      minikube status -p "$cluster" >/dev/null 2>&1 || minikube start -p "$cluster" --nodes 1 --memory 2048
+      # minikube names the context after the profile.
+      kubectl config view --minify --flatten --context "$cluster" >"$kc"
+      install_kwok "$kc"
+      ;;
+    kwok)
+      kwokctl get clusters 2>/dev/null | grep -qx "$cluster" ||
+        kwokctl create cluster --name "$cluster" --runtime "${KWOK_RUNTIME:-binary}" ${KWOKCTL_ARGS:-} --wait 120s
+      kwokctl get kubeconfig --name "$cluster" >"$kc"
+      ;;
+    *)
+      echo "unknown PROVIDER=$PROVIDER (kind|minikube|kwok)" >&2
+      exit 1
+      ;;
+  esac
+  echo "cluster $cluster ready: $kc"
+done
+
+cat <<MSG
+
+Run the suite:
+  PLUMB_E2E_KUBECONFIG=$OUT/home.kubeconfig ${REMOTE:+PLUMB_E2E_REMOTE_KUBECONFIG=$OUT/remote.kubeconfig} make e2e
+MSG

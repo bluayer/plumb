@@ -1,0 +1,25 @@
+[project]
+name = "plumb-decision"
+version = "0.1.0"
+description = "Decision model sidecar (Laya, Jev, ... via plugins) for the Plumb adaptive scheduler agent"
+requires-python = ">=3.10"
+dependencies = [
+  "grpcio>=1.66",
+  "grpcio-health-checking>=1.66",
+  "protobuf>=5.28",
+]
+
+[project.optional-dependencies]
+# The jev and uniform plugins need nothing beyond the standard library.
+laya = ["laya>=0.3.20"]
+dev = ["pytest>=8", "grpcio-tools>=1.66"]
+
+# Third-party model plugins register here, e.g. in their own pyproject:
+#   [project.entry-points."plumb.decision.plugins"]
+#   my-model = "my_pkg.plugin:MyPlugin"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["plumb_decision*"]

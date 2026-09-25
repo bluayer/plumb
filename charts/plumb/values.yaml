@@ -1,0 +1,57 @@
+image:
+  agent: ghcr.io/bluayer/plumb-agent:0.1.0
+  scaler: ghcr.io/bluayer/plumb-scaler:0.1.0
+  decisionService: ghcr.io/bluayer/plumb-decision:0.1.0
+  pullPolicy: IfNotPresent
+
+agent:
+  resyncInterval: 30s
+  # Decision log (fine-tuning data). "-" writes JSONL to stdout for a log shipper.
+  decisionLog: "-"
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+
+decisionService:
+  # Models only run in shadow: their answers are logged next to the rule decision and
+  # never applied. Disable to run rules only.
+  enabled: true
+  # Instance the service uses when a request names none.
+  default: laya
+  # Model instances. Each is a plugin (laya, jev, uniform, an entry point, or
+  # "package.module:Class") and is shadowed by the agent with its own timeout and
+  # circuit breaker. Temperatures are per instance (see plumb_decision/calibration.py).
+  models:
+    laya:
+      enabled: true
+      plugin: laya
+      timeout: 500ms
+      options:
+        model: convaiinnovations/laya
+        max_len: 512
+      temperatures: {}
+    # TypeSafe Jev (hosted). Enabling it sends the compressed cluster state (regions,
+    # replica counts, error codes, instance types) to api.typesafe.ai. Also works with any
+    # /v1/systemone server, e.g. a self-hosted laya-serve (set options.base_url).
+    jev:
+      enabled: false
+      plugin: jev
+      timeout: 3s
+      options:
+        model: jev-latest
+        # base_url: https://api.typesafe.ai
+      # Secret holding the API key, exposed as TYPESAFE_API_KEY (or options.api_key_env).
+      apiKeySecret:
+        name: ""
+        key: api-key
+      temperatures: {}
+  resources:
+    requests: {cpu: "1", memory: 3Gi}
+    limits: {memory: 4Gi}
+
+scaler:
+  replicas: 2
+  maxStaleness: 10m
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}

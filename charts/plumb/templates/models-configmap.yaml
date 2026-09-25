@@ -1,0 +1,10 @@
+{{- if .Values.decisionService.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "plumb.name" . }}-models
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+data:
+  models.json: |
+{{ include "plumb.modelsConfig" . | indent 4 }}
+{{- end }}
