@@ -1,0 +1,71 @@
+# Install this chart in every member cluster, with the same AdaptivePolicies everywhere.
+image:
+  repository: ghcr.io/bluayer/plumb  # one binary: `plumb agent`, `plumb scaler`
+  tag: ""                            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# This member's name: its ClusterProfile name in the other members, and its entry in
+# spec.clusters. Required.
+clusterName: ""
+
+# This cluster's Prometheus, for spec.signals (demand, saturation). Empty: no metric signals.
+prometheusURL: ""
+
+# The model that ranks clusters when the fleet escalates. Any /v1/systemone server works
+# (TypeSafe Jev by default, or one you host). The hosted API is only called when an API key
+# is set, and receives a compact per-cluster summary (replicas, room, errors, cost rank).
+# Without a model, or on timeout or low confidence, rules rank the clusters.
+model:
+  url: https://api.typesafe.ai
+  name: jev-latest
+  timeout: 1s
+  apiKeySecret:  # exposed as TYPESAFE_API_KEY
+    name: ""
+    key: api-key
+
+# How this member reaches the others: ClusterProfile access providers (KEP-5339), matched
+# by name against status.accessProviders of the ClusterProfiles in this namespace. Their
+# exec commands must exist in the agent container (see agent.extraVolumes). Empty: this
+# cluster alone. Example with the cluster-inventory-api kubeconfig-secretreader plugin:
+#   - name: kubeconfig-secretreader
+#     execConfig:
+#       apiVersion: client.authentication.k8s.io/v1
+#       command: /plugins/kubeconfig-secretreader
+#       provideClusterInfo: true
+accessProviders: []
+
+agent:
+  replicas: 2        # one is elected per cluster; the other takes over on failure
+  interval: 30s      # member reports
+  hubInterval: 10s   # hub planning, while this member is the hub
+  # Decision log. "-" writes JSONL to stdout for a log shipper.
+  decisionLog: "-"
+  extraVolumes: []
+  extraVolumeMounts: []
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+scaler:
+  replicas: 2
+  # Serve gRPC over TLS from a kubernetes.io/tls Secret. Give KEDA the CA as caCert in a
+  # TriggerAuthentication referenced by the trigger.
+  tlsSecretName: ""
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+# Scrape /metrics with the Prometheus Operator.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}

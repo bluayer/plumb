@@ -1,0 +1,92 @@
+{{- if not .Values.clusterName }}{{ fail "clusterName is required" }}{{ end }}
+{{- if .Values.accessProviders }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "plumb.name" . }}-access
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+data:
+  providers.json: {{ dict "providers" .Values.accessProviders | toJson | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "plumb.name" . }}-agent
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.agent.replicas }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ include "plumb.name" . }}-agent}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: {{ include "plumb.name" . }}-agent}
+      annotations:
+        checksum/access: {{ .Values.accessProviders | toJson | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "plumb.name" . }}-agent
+      {{- include "plumb.podSecurityContext" . | nindent 6 }}
+      {{- include "plumb.podScheduling" (list . .Values.agent) | nindent 6 }}
+      containers:
+        - name: agent
+          image: {{ include "plumb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - agent
+            - --cluster-name={{ .Values.clusterName }}
+            - --interval={{ .Values.agent.interval }}
+            - --hub-interval={{ .Values.agent.hubInterval }}
+            - --decision-log={{ .Values.agent.decisionLog }}
+            - --prometheus-url={{ .Values.prometheusURL }}
+            - --model-url={{ .Values.model.url }}
+            - --model={{ .Values.model.name }}
+            - --model-timeout={{ .Values.model.timeout }}
+            {{- if .Values.accessProviders }}
+            - --clusterprofile-provider-file=/etc/plumb/providers.json
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            {{- with .Values.model.apiKeySecret }}{{ if .name }}
+            - name: TYPESAFE_API_KEY
+              valueFrom: {secretKeyRef: {name: {{ .name }}, key: {{ .key }}}}
+            {{- end }}{{ end }}
+          ports:
+            - {name: metrics, containerPort: 8080}
+            - {name: probes, containerPort: 8081}
+          livenessProbe: {httpGet: {path: /healthz, port: probes}}
+          readinessProbe: {httpGet: {path: /readyz, port: probes}}
+          resources: {{- toYaml .Values.agent.resources | nindent 12 }}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            {{- if .Values.accessProviders }}
+            - {name: access, mountPath: /etc/plumb, readOnly: true}
+            {{- end }}
+            {{- with .Values.agent.extraVolumeMounts }}{{ toYaml . | nindent 12 }}{{ end }}
+      volumes:
+        {{- if .Values.accessProviders }}
+        - name: access
+          configMap: {name: {{ include "plumb.name" . }}-access}
+        {{- end }}
+        {{- with .Values.agent.extraVolumes }}{{ toYaml . | nindent 8 }}{{ end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "plumb.name" . }}-agent
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ include "plumb.name" . }}-agent}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "plumb.name" . }}-agent-metrics
+  labels: {{- include "plumb.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "plumb.name" . }}-agent
+spec:
+  selector: {app.kubernetes.io/name: {{ include "plumb.name" . }}-agent}
+  ports:
+    - {name: metrics, port: 8080, targetPort: metrics}

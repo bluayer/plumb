@@ -1,0 +1,6 @@
+apiVersion: v2
+name: plumb
+description: Multi-cluster adaptive capacity for inference on Karpenter, KEDA, Prometheus and Gateway API (shadow mode by default)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
