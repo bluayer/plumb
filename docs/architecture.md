@@ -168,6 +168,8 @@ flowchart LR
 
 The decision log records every candidate, every rejection, Jev's probabilities, and what ran (`adaptive`), and each planner answer as a `proposal` line.
 
+**Planner only** (`--planner-only`, Helm `planner.only`): Jev is not used and need not be configured. The planner gets the same prompt except its last part, which asks for the one plan to carry out instead of alternatives. That plan goes through the same validation on each step's state; if it passes, it is the pick (`adaptive.chooser: planner`), recorded in `shadow` and carried out in `apply`. If it does not, or none has arrived, the rules' plan runs. No one-step changes are enumerated, and there is no confidence threshold. Useful to compare the planner's own judgment with Jev's on the same traffic.
+
 ## Apply
 
 In `auto` mode the hub:

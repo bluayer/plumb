@@ -72,8 +72,10 @@ type Hub struct {
 	Planner         core.Planner
 	PlannerInterval time.Duration
 	PlannerTimeout  time.Duration
-	Log             *core.Log
-	Recorder        events.EventRecorder // optional
+	// PlannerOnly: the planner's one plan is carried out once validated, without Jev.
+	PlannerOnly bool
+	Log         *core.Log
+	Recorder    events.EventRecorder // optional
 
 	wake chan struct{}
 	// leading is held while Lead runs: client-go starts a new leader callback without
@@ -258,15 +260,17 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 	}
 	var res core.Result
 	var adaptive *core.AdaptiveRecord
-	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && h.Model != nil && h.Planner != nil {
+	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && h.Planner != nil && (h.Model != nil || h.PlannerOnly) {
 		ain := core.AdaptiveInput{Input: in, Policy: *x.Adaptive, Metrics: p.Spec.Signals.Metrics, Placement: p.Spec.Placement,
-			Recent: fs.Recent, Proposed: h.proposed(key, now), Shadow: h.ModelShadow,
-			Choose: func(state any, instructions string, options map[string]string) (map[string]float64, error) {
+			Recent: fs.Recent, Proposed: h.proposed(key, now), Shadow: h.ModelShadow, PlannerOnly: h.PlannerOnly}
+		if !h.PlannerOnly {
+			ain.Choose = func(state any, instructions string, options map[string]string) (map[string]float64, error) {
 				start := time.Now()
 				probs, err := h.Model.Choose(ctx, state, instructions, options)
 				modelRequests.WithLabelValues(map[bool]string{true: "error", false: "ok"}[err != nil]).Observe(time.Since(start).Seconds())
 				return probs, err
-			}}
+			}
+		}
 		r, rec := core.Adapt(ain)
 		res, adaptive = r, &rec
 		h.plan(key, ain, res)

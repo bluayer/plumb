@@ -33,9 +33,11 @@ model:
     key: api-key
 
 # EXPERIMENTAL. The planner model for policies with spec.experimental.adaptive: it proposes
-# plans, Plumb validates them, and the model above (Jev) picks one. Both are needed; without
-# either, those policies follow the rules. Called in the background, at most once per
-# interval per policy, only while a member is short or the fleet is not Steady.
+# plans, Plumb validates them, and the model above (Jev) picks one. Both are needed, unless
+# only is true: then the planner proposes one plan, carried out once validated, and Jev is
+# not used. Otherwise those policies follow the rules. Called in the background, at most
+# once per interval per policy, only while a member is short or the fleet is not Steady.
+# model.mode (shadow or apply) applies to the planner's pick too.
 #   provider    "" (none, default) or bedrock (Amazon Bedrock Converse; credentials from IRSA
 #               or EKS Pod Identity, see agent.serviceAccountAnnotations)
 planner:
@@ -45,6 +47,7 @@ planner:
   endpoint: ""
   interval: 2m
   timeout: 1m
+  only: false    # planner only, without Jev
 
 # How this member reaches the others: ClusterProfile access providers (KEP-5339), matched
 # by name against status.accessProviders of the ClusterProfiles in this namespace. Their

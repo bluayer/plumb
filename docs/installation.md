@@ -174,7 +174,7 @@ spec:
          query: 'histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[2m])))'}
 ```
 
-It starts in `model.mode=shadow`; see [evaluating the adaptive path](operations.md#evaluating-the-adaptive-path). Another planner host: see [CONTRIBUTING](../CONTRIBUTING.md#planner-providers).
+It starts in `model.mode=shadow`; see [evaluating the adaptive path](operations.md#evaluating-the-adaptive-path). Without Jev, add `--set planner.only=true`: the planner's one plan is carried out once validated ([planner only](architecture.md#experimental-the-adaptive-path)). Another planner host: see [CONTRIBUTING](../CONTRIBUTING.md#planner-providers).
 
 ## 7. Go live
 

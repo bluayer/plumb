@@ -96,13 +96,19 @@ func adaptiveFleet(t *testing.T) (a, b client.WithWatch, key types.NamespacedNam
 	return a, b, types.NamespacedName{Namespace: "ns", Name: "llm"}
 }
 
+// With Jev, or planner only (no Jev configured at all), in apply and shadow mode.
 func TestHubAdaptive(t *testing.T) {
-	for _, shadow := range []bool{false, true} {
+	for _, tc := range []struct{ only, shadow bool }{{false, false}, {false, true}, {true, false}, {true, true}} {
+		shadow := tc.shadow
 		a, b, key := adaptiveFleet(t)
 		log, _ := core.OpenLog("")
 		pl := &planner{}
-		h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: newJev(t, "p1"), ModelShadow: shadow,
-			Planner: pl, PlannerInterval: time.Hour,
+		var jev *core.SystemOne
+		if !tc.only {
+			jev = newJev(t, "p1")
+		}
+		h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: jev, ModelShadow: shadow,
+			Planner: pl, PlannerInterval: time.Hour, PlannerOnly: tc.only,
 			Fleet: &Fleet{Self: "a", members: map[string]*member{"a": {cl: fakeCluster{c: a}}, "b": {cl: fakeCluster{c: b}}}}})
 		h.floorsWritten = map[string]time.Time{}
 		step := func() {
@@ -143,7 +149,10 @@ func TestHubAdaptive(t *testing.T) {
 			}
 		}
 		if rec == nil || proposals != 1 || pl.calls != 1 {
-			t.Fatalf("shadow %t: record %+v, %d proposals, %d planner calls", shadow, rec, proposals, pl.calls)
+			t.Fatalf("%+v: record %+v, %d proposals, %d planner calls", tc, rec, proposals, pl.calls)
+		}
+		if want := map[bool]string{false: "jev", true: core.SourcePlanner}[tc.only]; rec.Adaptive.Chooser != want {
+			t.Errorf("%+v: chooser %s", tc, rec.Adaptive.Chooser)
 		}
 		// In shadow the rules' plan runs (here the same as holding: the first step covered
 		// the shortage); otherwise Jev's pick does.

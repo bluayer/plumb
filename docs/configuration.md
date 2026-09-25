@@ -60,7 +60,7 @@ Unschedulable replicas always count, with or without signals. Signals are read, 
 
 ### `spec.experimental.adaptive`
 
-Experimental; its fields may change between releases. Takes effect only on agents run with both `--planner-provider` and `--model-provider`; otherwise the policy follows the rules.
+Experimental; its fields may change between releases. Takes effect only on agents run with both `--planner-provider` and `--model-provider`, or with `--planner-provider` and `--planner-only`; otherwise the policy follows the rules.
 
 | Field | Default | Description |
 |---|---|---|
@@ -128,6 +128,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `planner.region`, `planner.endpoint` | `""` | Overrides; for Bedrock, the AWS SDK's default chain otherwise |
 | `planner.interval` | `2m` | At most one planner call per policy per interval, only while a member is short or the fleet is not Steady. Calls run in the background |
 | `planner.timeout` | `1m` | Per-call timeout |
+| `planner.only` | `false` | Planner only, without Jev: the planner proposes one plan, carried out once validated (recorded only while `model.mode=shadow`) |
 | `accessProviders` | `[]` | KEP-5339 providers used to reach other members |
 | `agent.replicas` | `2` | One is elected per cluster |
 | `agent.interval` | `30s` | Member report interval |
@@ -152,7 +153,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `--clusterprofile-provider-file` | `""` | Access providers JSON (`{"providers": [...]}`); empty is a fleet of one |
 | `--prometheus-url` | `""` | Prometheus for `spec.signals` |
 | `--model-provider`, `--model-mode`, `--model-url`, `--model`, `--model-timeout` | see Helm values | The experimental ranking model |
-| `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-interval`, `--planner-timeout` | see Helm values | The experimental planner |
+| `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-interval`, `--planner-timeout`, `--planner-only` | see Helm values | The experimental planner |
 | `--interval` / `--hub-interval` | `30s` / `10s` | Report and planning intervals |
 | `--decision-log` | `-` | Decision log path |
 | `--leader-elect` | `true` | Elect one agent per cluster |

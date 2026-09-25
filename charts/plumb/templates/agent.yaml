@@ -49,6 +49,7 @@ spec:
             - --planner-endpoint={{ .Values.planner.endpoint }}
             - --planner-interval={{ .Values.planner.interval }}
             - --planner-timeout={{ .Values.planner.timeout }}
+            - --planner-only={{ .Values.planner.only }}
             {{- if .Values.accessProviders }}
             - --clusterprofile-provider-file=/etc/plumb/providers.json
             {{- end }}

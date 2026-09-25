@@ -69,62 +69,76 @@ func Planners() []string {
 	return slices.Sorted(maps.Keys(planners))
 }
 
+// plannerSystem is the planner's system prompt, but for its last part (plannerAlternatives
+// or plannerOne): what to answer is all that differs between the two modes, alternatives
+// for Jev to choose from or the one plan to carry out (planner only).
 const plannerSystem = `You plan capacity and traffic for one inference workload that runs in several Kubernetes clusters.
 The operator's policy says what matters for this workload. The observed state gives each cluster's replicas, spare capacity, recent launch failures, metrics (with unit, meaning and age) and what happened after recent decisions.
 Clusters in the same region compete for the same cloud capacity: repeated launch failures in one make new nodes in the others there unlikely too.
-Propose up to 3 different plans for the next step only. A plan is a list of actions:
+A plan for the next step only is a list of actions:
 - add: request "replicas" ADDITIONAL replicas, not a target floor or a total replica count.
   On the first add when no previous fleet additions are held, the executor starts from max(current floor, current desired replicas), then adds "replicas". Later adds increment the held floor.
   For example, with floor 0 and desired 3, adding one replica means "replicas": 1 and produces floor 4. Do not include the existing desired replicas in the requested additional count.
   New replicas are not immediately ready; the autoscaler may need to launch nodes and load the model.
 - release: lower a cluster's floor by "replicas"
 - shift: move "percent" percentage points of traffic from cluster "from" to cluster "to"
-An empty action list means holding. Stay within the limits given; plans that break them are discarded.
-Make the plans genuinely different strategies, and state in "hypothesis" what you expect each to achieve and why, from the observed data.` + capacitySemantics
+An empty action list means holding. Stay within the limits given; plans that break them are discarded.` + capacitySemantics
 
-// plannerSchema is the structure the model must answer in.
-var plannerSchema = map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"plans": map[string]any{
-			"type": "array", "maxItems": MaxProposals,
-			"items": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"actions": map[string]any{
-						"type": "array", "maxItems": MaxActions,
-						"items": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"kind":    map[string]any{"type": "string", "enum": []string{ActionAdd, ActionRelease, ActionShift}},
-								"cluster": map[string]any{"type": "string"},
-								"replicas": map[string]any{"type": "integer", "minimum": 1,
-									"description": "For add: number of ADDITIONAL replicas requested, not the target floor or total replicas. For release: number to subtract from the held floor."},
-								"from": map[string]any{"type": "string"},
-								"to":   map[string]any{"type": "string"},
-								"percent": map[string]any{"type": "integer", "minimum": 1,
-									"description": "Positive INTEGER percentage points, not a fraction or relative percentage. Use the smallest feasible integer when satisfying a minimum traffic movement."},
+const (
+	plannerAlternatives = `Propose up to 3 different plans. Make the plans genuinely different strategies, and state in "hypothesis" what you expect each to achieve and why, from the observed data.`
+	plannerOne          = `Propose exactly 1 plan: the one that best serves the policy's intent given the observed state. It is carried out as proposed if it stays within the limits. State in "hypothesis" what you expect it to achieve and why, from the observed data.`
+)
+
+// plannerSchema is the structure the model must answer in, with at most n plans.
+func plannerSchema(n int) map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"plans": map[string]any{
+				"type": "array", "minItems": min(n, 1), "maxItems": n,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"actions": map[string]any{
+							"type": "array", "maxItems": MaxActions,
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"kind":    map[string]any{"type": "string", "enum": []string{ActionAdd, ActionRelease, ActionShift}},
+									"cluster": map[string]any{"type": "string"},
+									"replicas": map[string]any{"type": "integer", "minimum": 1,
+										"description": "For add: number of ADDITIONAL replicas requested, not the target floor or total replicas. For release: number to subtract from the held floor."},
+									"from": map[string]any{"type": "string"},
+									"to":   map[string]any{"type": "string"},
+									"percent": map[string]any{"type": "integer", "minimum": 1,
+										"description": "Positive INTEGER percentage points, not a fraction or relative percentage. Use the smallest feasible integer when satisfying a minimum traffic movement."},
+								},
+								"required": []string{"kind"},
 							},
-							"required": []string{"kind"},
 						},
+						"hypothesis": map[string]any{"type": "string"},
 					},
-					"hypothesis": map[string]any{"type": "string"},
+					"required": []string{"actions", "hypothesis"},
 				},
-				"required": []string{"actions", "hypothesis"},
 			},
 		},
-	},
-	"required": []string{"plans"},
+		"required": []string{"plans"},
+	}
 }
 
-// Propose asks the planner for plans for the state in `in`. They are validated later,
-// against the state of the step that offers them to Jev.
+// Propose asks the planner for plans for the state in `in`: up to MaxProposals for Jev
+// to choose from, or one with in.PlannerOnly. They are validated later, against the state
+// of the step that uses them.
 func Propose(ctx context.Context, p Planner, in AdaptiveInput) ([]Candidate, error) {
 	request, err := json.Marshal(Evidence(in, nil))
 	if err != nil {
 		return nil, err
 	}
-	raw, err := p.Propose(ctx, plannerSystem, string(request), plannerSchema)
+	n, ending := MaxProposals, plannerAlternatives
+	if in.PlannerOnly {
+		n, ending = 1, plannerOne
+	}
+	raw, err := p.Propose(ctx, plannerSystem+ending, string(request), plannerSchema(n))
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +152,7 @@ func Propose(ctx context.Context, p Planner, in AdaptiveInput) ([]Candidate, err
 		return nil, fmt.Errorf("planner answer: %w", err)
 	}
 	var cands []Candidate
-	for i, pl := range out.Plans[:min(len(out.Plans), MaxProposals)] {
+	for i, pl := range out.Plans[:min(len(out.Plans), n)] {
 		h := pl.Hypothesis
 		if r := []rune(h); len(r) > 1000 {
 			h = string(r[:1000])

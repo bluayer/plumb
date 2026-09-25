@@ -208,3 +208,72 @@ func TestAdaptQuietWhenSteady(t *testing.T) {
 		t.Fatalf("%+v %+v", res, rec)
 	}
 }
+
+type capturePlanner struct {
+	system string
+	schema map[string]any
+	answer string
+}
+
+func (c *capturePlanner) Propose(_ context.Context, system, _ string, schema map[string]any) (json.RawMessage, error) {
+	c.system, c.schema = system, schema
+	return json.RawMessage(c.answer), nil
+}
+
+// Planner only: the same prompt but for its last part, which asks for the one plan to carry
+// out, and a schema allowing one; extra plans are ignored.
+func TestProposePlannerOnly(t *testing.T) {
+	answer := `{"plans": [{"actions": [], "hypothesis": "a"}, {"actions": [], "hypothesis": "b"}]}`
+	alt, one := &capturePlanner{answer: answer}, &capturePlanner{answer: answer}
+	in := adaptiveInput()
+	if _, err := Propose(context.Background(), alt, in); err != nil {
+		t.Fatal(err)
+	}
+	in.PlannerOnly = true
+	cands, err := Propose(context.Background(), one, in)
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("%+v %v", cands, err)
+	}
+	if !strings.HasPrefix(one.system, plannerSystem) || !strings.HasPrefix(alt.system, plannerSystem) ||
+		!strings.HasSuffix(one.system, plannerOne) || !strings.HasSuffix(alt.system, plannerAlternatives) {
+		t.Errorf("prompts differ beyond their endings:\n%s\n---\n%s", alt.system, one.system)
+	}
+	max := func(s map[string]any) any {
+		return s["properties"].(map[string]any)["plans"].(map[string]any)["maxItems"]
+	}
+	if max(one.schema) != 1 || max(alt.schema) != MaxProposals {
+		t.Errorf("maxItems %v / %v", max(one.schema), max(alt.schema))
+	}
+}
+
+// Planner only: its one validated plan runs without Jev; in shadow it is only recorded;
+// when invalid or missing, the rules' plan runs.
+func TestAdaptPlannerOnly(t *testing.T) {
+	in := adaptiveInput()
+	in.PlannerOnly = true
+	in.Proposed = []Candidate{{Actions: []Action{{Kind: ActionAdd, Cluster: "b", Replicas: 4}}}, {Actions: []Action{{Kind: ActionAdd, Cluster: "c", Replicas: 3}}}}
+	in.Choose = func(any, string, map[string]string) (map[string]float64, error) {
+		t.Error("Jev asked in planner-only mode")
+		return nil, nil
+	}
+	res, rec := Adapt(in)
+	if f := floors(res); f["b"] != 8 || f["c"] != 0 || rec.Chooser != SourcePlanner || rec.Chosen != "p1" || rec.Executed != "p1" || res.Source != SourcePlanner {
+		t.Fatalf("floors %v record %+v", f, rec)
+	}
+	for _, c := range rec.Candidates {
+		if c.Source == SourceEnumerated || c.ID == "p2" {
+			t.Errorf("offered %s (%s)", c.ID, c.Source)
+		}
+	}
+
+	in.Shadow = true
+	if res, rec = Adapt(in); rec.Chosen != "p1" || rec.Executed != "rules" || floors(res)["c"] != 7 {
+		t.Fatalf("shadow: %+v", rec)
+	}
+
+	in.Shadow = false
+	in.Proposed = []Candidate{{Actions: []Action{{Kind: ActionAdd, Cluster: "b", Replicas: 9}}}} // over step
+	if res, rec = Adapt(in); rec.Chosen != "" || rec.Executed != "rules" || !strings.Contains(rec.Rejected["p1"], "more than step") {
+		t.Fatalf("invalid plan: %+v", rec)
+	}
+}

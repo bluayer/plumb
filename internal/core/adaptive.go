@@ -118,7 +118,10 @@ type AdaptiveInput struct {
 	Recent    []v1alpha1.RecentDecision
 	Proposed  []Candidate // from the planner, possibly made for an earlier state
 	Choose    Chooser     // nil: no Jev, the rules' plan is carried out
-	Shadow    bool        // Jev's pick is recorded; the rules' plan is carried out
+	Shadow    bool        // the models' pick is recorded; the rules' plan is carried out
+	// PlannerOnly: the planner proposes one plan, carried out once validated; Jev is not
+	// asked.
+	PlannerOnly bool
 }
 
 // AdaptiveRecord is what the decision log keeps of an adaptive step.
@@ -126,7 +129,8 @@ type AdaptiveRecord struct {
 	Candidates    []Candidate        `json:"candidates"`
 	Rejected      map[string]string  `json:"rejected,omitempty"` // candidate id → why
 	Probabilities map[string]float64 `json:"probabilities,omitempty"`
-	Chosen        string             `json:"chosen,omitempty"` // Jev's pick, when confident
+	Chooser       string             `json:"chooser"`          // who picked: "jev" or "planner"
+	Chosen        string             `json:"chosen,omitempty"` // the pick (Jev's only when confident)
 	Executed      string             `json:"executed"`
 	Shadow        bool               `json:"shadow,omitempty"`
 	Error         string             `json:"error,omitempty"`
@@ -154,7 +158,11 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 		return r
 	}
 	rules := Plan(in.Input)
-	rec := AdaptiveRecord{Rejected: map[string]string{}, Shadow: in.Shadow}
+	rec := AdaptiveRecord{Rejected: map[string]string{}, Shadow: in.Shadow, Chooser: "jev"}
+	proposals := MaxProposals
+	if in.PlannerOnly {
+		rec.Chooser, proposals = SourcePlanner, 1
+	}
 	// Nothing to decide while no member is short and the fleet is Steady: the models are
 	// asked only when a decision is due, like the planner.
 	if !Busy(in.Clusters, rules.Phase) {
@@ -163,11 +171,13 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	}
 
 	offered := []Candidate{{ID: "hold", Source: SourceHold}, {ID: "rules", Source: SourceRules, Actions: rulesActions(in.Clusters, rules.Plans)}}
-	for i, p := range in.Proposed[:min(len(in.Proposed), MaxProposals)] {
+	for i, p := range in.Proposed[:min(len(in.Proposed), proposals)] {
 		p.ID, p.Source = fmt.Sprintf("p%d", i+1), SourcePlanner
 		offered = append(offered, p)
 	}
-	offered = append(offered, enumerate(in)...)
+	if !in.PlannerOnly { // enumerated plans are there for Jev to choose from
+		offered = append(offered, enumerate(in)...)
+	}
 	seen := map[string]string{}
 	var valid []Candidate
 	for _, c := range offered {
@@ -192,7 +202,12 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 		fallback = valid[i]
 	}
 	run := fallback
-	if in.Choose != nil && len(valid) > 1 {
+	if i := slices.IndexFunc(valid, func(c Candidate) bool { return c.Source == SourcePlanner }); in.PlannerOnly && i >= 0 {
+		// Validated against this step's state, like any candidate; not otherwise second-guessed.
+		if rec.Chosen = valid[i].ID; !in.Shadow {
+			run = valid[i]
+		}
+	} else if in.Choose != nil && !in.PlannerOnly && len(valid) > 1 {
 		options := map[string]string{}
 		for _, c := range valid {
 			options[c.ID] = c.String()

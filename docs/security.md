@@ -37,7 +37,7 @@ Nothing, by default. Data leaves only through the experimental models, and only 
 | Call | When | What it carries |
 |---|---|---|
 | Ranking model (rules path) | `model.provider` and a key are set, and two or more clusters are candidates | Per candidate: cluster name, ready replicas, static and dynamic room, recent launch-failure count, cost rank, max replicas |
-| Planner and Jev (adaptive path) | A policy has `experimental.adaptive`, and both `planner.provider` and `model.provider` are set | The policy's `intent` text and placement preference; per cluster: name, replicas, room, launch failures, floor, traffic share, and the `signals.metrics` values with their names, units and meanings; recent decisions and their outcomes; the candidate plans |
+| Planner and Jev (adaptive path) | A policy has `experimental.adaptive`, and both `planner.provider` and `model.provider` are set (or `planner.provider` with `planner.only`: then only the planner is called) | The policy's `intent` text and placement preference; per cluster: name, replicas, room, launch failures, floor, traffic share, and the `signals.metrics` values with their names, units and meanings; recent decisions and their outcomes; the candidate plans |
 
 Workload names, namespaces, pod specs and node names are not sent. The `intent` and metric meanings are sent as written: keep secrets out of them.
 
