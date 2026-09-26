@@ -66,7 +66,7 @@ Take two members, `use1` and `usw2`, with the default `LocalFirst` placement. Tr
 3. **The hub borrows capacity.** It raises `usw2`'s replica floor by at most `step`: idle existing nodes first, new nodes only if those are not enough. `usw2`'s scaler serves the floor to KEDA, which scales the Deployment there.
 4. **It waits for the replicas to be ready.** If they never reach a node within `readyTimeout`, the floor is taken back and the shortage placed elsewhere. If they are on nodes but still loading, the hub only warns.
 5. **Traffic follows ready capacity.** HTTPRoute weights move toward `usw2` by at most `stepPercent` per step, and never toward a cluster over its SLO.
-6. **Everything is given back, slowly.** While `usw2` serves well, nothing moves. Once no member is short and the fleet has been calm for `calmFor`, traffic comes back to `use1` one `stepPercent` step per `calmFor`, and only as far as `use1`'s replicas have been seen to serve without a shortage. When `usw2` carries no borrowed traffic, its floors come down by `step`, newest capacity first. If `use1` can't take the traffic back, `usw2` keeps serving it.
+6. **Everything is given back, slowly.** While `usw2` serves well, nothing moves. Once no member is short and the fleet has been calm for `calmFor`, traffic comes back to `use1` one `stepPercent` step per `calmFor`, and only as far as `use1`'s replicas have been seen to serve without a shortage. If `use1` needs more replicas to take it back and can get them, the hub raises `use1`'s floor first, and the traffic follows once they are ready: borrowing in reverse. When `usw2` carries no borrowed traffic, its floors come down by `step`, newest capacity first, and `use1`'s floor goes last. If `use1` can't take the traffic back or grow, `usw2` keeps serving it.
 
 The fleet moves through three phases on the way:
 
@@ -136,7 +136,9 @@ Traffic moves for two reasons only, and otherwise stays where it is: a split tha
 - Without pressure there is nothing to judge by: steps are simply a `calmFor` apart.
 - A shortage stops the return at once.
 
-A floor is released only once its cluster carries no more than its Steady share (see [release](#the-planning-step-in-detail)). The fleet is Steady again when no floor is left and every share is back.
+**Home first.** When the next step can't come back because the receiver's replicas would be too busy, but the receiver has room to grow (existing nodes or NodePool headroom), the hub raises its floor to the replicas that would carry all the borrowed traffic within that limit, `step` at a time. Its pending replicas are not counted as a shortage. Once they are ready, the return proceeds; if they never reach a node within `readyTimeout`, they are taken back and the borrowed capacity keeps serving. This needs pressure, which sizes the floor.
+
+A floor is released only once its cluster carries no more than its Steady share, and the floor raised for the return only after every borrowed floor is gone and all traffic is back (see [release](#the-planning-step-in-detail)). The fleet is Steady again when no floor is left and every share is back.
 
 ## Where the state lives
 
@@ -204,7 +206,7 @@ At least every `--hub-interval` (10s), and sooner when a member's report changes
 4. **Ranking.** Static room, fewer launch failures, cost rank, more room, name. *Experimental:* a model may reorder them ([below](#ranking-model)).
 5. **Allocation.** Two passes over the ranking, one per **tier**: static room (tier 0), then dynamic room (tier 1), the latter only when the fleet may launch nodes for this shortage ([placement](#placement)). Each cluster gains at most `step` replicas per step. Floors are absolute: `max(current floor, desired) + added`. A cluster whose report predates the last floor the hub wrote there, for any policy, takes nothing this step.
 6. **Traffic.** Weights as described in [traffic](#traffic).
-7. **Release.** After `calmFor` in Recovering, floors drop by `step` on clusters whose traffic has come back to their Steady share, highest tier first, so Karpenter consolidates what it added while existing and reserved nodes stay in use. A floor drops only on a member that has reported since the hub last raised or lowered a floor there, so releases go one acknowledged step at a time. A member without a usable report (stale, out of sync, or none) keeps its floor, and the hub raises a `ReleaseHeld` Event naming it. A member reporting a shortage again, even one too young to borrow for, ends Recovering, and the calm interval starts over once it clears.
+7. **Release.** After `calmFor` in Recovering, floors drop by `step` on clusters whose traffic has come back to their Steady share, highest tier first, so Karpenter consolidates what it added while existing and reserved nodes stay in use; the floor raised for the return goes last, once all traffic is back. A floor drops only on a member that has reported since the hub last raised or lowered a floor there, so releases go one acknowledged step at a time. A member without a usable report (stale, out of sync, or none) keeps its floor, and the hub raises a `ReleaseHeld` Event naming it. A member reporting a shortage again, even one too young to borrow for, ends Recovering, and the calm interval starts over once it clears.
 
 The rules decide *where*; the policy and arithmetic decide *how much*.
 
