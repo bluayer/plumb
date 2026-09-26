@@ -28,7 +28,7 @@ Plumb never creates or deletes nodes or pods, and never edits NodePools.
 
 - **Member credentials** come from ClusterProfile access providers (KEP-5339 exec plugins), resolved per request. Prefer short-lived tokens from your cloud's identity (e.g. workload identity) over long-lived kubeconfigs in Secrets.
 - **The model API key** is read from `PLUMB_MODEL_API_KEY` (else the provider's own variable). Set it from a Secret with `model.apiKeySecret`; it is never logged.
-- **The planner** (experimental) uses its host's own credentials: for Bedrock, the AWS SDK's default chain, i.e. IRSA (`agent.serviceAccountAnnotations`) or EKS Pod Identity. Grant the role `bedrock:InvokeModel` on the one model it uses.
+- **The planner** (experimental) uses its host's own credentials: for Bedrock, the AWS SDK's default chain, i.e. IRSA (`agent.serviceAccountAnnotations`) or EKS Pod Identity. Grant the role `bedrock:InvokeModel` on the one model it uses. For an OpenAI-compatible host, Plumb requires an explicit endpoint and optionally sends `PLUMB_PLANNER_API_KEY` as a Bearer token from `planner.apiKeySecret`; it never logs the token.
 
 ## What leaves the cluster
 

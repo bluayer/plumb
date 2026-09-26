@@ -216,7 +216,7 @@ Nothing breaks: rules rank. After 3 consecutive failures the model is skipped fo
 
 **Planner errors** (adaptive path; `proposal` lines with `error`)
 
-Steps go on without the planner's plans. Check the role (`bedrock:InvokeModel` on the model, IRSA or Pod Identity), `planner.model` and `planner.region`, and `planner.timeout`. A planner answer that does not follow the schema is an error too.
+Steps go on without the planner's plans. For Bedrock, check the role (`bedrock:InvokeModel` on the model, IRSA or Pod Identity), `planner.model`, and `planner.region`. For an OpenAI-compatible server, check `planner.endpoint`, `planner.model`, its optional API key Secret, and whether the server supports `planner.responseFormat=json_schema` if set. Check `planner.timeout` for either provider. A planner answer that does not follow the schema is an error too.
 
 ## Upgrades
 

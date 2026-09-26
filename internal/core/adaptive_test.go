@@ -195,6 +195,18 @@ func TestPropose(t *testing.T) {
 	if _, err := Propose(context.Background(), fakePlanner{"not json"}, adaptiveInput()); err == nil {
 		t.Error("garbage accepted")
 	}
+	if _, err := Propose(context.Background(), fakePlanner{`{"plans":[]}`}, adaptiveInput()); err == nil {
+		t.Error("answer without plans accepted")
+	}
+	for _, answer := range []string{
+		`{"plans":[{"hypothesis":"wait"}]}`,
+		`{"plans":[{"actions":[],"hypothesis":null}]}`,
+		`{"plans":[{"actions":null,"hypothesis":"wait"}]}`,
+	} {
+		if _, err := Propose(context.Background(), fakePlanner{answer}, adaptiveInput()); err == nil {
+			t.Errorf("incomplete plan accepted: %s", answer)
+		}
+	}
 }
 
 func TestAdaptQuietWhenSteady(t *testing.T) {

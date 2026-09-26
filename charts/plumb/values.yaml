@@ -38,13 +38,17 @@ model:
 # not used. Otherwise those policies follow the rules. Called in the background, at most
 # once per interval per policy, only while a member is short or the fleet is not Steady.
 # model.mode (shadow or apply) applies to the planner's pick too.
-#   provider    "" (none, default) or bedrock (Amazon Bedrock Converse; credentials from IRSA
-#               or EKS Pod Identity, see agent.serviceAccountAnnotations)
+#   provider    "" (none, default), bedrock (Amazon Bedrock Converse; credentials from IRSA
+#               or EKS Pod Identity), or openai (OpenAI-compatible /v1/chat/completions)
 planner:
   provider: ""
-  model: ""      # e.g. a Bedrock model or inference profile id
+  model: ""      # Bedrock model id or model served by the OpenAI-compatible endpoint
   region: ""     # "": the provider's default
-  endpoint: ""
+  endpoint: ""   # required for openai: explicit base URL ending in /v1
+  responseFormat: "" # openai: text (default) or json_schema for servers supporting structured output
+  apiKeySecret:  # optional for openai; exposed as PLUMB_PLANNER_API_KEY
+    name: ""
+    key: api-key
   interval: 2m
   timeout: 1m
   only: false    # planner only, without Jev

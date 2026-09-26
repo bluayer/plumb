@@ -156,6 +156,9 @@ func newPlanner(provider string, o core.PlannerOptions) (core.Planner, error) {
 			return nil, err
 		}
 	}
+	if o.APIKey == "" {
+		o.APIKey = os.Getenv("PLUMB_PLANNER_API_KEY")
+	}
 	p, err := spec.New(o)
 	if err != nil {
 		return nil, err
@@ -184,9 +187,10 @@ func runAgent(ctx context.Context, args []string) error {
 	modelName := fs.String("model", "", "model name; empty: the provider's default")
 	modelTimeout := fs.Duration("model-timeout", time.Second, "per-call model timeout; the rules decide on expiry")
 	plannerProvider := fs.String("planner-provider", "", "experimental: host serving the model that proposes plans for spec.experimental.adaptive ("+strings.Join(core.Planners(), ", ")+`); "" for none`)
-	plannerModel := fs.String("planner-model", "", "planner model id, e.g. a Bedrock model or inference profile id")
+	plannerModel := fs.String("planner-model", "", "planner model id (Bedrock or an OpenAI-compatible server)")
 	plannerRegion := fs.String("planner-region", "", "planner region; empty: the provider's default (for Bedrock, the AWS SDK's)")
-	plannerEndpoint := fs.String("planner-endpoint", "", "planner endpoint override")
+	plannerEndpoint := fs.String("planner-endpoint", "", "planner endpoint: Bedrock override or OpenAI-compatible base URL ending in /v1")
+	plannerResponseFormat := fs.String("planner-response-format", "", "OpenAI-compatible planner response format: text (default) or json_schema")
 	plannerInterval := fs.Duration("planner-interval", 2*time.Minute, "at most one planner call per policy per interval, only while a member is short or the fleet is not Steady")
 	plannerTimeout := fs.Duration("planner-timeout", time.Minute, "per-call planner timeout; the call runs in the background")
 	plannerOnly := fs.Bool("planner-only", false, "experimental: the planner proposes one plan, carried out once validated (subject to --model-mode), without Jev")
@@ -212,7 +216,7 @@ func runAgent(ctx context.Context, args []string) error {
 	if ranker != nil {
 		ctrl.Log.Info("the ranking model is experimental", "mode", *modelMode)
 	}
-	planner, err := newPlanner(*plannerProvider, core.PlannerOptions{Model: *plannerModel, Region: *plannerRegion, Endpoint: *plannerEndpoint})
+	planner, err := newPlanner(*plannerProvider, core.PlannerOptions{Model: *plannerModel, Region: *plannerRegion, Endpoint: *plannerEndpoint, ResponseFormat: *plannerResponseFormat})
 	if err != nil {
 		return err
 	}
