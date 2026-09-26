@@ -71,6 +71,32 @@ flowchart LR
 
 Read the [architecture](docs/architecture.md), starting with [a shortage, start to finish](docs/architecture.md#a-shortage-start-to-finish).
 
+## Results on real GPUs
+
+Two EKS clusters with the same GPU nodes (g5.4xlarge, one A10G each), serving Qwen2.5-1.5B with vLLM. The traffic arrives at *home* (without Plumb, home:remote = 100:0 and home serves every request); with Plumb, replicas can also be placed in *remote* and traffic shifted to it.
+
+Both setups received the same BurstGPT traffic (a public trace of request arrivals to a real LLM service), request for request: 2 minutes at 1 request/s, then a 20-minute peak of 3,600 requests, 3 requests/s on average with spikes up to about 10/s. Prompts are 128–512 tokens and answers 64–256. Home starts with one replica, and KEDA scales it up to three at 8 in-flight requests per replica. A request meets the SLO when it completes with its first token within 2 seconds. Numbers are for the peak, medians of three runs.
+
+### Scenario 1: remote has idle GPUs
+
+Home can add its own nodes, but they take minutes. Without Plumb, home waits for them while remote's GPUs sit idle. Plumb placed replicas on those idle GPUs 31–32 seconds after the shortage was reported, and they were serving about 70 seconds later.
+
+| Scenario 1 | Without Plumb (KEDA + Karpenter only) | With Plumb |
+|---|---:|---:|
+| Requests meeting the SLO | 73.2% | **91.4%** |
+| TTFT p95 | 16.4s | **4.8s** |
+| Time in SLO violation | 350s | **180s** |
+
+### Scenario 2: home can't get GPUs at all
+
+Home's NodePool limit is 0, so it stays at one replica; remote has to launch new nodes. Without Plumb, home stays short for the whole peak, because nothing tries another cluster. Plumb started getting capacity in remote 30 seconds after the shortage was reported, without anyone having to decide.
+
+| Scenario 2 | Without Plumb (KEDA + Karpenter only) | With Plumb |
+|---|---:|---:|
+| Requests meeting the SLO | 26.7% | **57.3%** |
+| TTFT p95 | 44.3s | **31.3s** |
+| Time in SLO violation | 630s | **500s** |
+
 ## Features
 
 - **Own cluster first, then the fleet, in the order you choose.**
@@ -89,7 +115,7 @@ Read the [architecture](docs/architecture.md), starting with [a shortage, start 
   - a **KEDA** external scaler
   - standard Conditions, Events and Prometheus metrics
 - **Metrics and SLOs in, knobs out.** Pressure (e.g. queued requests or KV-cache usage per replica), latency and error-rate SLOs from Prometheus decide where traffic goes: shares move from busier clusters to less busy ones, and never toward a cluster over its SLO. Plumb only turns knobs (replica floors, cluster weights); per-request routing stays with your gateway and the Gateway API Inference Extension.
-- **You set the limits, Plumb computes within them.** Step sizes, weight bounds, replica capacity and timing come from the policy, and deterministic rules decide where capacity goes. *Experimental:* a fast typed-decision model (TypeSafe **Jev**, served by TypeSafe, Cloudflare Workers AI, Vercel AI Gateway or any `/v1/systemone` server) can be asked to rank candidate clusters within a placement tier. It is off by default, and when enabled it starts in shadow: its pick is logged next to the rules' decision until you choose to apply it. A further experimental path lets a workload state its operating intent and metrics in plain words: a planner model (Amazon Bedrock first, other hosts as plugins) proposes plans, Plumb validates them against the limits, and Jev picks one.
+- **You set the limits, Plumb computes within them.** Step sizes, weight bounds, replica capacity and timing come from the policy, and deterministic rules decide where capacity goes.
 - **Safe by construction.**
   - Shadow mode is the default.
   - Floors expire and are fenced to the current hub.
@@ -97,6 +123,7 @@ Read the [architecture](docs/architecture.md), starting with [a shortage, start 
   - KEDA takes the maximum across triggers.
   - Without Plumb, clusters behave as if it were not installed.
 - **Auditable, with outcomes.** Every hub decision is recorded with the reports it saw, the model's answer and the plan before and after, in status, an Event and a JSONL decision log. Outcome records join it by `decisionId`: when the capacity became ready, what queues, latency and errors did at 1, 5 and 15 minutes, and what was decided next.
+- **Adaptive mode** *(experimental)*. Write down in the policy's `intent` field what matters for the workload, in one sentence (e.g. "protect TTFT first, then reduce cost when there is slack"). A planner model proposes plans for the current state, Plumb validates each against the policy's limits, and a fast decision model (TypeSafe Jev) picks one; without Jev, the planner's own plan runs once validated. Jev can also be used on its own to rank clusters within a placement tier. Both start in shadow, next to the rules, so you can compare them on your own traffic before letting them act.
 
 ## Quick start
 
