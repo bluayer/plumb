@@ -130,6 +130,10 @@ type Result struct {
 	// Warnings are worth an operator's look but changed nothing, e.g. replicas on nodes
 	// still not ready after ReadyTimeout.
 	Warnings []string
+	// Held lists members whose floor was due to be released but was kept: the hub has no
+	// usable report from them (stale, out of sync, or none), so it can't see what the
+	// floor still serves.
+	Held []string
 }
 
 // ModelResult is what the ranker returned, for the decision log.
@@ -168,10 +172,15 @@ func Plan(in Input) Result {
 		}
 	}
 	escalated := len(short) > 0
+	shortage := hasShortage(cs)
 	switch {
+	case shortage && res.Phase == v1alpha1.PhaseRecovering:
+		// A new shortage interrupts the calm interval even before it is old
+		// enough to borrow more capacity.
+		res.Phase, res.PhaseSince = v1alpha1.PhaseEscalated, in.Now
 	case escalated && res.Phase != v1alpha1.PhaseEscalated:
 		res.Phase, res.PhaseSince = v1alpha1.PhaseEscalated, in.Now
-	case !escalated && res.Phase == v1alpha1.PhaseEscalated:
+	case !shortage && res.Phase == v1alpha1.PhaseEscalated:
 		res.Phase, res.PhaseSince = v1alpha1.PhaseRecovering, in.Now
 	}
 	due := in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.Cooldown
@@ -186,7 +195,9 @@ func Plan(in Input) Result {
 		}
 	}
 	if res.Phase == v1alpha1.PhaseRecovering && in.Now.Sub(res.PhaseSince) >= cfg.CalmFor && due {
-		if n := releaseCapacity(cs, cfg.Step); n != "" {
+		n, held := releaseCapacity(cs, cfg.Step, in.Hold)
+		res.Held = held
+		if n != "" {
 			if !slices.Contains(actions, "release_capacity") {
 				actions = append(actions, "release_capacity")
 			}
@@ -463,20 +474,33 @@ func maxValue(m map[string]float64) float64 {
 	return top
 }
 
+func hasShortage(cs []Cluster) bool {
+	return slices.ContainsFunc(cs, func(c Cluster) bool {
+		return c.Report != nil && c.Report.NeededReplicas > 0
+	})
+}
+
 // releaseCapacity lowers floors by step in the reverse of the order they were taken:
 // dynamic before static (Karpenter consolidates what it added while existing nodes stay
-// in use).
-func releaseCapacity(cs []Cluster, step int32) string {
+// in use). A fresh report must acknowledge the previous floor before another release;
+// members without a usable report are returned as held.
+func releaseCapacity(cs []Cluster, step int32, hold map[string]bool) (string, []string) {
 	last := int32(-1) // the tier taken last is released first
 	for _, c := range cs {
 		if c.Floor > 0 {
 			last = max(last, c.Tier)
 		}
 	}
-	var notes []string
+	var notes, held []string
 	for i, c := range cs {
-		if c.Floor == 0 || c.Tier != last {
+		switch {
+		case c.Floor == 0 || c.Tier != last:
 			continue
+		case c.Report == nil:
+			held = append(held, c.Spec.Name)
+			continue
+		case hold[c.Spec.Name]:
+			continue // acknowledged on its next report
 		}
 		cs[i].Floor = max(c.Floor-step, 0)
 		cs[i].Added = max(c.Added-(c.Floor-cs[i].Floor), 0)
@@ -485,7 +509,7 @@ func releaseCapacity(cs []Cluster, step int32) string {
 		}
 		notes = append(notes, fmt.Sprintf("-%d on %s", c.Floor-cs[i].Floor, c.Spec.Name))
 	}
-	return strings.Join(notes, ", ")
+	return strings.Join(notes, ", "), held
 }
 
 // shiftTraffic moves shares while floors are held or a member is short, and back to the

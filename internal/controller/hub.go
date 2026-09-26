@@ -85,7 +85,10 @@ type Hub struct {
 	// since is when it started leading (another hub may have written before).
 	floorsWritten map[string]time.Time
 	since         time.Time
-	planning      *planning
+	// held is, per policy, the members whose floor the last step kept for want of a
+	// usable report; the hub records and raises an Event when it changes.
+	held     map[string][]string
+	planning *planning
 }
 
 // planning is the planner's state per policy, shared with its background calls.
@@ -318,7 +321,13 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 		errs = append(errs, h.apply(ctx, p, res, before, intents, id, now)...)
 	}
 	applied := auto && len(errs) == 0 && res.Action != "none"
-	changed := res.Action != "none" || res.Phase != fs.Phase || len(res.Warnings) > 0 || (adaptive != nil && adaptive.Chosen != "" && adaptive.Chosen != adaptive.Executed)
+	if h.held == nil {
+		h.held = map[string][]string{}
+	}
+	newlyHeld := len(res.Held) > 0 && !slices.Equal(res.Held, h.held[key])
+	h.held[key] = res.Held
+	changed := res.Action != "none" || res.Phase != fs.Phase || len(res.Warnings) > 0 || newlyHeld ||
+		(adaptive != nil && adaptive.Chosen != "" && adaptive.Chosen != adaptive.Executed)
 	joined := errors.Join(errs...)
 
 	// Outcomes: follow earlier decisions with what the members report now, then start
@@ -368,7 +377,7 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 			Message: msg[:min(len(msg), 1024)], Time: metav1.Time{Time: now}}
 		rec := core.Record{Kind: "decision", DecisionID: id, Time: now, Policy: client.ObjectKeyFromObject(p).String(), Hub: h.Identity,
 			Mode: string(p.EffectiveMode()), Reports: reports, Before: before, After: res.Plans, Phase: res.Phase,
-			Action: res.Action, Source: res.Source, Model: res.Model, Adaptive: adaptive, Message: res.Message, Warnings: res.Warnings, Applied: applied,
+			Action: res.Action, Source: res.Source, Model: res.Model, Adaptive: adaptive, Message: res.Message, Warnings: res.Warnings, Held: res.Held, Applied: applied,
 			OutOfSync: outOfSync}
 		if joined != nil {
 			rec.Error = joined.Error()
@@ -388,6 +397,10 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 			if h.Recorder != nil {
 				h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "ReplicasNotReady", "Plan", "%s", w)
 			}
+		}
+		if newlyHeld && h.Recorder != nil {
+			h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "ReleaseHeld", "Plan",
+				"keeping the floor on %s: no usable report from it (stale, out of sync, or none)", strings.Join(res.Held, ", "))
 		}
 	}
 	if !changed && p.Status.Fleet != nil && p.Status.Fleet.Hub == h.Identity && now.Sub(p.Status.Fleet.Time.Time) < FleetHeartbeat &&
@@ -558,7 +571,9 @@ func (h *Hub) apply(ctx context.Context, p *v1alpha1.AdaptivePolicy, res core.Re
 		mp.Status.Intent = next
 		if err := cl.GetClient().Status().Patch(ctx, mp, client.MergeFrom(orig)); err != nil {
 			errs = append(errs, fmt.Errorf("intent for %s: %w", plan.Name, err))
-		} else if next != nil && (cur == nil || next.Replicas > cur.Replicas) {
+		} else if replicas(next) != replicas(cur) {
+			// Raised or lowered: its room, and the release after, wait for a report that
+			// has seen this floor. A renewal changes neither.
 			h.floorsWritten[plan.Name] = now
 		}
 	}
@@ -630,4 +645,11 @@ func (h *Hub) weights(ctx context.Context, p *v1alpha1.AdaptivePolicy) (map[stri
 		out[name] = w
 	}
 	return out, nil
+}
+
+func replicas(in *v1alpha1.Intent) int32 {
+	if in == nil {
+		return 0
+	}
+	return in.Replicas
 }

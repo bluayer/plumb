@@ -141,13 +141,13 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	in.Rank = nil
 	// Replicas that never reached a node are taken back first, whatever the models pick;
 	// every candidate starts from there. Plan finds nothing more to follow afterwards.
-	var released, warnings []string
+	var released, warnings, held []string
 	if !in.Simulated {
 		in.Clusters = slices.Clone(in.Clusters)
 		released, warnings = AwaitReady(in.Clusters, in.Config, in.Now)
 	}
 	withReady := func(r Result) Result {
-		r.Warnings = warnings
+		r.Warnings, r.Held = warnings, held
 		if len(released) > 0 {
 			if !strings.Contains(r.Action, "release_capacity") {
 				r.Action = strings.TrimSuffix("release_capacity+"+r.Action, "+none")
@@ -158,6 +158,7 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 		return r
 	}
 	rules := Plan(in.Input)
+	held = rules.Held
 	rec := AdaptiveRecord{Rejected: map[string]string{}, Shadow: in.Shadow, Chooser: "jev"}
 	proposals := MaxProposals
 	if in.PlannerOnly {
@@ -265,9 +266,7 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 
 // Busy reports whether there is something to decide: a member short, or the fleet not Steady.
 func Busy(cs []Cluster, phase string) bool {
-	return cmp.Or(phase, v1alpha1.PhaseSteady) != v1alpha1.PhaseSteady || slices.ContainsFunc(cs, func(c Cluster) bool {
-		return c.Report != nil && c.Report.NeededReplicas > 0
-	})
+	return cmp.Or(phase, v1alpha1.PhaseSteady) != v1alpha1.PhaseSteady || hasShortage(cs)
 }
 
 func top(probs map[string]float64) (string, float64) {
@@ -419,6 +418,12 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: more than step %d", a, cfg.Step)
 			case a.Replicas > cs[i].Floor:
 				return nil, fmt.Errorf("%s: floor is %d", a, cs[i].Floor)
+			case hasShortage(cs):
+				return nil, fmt.Errorf("%s: a member still reports a shortage", a)
+			case cs[i].Report == nil:
+				return nil, fmt.Errorf("%s: no fresh report", a)
+			case in.Hold[a.Cluster]:
+				return nil, fmt.Errorf("%s: its report predates the last floor written there", a)
 			}
 			x := &cs[i]
 			x.Floor -= a.Replicas

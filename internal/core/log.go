@@ -50,6 +50,8 @@ type Record struct {
 	Message  string          `json:"message,omitempty"`
 	Warnings []string        `json:"warnings,omitempty"`
 	Applied  bool            `json:"applied"`
+	// Held names members whose floor was due back but kept: no usable report from them.
+	Held []string `json:"held,omitempty"`
 	// OutOfSync names members whose report was ignored: their copy of the policy differs.
 	OutOfSync []string `json:"outOfSync,omitempty"`
 	Error     string   `json:"error,omitempty"`
