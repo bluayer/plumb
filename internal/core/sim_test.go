@@ -153,12 +153,14 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 	var releasedAt time.Duration = -1
 	var releasedDemand float64
 	maxSinceRelease, minSinceRelease := 0.0, 0.0
-	turned := make([]struct {
-		at     time.Duration
-		dir    int32
-		demand float64
-		ready  string
-	}, len(sc.clusters))
+	// The last traffic move: when, which clusters lost and gained, and what it saw.
+	var moved struct {
+		at           time.Duration
+		lost, gained []int
+		demand       float64
+		ready        string
+	}
+	moved.at = -time.Hour
 	for at := time.Duration(0); at < length; at += simTick {
 		now := t0.Add(at)
 		demand := sc.demand(at)
@@ -237,18 +239,29 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			!strings.Contains(res.Message, "to take traffic back") {
 			t.Fatalf("%s at %s: borrowed again after giving back at %s, demand not higher since\n%s", sc.name, at, releasedAt, run.trace(20))
 		}
-		// A share that turns around within a minute of its last move, with demand and
-		// every cluster's ready replicas unchanged, bounces between clusters out of room.
-		ready := fmt.Sprint(st.ready)
+		// Traffic that goes back between the same two clusters within a minute, with
+		// demand and every cluster's ready replicas unchanged, bounces between clusters
+		// out of room.
+		var lost, gained []int
 		for i, p := range res.Plans {
-			d := p.Weight - in.Clusters[i].Weight
-			if d == 0 {
-				continue
+			if d := p.Weight - in.Clusters[i].Weight; d < 0 {
+				lost = append(lost, i)
+			} else if d > 0 {
+				gained = append(gained, i)
 			}
-			if turned[i].dir != 0 && (d > 0) != (turned[i].dir > 0) && at-turned[i].at <= time.Minute && demand == turned[i].demand && ready == turned[i].ready {
-				t.Fatalf("%s at %s: %s's share turned around %s after its last move\n%s", sc.name, at, sc.clusters[i].name, at-turned[i].at, run.trace(10))
+		}
+		if len(lost) > 0 {
+			ready := fmt.Sprint(st.ready)
+			if at-moved.at <= time.Minute && demand == moved.demand && ready == moved.ready {
+				for _, i := range lost {
+					for _, j := range gained {
+						if slices.Contains(moved.gained, i) && slices.Contains(moved.lost, j) {
+							t.Fatalf("%s at %s: traffic went %s→%s and back within %s\n%s", sc.name, at, sc.clusters[j].name, sc.clusters[i].name, at-moved.at, run.trace(10))
+						}
+					}
+				}
 			}
-			turned[i].at, turned[i].dir, turned[i].demand, turned[i].ready = at, d, demand, ready
+			moved.at, moved.lost, moved.gained, moved.demand, moved.ready = at, lost, gained, demand, ready
 		}
 		if released(in, res) {
 			releasedAt, releasedDemand, maxSinceRelease, minSinceRelease = at, demand, demand, demand

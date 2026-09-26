@@ -705,8 +705,8 @@ func balance(cs []Cluster, cfg Config, lastStep time.Time) string {
 }
 
 // overshoots reports whether moving n percent from a donor over its SLO because of its
-// load (busier than the receiver) would leave the receiver at least as busy as the donor:
-// both are out of room, and the move would only bounce back next step. A donor over its SLO
+// load (busier than the receiver) would leave the receiver busier than the donor: both
+// are out of room, and the move would only bounce back next step. A donor over its SLO
 // while less busy, with no ready replicas, or with no pressure reading gives way anyway.
 func overshoots(donor, receiver Cluster, n int32) bool {
 	d, r := donor.Report, receiver.Report
@@ -723,7 +723,7 @@ func overshoots(donor, receiver Cluster, n int32) bool {
 	}
 	perPercent := pd * float64(d.ReadyReplicas) / float64(donor.Weight) // load one percent carries
 	after := pr + float64(n)*perPercent/float64(r.ReadyReplicas)
-	return after >= pd*float64(donor.Weight-n)/float64(donor.Weight)
+	return after > pd*float64(donor.Weight-n)/float64(donor.Weight)
 }
 
 func fmtLoad(v float64) string {
