@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -321,7 +322,7 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 		}
 	}
 	if auto {
-		errs = append(errs, h.apply(ctx, p, res, before, intents, id, now)...)
+		errs = append(errs, h.apply(ctx, p, res, intents, id, now)...)
 	}
 	applied := auto && len(errs) == 0 && res.Action != "none"
 	if h.held == nil {
@@ -538,18 +539,13 @@ func reasonFor(action string) string {
 }
 
 // apply writes intents that changed or are due for renewal, and the route weights.
-func (h *Hub) apply(ctx context.Context, p *v1alpha1.AdaptivePolicy, res core.Result, before []v1alpha1.ClusterPlan,
+func (h *Hub) apply(ctx context.Context, p *v1alpha1.AdaptivePolicy, res core.Result,
 	intents map[string]*v1alpha1.Intent, id string, now time.Time) []error {
 	var errs []error
-	weights, weightsChanged, was := map[string]int32{}, false, map[string]int32{}
-	for _, b := range before {
-		was[b.Name] = b.Weight
-	}
+	weights := map[string]int32{}
 	for _, plan := range res.Plans {
 		if plan.Weight >= 0 {
 			weights[plan.Name] = plan.Weight
-			w, ok := was[plan.Name]
-			weightsChanged = weightsChanged || !ok || plan.Weight != w
 		}
 		cur := intents[plan.Name]
 		var next *v1alpha1.Intent
@@ -580,7 +576,9 @@ func (h *Hub) apply(ctx context.Context, p *v1alpha1.AdaptivePolicy, res core.Re
 			h.floorsWritten[plan.Name] = now
 		}
 	}
-	if weightsChanged {
+	// Reconcile every route even if the first route already has the planned weights:
+	// an earlier step may have updated it while a later route write failed.
+	if len(weights) > 0 {
 		backends := backendsOf(p)
 		for _, r := range p.Spec.Traffic.Routes {
 			if !h.Fleet.Holds(ctx, r.Cluster, h.Identity) { // fencing: routes have no reader to check the hub
@@ -590,6 +588,14 @@ func (h *Hub) apply(ctx context.Context, p *v1alpha1.AdaptivePolicy, res core.Re
 			cl, ok := h.Fleet.Cluster(r.Cluster)
 			if !ok {
 				errs = append(errs, fmt.Errorf("route %s/%s: member %s is not connected", r.Namespace, r.Name, r.Cluster))
+				continue
+			}
+			current, err := routePercentWeights(ctx, cl.GetAPIReader(), r, backends, p.Spec.Clusters)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("route %s/%s in %s: %w", r.Namespace, r.Name, r.Cluster, err))
+				continue
+			}
+			if maps.Equal(current, weights) {
 				continue
 			}
 			if err := adapters.SetRouteWeights(ctx, cl.GetClient(), r, backends, weights); err != nil {
@@ -628,26 +634,54 @@ func (h *Hub) weights(ctx context.Context, p *v1alpha1.AdaptivePolicy) (map[stri
 	if !ok {
 		return nil, fmt.Errorf("route %s/%s: member %s is not connected", r.Namespace, r.Name, r.Cluster)
 	}
-	raw, err := adapters.RouteWeights(ctx, cl.GetAPIReader(), r, backendsOf(p))
+	weights, err := routePercentWeights(ctx, cl.GetAPIReader(), r, backendsOf(p), p.Spec.Clusters)
 	if err != nil {
 		return nil, fmt.Errorf("route %s/%s in %s: %w", r.Namespace, r.Name, r.Cluster, err)
 	}
-	var sum int32
-	for _, c := range p.Spec.Clusters {
+	return weights, nil
+}
+
+func routePercentWeights(ctx context.Context, reader client.Reader, route v1alpha1.RouteRef,
+	backends map[string]v1alpha1.BackendRef, clusters []v1alpha1.ClusterSpec) (map[string]int32, error) {
+	raw, err := adapters.RouteWeights(ctx, reader, route, backends)
+	if err != nil {
+		return nil, err
+	}
+	var sum int64
+	for _, c := range clusters {
 		w, ok := raw[c.Name]
 		if !ok {
-			return nil, fmt.Errorf("route %s/%s has no backendRef for cluster %s", r.Namespace, r.Name, c.Name)
+			return nil, fmt.Errorf("no backendRef for cluster %s", c.Name)
 		}
-		sum += w
+		sum += int64(w)
+	}
+	if sum <= 0 {
+		return nil, fmt.Errorf("no positive backend weight")
+	}
+	return percentWeights(raw, clusters, sum), nil
+}
+
+// percentWeights uses largest remainders so the percentages read from proportional
+// Gateway weights always total 100 before the planner moves any traffic.
+func percentWeights(raw map[string]int32, clusters []v1alpha1.ClusterSpec, sum int64) map[string]int32 {
+	type remainder struct {
+		name string
+		part int64
 	}
 	out := map[string]int32{}
-	for name, w := range raw {
-		if sum > 0 {
-			w = int32(math.Round(float64(w) * 100 / float64(sum)))
-		}
-		out[name] = w
+	var parts []remainder
+	var assigned int32
+	for _, c := range clusters {
+		scaled := int64(raw[c.Name]) * 100
+		out[c.Name] = int32(scaled / sum)
+		assigned += out[c.Name]
+		parts = append(parts, remainder{name: c.Name, part: scaled % sum})
 	}
-	return out, nil
+	slices.SortStableFunc(parts, func(a, b remainder) int { return cmp.Compare(b.part, a.part) })
+	for i := int32(0); i < 100-assigned; i++ {
+		out[parts[i].name]++
+	}
+	return out
 }
 
 func replicas(in *v1alpha1.Intent) int32 {

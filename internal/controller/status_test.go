@@ -18,16 +18,20 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -53,8 +57,108 @@ func statusClient(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) 
 			t.Fatal(err)
 		}
 	}
+	s.AddKnownTypeWithName(adapters.HTTPRouteGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(adapters.HTTPRouteGVK.GroupVersion().WithKind("HTTPRouteList"), &unstructured.UnstructuredList{})
 	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).WithStatusSubresource(&v1alpha1.AdaptivePolicy{}).
 		WithInterceptorFuncs(funcs).Build()
+}
+
+func TestHubRetriesRouteAfterPartialWrite(t *testing.T) {
+	route := func(name string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(adapters.HTTPRouteGVK)
+		u.SetNamespace("ns")
+		u.SetName(name)
+		if err := unstructured.SetNestedSlice(u.Object, []any{map[string]any{"backendRefs": []any{
+			map[string]any{"name": "svc-a", "weight": int64(100)},
+			map[string]any{"name": "svc-b", "weight": int64(0)},
+		}}}, "spec", "rules"); err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	failSecond := true
+	c := statusClient(t, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if obj.GetName() == "second" && failSecond {
+			failSecond = false
+			return errors.New("temporary route write failure")
+		}
+		return c.Update(ctx, obj, opts...)
+	}}, route("first"), route("second"))
+	check := func(name string, wantA, wantB int32) {
+		t.Helper()
+		got, err := adapters.RouteWeights(context.Background(), c, v1alpha1.RouteRef{Namespace: "ns", Name: name},
+			map[string]v1alpha1.BackendRef{"a": {Name: "svc-a"}, "b": {Name: "svc-b"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["a"] != wantA || got["b"] != wantB {
+			t.Errorf("route %s weights %v, want a=%d b=%d", name, got, wantA, wantB)
+		}
+	}
+	p := &v1alpha1.AdaptivePolicy{Spec: v1alpha1.AdaptivePolicySpec{
+		Clusters: []v1alpha1.ClusterSpec{{Name: "a", Backend: &v1alpha1.BackendRef{Name: "svc-a"}}, {Name: "b", Backend: &v1alpha1.BackendRef{Name: "svc-b"}}},
+		Traffic:  &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: "a", Namespace: "ns", Name: "first"}, {Cluster: "a", Namespace: "ns", Name: "second"}}},
+	}}
+	holder, duration, renew := "hub", int32(60), metav1.NewMicroTime(time.Now())
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: HubLease},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew}}
+	h := NewHub(Hub{Identity: holder, Fleet: &Fleet{Namespace: "plumb-system", members: map[string]*member{
+		"a": {cl: fakeCluster{c: c}, leases: k8sfake.NewClientset(lease).CoordinationV1()},
+	}}})
+	after := core.Result{Plans: []v1alpha1.ClusterPlan{{Name: "a", Weight: 90}, {Name: "b", Weight: 10}}}
+	if errs := h.apply(context.Background(), p, after, nil, "d1", time.Now()); len(errs) != 1 {
+		t.Fatalf("first route write: errors %v, want one failure", errs)
+	}
+	check("first", 90, 10)
+	check("second", 100, 0)
+	if errs := h.apply(context.Background(), p, after, nil, "d2", time.Now()); len(errs) != 0 {
+		t.Fatalf("retry: %v", errs)
+	}
+	check("second", 90, 10)
+}
+
+func TestHubLeavesEquivalentRouteRatioAlone(t *testing.T) {
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(adapters.HTTPRouteGVK)
+	route.SetNamespace("ns")
+	route.SetName("route")
+	if err := unstructured.SetNestedSlice(route.Object, []any{map[string]any{"backendRefs": []any{
+		map[string]any{"name": "svc-a", "weight": int64(2)},
+		map[string]any{"name": "svc-b", "weight": int64(1)},
+	}}}, "spec", "rules"); err != nil {
+		t.Fatal(err)
+	}
+	updates := 0
+	c := statusClient(t, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		updates++
+		return c.Update(ctx, obj, opts...)
+	}}, route)
+	p := &v1alpha1.AdaptivePolicy{Spec: v1alpha1.AdaptivePolicySpec{
+		Clusters: []v1alpha1.ClusterSpec{{Name: "a", Backend: &v1alpha1.BackendRef{Name: "svc-a"}}, {Name: "b", Backend: &v1alpha1.BackendRef{Name: "svc-b"}}},
+		Traffic:  &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: "a", Namespace: "ns", Name: "route"}}},
+	}}
+	holder, duration, renew := "hub", int32(60), metav1.NewMicroTime(time.Now())
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: HubLease},
+		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew}}
+	h := NewHub(Hub{Identity: holder, Fleet: &Fleet{Namespace: "plumb-system", members: map[string]*member{
+		"a": {cl: fakeCluster{c: c}, leases: k8sfake.NewClientset(lease).CoordinationV1()},
+	}}})
+	res := core.Result{Plans: []v1alpha1.ClusterPlan{{Name: "a", Weight: 67}, {Name: "b", Weight: 33}}}
+	if errs := h.apply(context.Background(), p, res, nil, "d1", time.Now()); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if updates != 0 {
+		t.Errorf("rewrote a route with the same effective share %d times", updates)
+	}
+}
+
+func TestPercentWeightsTotalOneHundred(t *testing.T) {
+	clusters := []v1alpha1.ClusterSpec{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	got := percentWeights(map[string]int32{"a": 1, "b": 1, "c": 1}, clusters, 3)
+	if got["a"] != 34 || got["b"] != 33 || got["c"] != 33 {
+		t.Errorf("equal thirds normalized to %v, want 34/33/33", got)
+	}
 }
 
 func TestMemberReportDropsStaleFields(t *testing.T) {
@@ -165,7 +269,7 @@ func TestHubWritesDropStaleFields(t *testing.T) {
 	key := types.NamespacedName{Namespace: "ns", Name: "llm"}
 
 	res := core.Result{Plans: []v1alpha1.ClusterPlan{{Name: "a", Floor: 3, Weight: -1}}}
-	if errs := h.apply(context.Background(), p, res, []v1alpha1.ClusterPlan{{Name: "a", Floor: 5, Added: 2, Tier: 1, Weight: -1}},
+	if errs := h.apply(context.Background(), p, res,
 		map[string]*v1alpha1.Intent{"a": in}, "d2", now); len(errs) > 0 {
 		t.Fatal(errs)
 	}

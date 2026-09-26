@@ -15,7 +15,8 @@
 
 # hack/e2e.sh up|down
 #
-# up creates two disposable clusters for the e2e suite ("home" and "remote" regions) and
+# up creates disposable clusters for the e2e suite ("home" and "remote", with an
+# optional third member) and
 # makes KWOK manage fake nodes in them, so tests can create GPU nodes without GPUs.
 #
 #   PROVIDER=kind     hack/e2e.sh up   # default; needs docker + kind
@@ -25,11 +26,13 @@
 # The real kube-scheduler places pods in every mode; KWOK only simulates the kubelet
 # of nodes annotated kwok.x-k8s.io/node=fake. Kubeconfigs land in .e2e/.
 # REMOTE=0 skips the second cluster (multi-region tests are then skipped).
+# THIRD=1 adds a third cluster for three-way traffic tests.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROVIDER=${PROVIDER:-kind}
 REMOTE=${REMOTE:-1}
+THIRD=${THIRD:-0}
 KWOK_VERSION=${KWOK_VERSION:-$(go list -modfile=hack/tools/go.mod -m -f '{{.Version}}' sigs.k8s.io/kwok)} # Dependabot bumps it there
 KIND_IMAGE=${KIND_IMAGE:-}          # e.g. kindest/node:v1.33.7
 PREFIX=${PREFIX:-plumb-e2e}
@@ -39,7 +42,7 @@ OUT=.e2e
 command -v kwokctl >/dev/null || kwokctl() { go tool -modfile=hack/tools/go.mod kwokctl "$@"; }
 
 if [[ "${1:-}" == "down" ]]; then
-  for n in home remote; do
+  for n in home remote third; do
     case "$PROVIDER" in
       kind) kind delete cluster --name "${PREFIX}-${n}" || true ;;
       minikube) minikube delete -p "${PREFIX}-${n}" || true ;;
@@ -54,6 +57,11 @@ mkdir -p "$OUT"
 
 names=(home)
 [[ "$REMOTE" == "1" ]] && names+=(remote)
+[[ "$THIRD" == "1" ]] && names+=(third)
+if [[ "$THIRD" == "1" && "$REMOTE" != "1" ]]; then
+  echo "THIRD=1 requires REMOTE=1" >&2
+  exit 2
+fi
 
 # KWOK in-cluster manifests, rendered from the pinned Go module (no GitHub download).
 kwok_manifests() {
@@ -90,7 +98,7 @@ for n in "${names[@]}"; do
     kwok)
       read -ra extra <<<"${KWOKCTL_ARGS:-}" # e.g. "--etcd-binary /path/etcd"
       kwokctl get clusters 2>/dev/null | grep -qx "$cluster" ||
-        kwokctl create cluster --name "$cluster" --runtime "${KWOK_RUNTIME:-binary}" "${extra[@]}" --wait 120s
+        kwokctl create cluster --name "$cluster" --runtime "${KWOK_RUNTIME:-binary}" ${extra[@]+"${extra[@]}"} --wait 120s
       kwokctl get kubeconfig --name "$cluster" >"$kc"
       ;;
     *)
@@ -101,8 +109,12 @@ for n in "${names[@]}"; do
   echo "cluster $cluster ready: $kc"
 done
 
+remote_config=""
+third_config=""
+[[ "$REMOTE" == "1" ]] && remote_config=" PLUMB_E2E_REMOTE_KUBECONFIG=$OUT/remote.kubeconfig"
+[[ "$THIRD" == "1" ]] && third_config=" PLUMB_E2E_THIRD_KUBECONFIG=$OUT/third.kubeconfig"
 cat <<MSG
 
 Run the suite:
-  PLUMB_E2E_KUBECONFIG=$OUT/home.kubeconfig ${REMOTE:+PLUMB_E2E_REMOTE_KUBECONFIG=$OUT/remote.kubeconfig} make e2e
+  PLUMB_E2E_KUBECONFIG=$OUT/home.kubeconfig${remote_config}${third_config} make e2e
 MSG

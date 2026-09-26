@@ -56,6 +56,7 @@ e2e-up:
 e2e:
 	PLUMB_E2E_KUBECONFIG=$${PLUMB_E2E_KUBECONFIG:-$(CURDIR)/.e2e/home.kubeconfig} \
 	PLUMB_E2E_REMOTE_KUBECONFIG=$${PLUMB_E2E_REMOTE_KUBECONFIG:-$$(test -f .e2e/remote.kubeconfig && echo $(CURDIR)/.e2e/remote.kubeconfig)} \
+	PLUMB_E2E_THIRD_KUBECONFIG=$${PLUMB_E2E_THIRD_KUBECONFIG:-$$(test -f .e2e/third.kubeconfig && echo $(CURDIR)/.e2e/third.kubeconfig)} \
 	go test -tags e2e -count=1 -timeout 15m -v ./test/e2e/...
 
 e2e-down:
