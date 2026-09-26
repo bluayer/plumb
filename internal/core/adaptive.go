@@ -141,13 +141,13 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	in.Rank = nil
 	// Replicas that never reached a node are taken back first, whatever the models pick;
 	// every candidate starts from there. Plan finds nothing more to follow afterwards.
-	var released, warnings []string
+	var released, warnings, held []string
 	if !in.Simulated {
 		in.Clusters = slices.Clone(in.Clusters)
 		released, warnings = AwaitReady(in.Clusters, in.Config, in.Now)
 	}
 	withReady := func(r Result) Result {
-		r.Warnings = warnings
+		r.Warnings, r.Held = warnings, held
 		if len(released) > 0 {
 			if !strings.Contains(r.Action, "release_capacity") {
 				r.Action = strings.TrimSuffix("release_capacity+"+r.Action, "+none")
@@ -158,6 +158,7 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 		return r
 	}
 	rules := Plan(in.Input)
+	held = rules.Held
 	rec := AdaptiveRecord{Rejected: map[string]string{}, Shadow: in.Shadow, Chooser: "jev"}
 	proposals := MaxProposals
 	if in.PlannerOnly {

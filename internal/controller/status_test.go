@@ -20,6 +20,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -174,6 +176,10 @@ func TestHubWritesDropStaleFields(t *testing.T) {
 	if in := got.Status.Intent; in == nil || in.Replicas != 3 || in.Added != 0 || in.Tier != 0 || in.DecisionID != "d2" {
 		t.Errorf("intent %+v, want 3 replicas with no added replicas or tier left over", in)
 	}
+	// Lowered, not only raised: the next release there waits for a report that saw it.
+	if w := h.floorsWritten["a"]; !w.Equal(now) {
+		t.Errorf("lowering the floor was not recorded as a write: %v", w)
+	}
 
 	// Two steps: the due checkpoint is recorded once, and tracking is emptied.
 	for range 2 {
@@ -195,5 +201,47 @@ func TestHubWritesDropStaleFields(t *testing.T) {
 	}
 	if finals != 1 {
 		t.Errorf("final outcome of d1 recorded %d times, want 1", finals)
+	}
+}
+
+// A floor due to be released on a member without a usable report is kept, and the hub
+// says so once, not on every step.
+func TestHubHoldsReleaseWithoutReport(t *testing.T) {
+	now := time.Now()
+	spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"},
+		Clusters:   []v1alpha1.ClusterSpec{{Name: "a", MaxReplicas: 10}, {Name: "b", MaxReplicas: 10}},
+		Capacity:   v1alpha1.CapacityPolicy{Step: 1},
+		Escalation: v1alpha1.EscalationPolicy{After: metav1.Duration{Duration: time.Minute}, CalmFor: metav1.Duration{Duration: time.Minute}, Cooldown: metav1.Duration{Duration: time.Millisecond}}}
+	pol := func(name string, age time.Duration) *v1alpha1.AdaptivePolicy {
+		p := &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: spec}
+		p.Status.Report = &v1alpha1.ClusterReport{Time: metav1.Time{Time: now.Add(-age)}, SpecHash: ReportHash(p, name), DesiredReplicas: 1, ReadyReplicas: 1}
+		return p
+	}
+	home := pol("a", 0)
+	home.Status.Fleet = &v1alpha1.FleetStatus{Hub: "hub", Time: metav1.Time{Time: now}, Phase: v1alpha1.PhaseRecovering,
+		PhaseSince: metav1.Time{Time: now.Add(-time.Hour)}, Clusters: []v1alpha1.ClusterPlan{{Name: "a", Weight: -1}, {Name: "b", Floor: 1, Added: 1, Weight: -1}}}
+	remote := pol("b", 10*time.Minute) // older than ReportTTL
+	remote.Status.Intent = &v1alpha1.Intent{Replicas: 1, Added: 1, Hub: "hub", Expires: metav1.Time{Time: now.Add(4 * time.Minute)}}
+	a, b := statusClient(t, interceptor.Funcs{}, home), statusClient(t, interceptor.Funcs{}, remote)
+	log, _ := core.OpenLog("")
+	rec := events.NewFakeRecorder(10)
+	h := hubFor(a, b, log, nil, nil, false)
+	h.Recorder = rec
+	for range 3 {
+		stepHub(t, h)
+	}
+	got := &v1alpha1.AdaptivePolicy{}
+	_ = b.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "llm"}, got)
+	if got.Status.Intent == nil || got.Status.Intent.Replicas != 1 {
+		t.Errorf("floor on b released without a report from b: %+v", got.Status.Intent)
+	}
+	held := 0
+	for len(rec.Events) > 0 {
+		if e := <-rec.Events; strings.Contains(e, "ReleaseHeld") && strings.Contains(e, "b") {
+			held++
+		}
+	}
+	if held != 1 {
+		t.Errorf("ReleaseHeld raised %d times over three steps, want once", held)
 	}
 }

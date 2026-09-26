@@ -109,3 +109,21 @@ func TestReleaseRegressionWaitForFloorObservation(t *testing.T) {
 		t.Fatalf("fresh observations should allow a safe release: %+v", got)
 	}
 }
+
+// A member without a usable report keeps its floor, and is named so the hub can say why.
+func TestReleaseRegressionHeldWithoutReport(t *testing.T) {
+	in := releaseRegressionInput()
+	in.Clusters[0].Report.NeededReplicas = 0
+	in.Clusters[0].Report.ShortSince = nil
+	in.Clusters[1].Report = nil
+	got := Plan(in)
+	if floors(got)["remote"] != 1 || len(got.Held) != 1 || got.Held[0] != "remote" {
+		t.Fatalf("floor released, or not reported held, without a report: %+v", got)
+	}
+	in.Clusters[1] = member("remote", 1, 1, 1, 0)
+	in.Clusters[1].Floor, in.Clusters[1].Added, in.Clusters[1].Static = 1, 1, true
+	in.Hold = map[string]bool{"remote": true}
+	if got := Plan(in); floors(got)["remote"] != 1 || len(got.Held) != 0 {
+		t.Fatalf("waiting for the next report is not held: %+v", got)
+	}
+}

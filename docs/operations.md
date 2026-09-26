@@ -81,6 +81,7 @@ Suggested alerts:
 
 - **`Ready`** on each member's copy: `True`/`Observed` when the last report succeeded, `False`/`ObservationFailed` with the error otherwise (e.g. Prometheus unreachable), `False`/`NotAMember` when the cluster is not in `spec.clusters`.
 - **Hub decisions** are Events on the hub's copy of the policy, with reason `AddCapacity`, `ShiftTraffic`, `ReleaseCapacity` or a combination. They are `Warning` when applying failed.
+- **`ReleaseHeld`** (`Warning`, hub's copy): a floor was due to be released, but the hub has no usable report from that member (stale, out of sync, or none), so it keeps the floor. Raised when the list changes; also the decision log's `held`. See the runbook.
 - **`MembersOutOfSync`** (`Warning`, hub's copy): the hub ignores some members' reports because their copy of the policy differs in what the report is computed from. Raised when the list changes; the current list is `status.fleet.outOfSync`.
 - **`ReplicasNotReady`** (`Warning`, hub's copy): replicas the hub added are on nodes but still not ready after `readyTimeout`. The floor stays; see the runbook.
 
@@ -175,6 +176,12 @@ Its report is missing, older than 2 minutes, or computed from a different spec:
 1. The scaler serves the floor only in `auto` mode, before `status.intent.expires`, and while `status.intent.hub` matches the member's `plumb-hub` Lease holder.
 2. Check that the ScaledObject has the `external-push` trigger and KEDA can reach `plumb-scaler`.
 3. Check that `maxReplicaCount` is not below the floor.
+
+**Floor kept after the shortage ended** (`ReleaseHeld` event, `held` in the decision log)
+
+1. The hub releases a floor only on a member whose report it can use. Check that member as in *A member is ignored by the hub* above: its agent, its `Ready` condition, and whether it is in `status.fleet.outOfSync`.
+2. Once the member reports again, release resumes, one step per report.
+3. If the member is unreachable, the hub can't renew the floor either: it expires after 5 minutes and KEDA scales down on its own.
 
 **Escalated but nothing added** (`message: N replicas short and no other cluster has room`)
 
