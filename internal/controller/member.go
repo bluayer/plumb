@@ -199,6 +199,7 @@ func (m *Member) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, 
 	if len(errs) > 0 {
 		rep.Error = errors.Join(errs...).Error()
 	}
+	rep.SafePressure, rep.SafeSince = safePressure(p.Status.Report, rep, len(errs) == 0, now)
 	p.Status.Report, p.Status.ObservedGeneration = rep, p.Generation
 	memberNeeded.WithLabelValues(req.String()).Set(float64(rep.NeededReplicas))
 	memberStaticRoom.WithLabelValues(req.String()).Set(float64(rep.StaticRoom))
@@ -211,6 +212,22 @@ func (m *Member) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, 
 	// short) are removed, and the hub's intent and fleet, which the member does not touch,
 	// are not in the patch at all.
 	return ctrl.Result{RequeueAfter: m.Interval}, m.Client.Status().Patch(ctx, p, client.MergeFrom(orig))
+}
+
+// safePressure carries the highest pressure served safely forward: a report counts when
+// the cluster has ready replicas, is not short and every signal was read (a latency that
+// could not be read says nothing about the SLO). The window starts over after
+// SafePressureWindow.
+func safePressure(prev, rep *v1alpha1.ClusterReport, complete bool, now time.Time) (*resource.Quantity, *metav1.Time) {
+	var safe *resource.Quantity
+	since := &metav1.Time{Time: now}
+	if prev != nil && prev.SafeSince != nil && now.Sub(prev.SafeSince.Time) < SafePressureWindow {
+		safe, since = prev.SafePressure, prev.SafeSince
+	}
+	if q := rep.Pressure; q != nil && complete && rep.NeededReplicas == 0 && rep.ReadyReplicas > 0 && (safe == nil || q.Cmp(*safe) > 0) {
+		safe = q
+	}
+	return safe, since
 }
 
 // observe builds the report; failed signals leave their fields empty.

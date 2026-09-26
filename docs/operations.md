@@ -15,16 +15,18 @@ Each item says what goes wrong when it is off. Check them for every workload (po
 - [ ] **`escalation.after` ≥ the time from pending pod to ready in the cluster itself** (node launch, image pull, model load). Too short: shortages the cluster would have solved alone move to other clusters.
 - [ ] **`escalation.readyTimeout` > the model's worst normal load time.** Too short: replicas still loading raise `ReplicasNotReady`, and replicas waiting for a node are taken back before they arrive.
 - [ ] **`escalation.cooldown` > your signals' lag** (scrape interval + query window). Too short: each step reacts to a state that does not show the last one yet, and floors and weights overshoot.
-- [ ] **`escalation.calmFor` longer than the gaps between your traffic bursts.** Too short: capacity is given back just before the next burst.
+- [ ] **`escalation.calmFor` longer than the gaps between your traffic bursts.** Too short: capacity is given back just before the next burst. It also paces the return: one `stepPercent` of traffic per `calmFor`, so with 10% steps a full return takes ten of them.
 
 **Signals**
 
 - [ ] **Every query is scoped to the one model** (e.g. vLLM's `model_name` label). A query over all models makes one model's load look like another's.
 - [ ] **Queries return exactly one sample**, from the member's own Prometheus (`--prometheus-url`). A failing query shows in the `Ready` condition; that signal is then ignored.
 - [ ] **`latencySLO` / `errorRateSLO` are set** if traffic is managed: a cluster over them never gains traffic.
+- [ ] **`pressure` is set** if traffic is managed. It is how the hub knows home can take borrowed traffic back (`status.report.safePressure`); without it, traffic returns on time alone.
 
 **Outside Plumb**
 
+- [ ] **GPUs meant to be lent as static capacity outlive consolidation.** With Karpenter's defaults (`consolidateAfter: 0s`, `WhenEmptyOrUnderutilized`), an empty GPU node in a NodePool is removed within moments, long before another cluster's shortage has lasted `earlyAfter`. Keep lendable GPUs outside NodePools (register them with `nodeSelector`), mark them `karpenter.sh/do-not-disrupt`, or set the NodePool's `consolidateAfter` longer than `earlyAfter` plus the model's load time.
 - [ ] **The ScaledObject has the Plumb `external-push` trigger, and `maxReplicaCount` ≥ any floor you allow** (`maxReplicas`). Otherwise floors are written and nothing scales.
 - [ ] **Every member reaches a majority of members** (ClusterProfiles, access providers, network). Without a majority there is no hub: clusters keep scaling on their own and floors lapse after 5 minutes.
 - [ ] **The same policy is applied, unchanged, in every member.** A member whose copy differs in what its report is computed from (workload, signals, capacity, its own `clusters[]` entry) is ignored by the hub until it catches up; it shows in `status.fleet.outOfSync`. Changes only the hub reads (intent, escalation, weights, placement) take effect without waiting for members.
@@ -176,6 +178,11 @@ Its report is missing, older than 2 minutes, or computed from a different spec:
 1. The scaler serves the floor only in `auto` mode, before `status.intent.expires`, and while `status.intent.hub` matches the member's `plumb-hub` Lease holder.
 2. Check that the ScaledObject has the `external-push` trigger and KEDA can reach `plumb-scaler`.
 3. Check that `maxReplicaCount` is not below the floor.
+
+**Traffic stays on the other cluster after the shortage ended** (Recovering, weights not back)
+
+1. This is on purpose while home can't take it: the hub returns a step only if home's pressure afterwards stays within what a replica has been seen to serve safely (`status.report.safePressure` on home and on the cluster carrying the traffic). The step's reason is in the decision log.
+2. Home grows, or demand drops, and the return resumes, one `stepPercent` per `calmFor`. The borrowed floor goes once that cluster's share is back to its Steady weight.
 
 **Floor kept after the shortage ended** (`ReleaseHeld` event, `held` in the decision log)
 

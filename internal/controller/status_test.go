@@ -245,3 +245,36 @@ func TestHubHoldsReleaseWithoutReport(t *testing.T) {
 		t.Errorf("ReleaseHeld raised %d times over three steps, want once", held)
 	}
 }
+
+// The highest pressure served safely is kept, a short or incomplete report never raises
+// it, and it starts over after a day.
+func TestMemberSafePressure(t *testing.T) {
+	now := time.Now()
+	q := func(v string) *resource.Quantity { r := resource.MustParse(v); return &r }
+	rep := func(pressure string, need int32) *v1alpha1.ClusterReport {
+		return &v1alpha1.ClusterReport{ReadyReplicas: 2, NeededReplicas: need, Pressure: q(pressure)}
+	}
+	prev := &v1alpha1.ClusterReport{SafePressure: q("6"), SafeSince: &metav1.Time{Time: now.Add(-time.Hour)}}
+	for _, tc := range []struct {
+		name     string
+		prev     *v1alpha1.ClusterReport
+		rep      *v1alpha1.ClusterReport
+		complete bool
+		want     string
+	}{
+		{"first safe report", nil, rep("3", 0), true, "3"},
+		{"higher and safe", prev, rep("8", 0), true, "8"},
+		{"lower keeps the highest", prev, rep("2", 0), true, "6"},
+		{"short does not count", prev, rep("9", 1), true, "6"},
+		{"a signal failed", prev, rep("9", 0), false, "6"},
+		{"window over, starts again", &v1alpha1.ClusterReport{SafePressure: q("6"), SafeSince: &metav1.Time{Time: now.Add(-25 * time.Hour)}}, rep("2", 0), true, "2"},
+	} {
+		got, since := safePressure(tc.prev, tc.rep, tc.complete, now)
+		if got == nil || got.Cmp(resource.MustParse(tc.want)) != 0 || since == nil {
+			t.Errorf("%s: safe pressure %v since %v, want %s", tc.name, got, since, tc.want)
+		}
+	}
+	if got, _ := safePressure(nil, rep("9", 1), true, now); got != nil {
+		t.Errorf("a cluster only seen short has a safe pressure: %v", got)
+	}
+}

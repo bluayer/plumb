@@ -194,8 +194,10 @@ func Plan(in Input) Result {
 			notes = append(notes, n)
 		}
 	}
-	if res.Phase == v1alpha1.PhaseRecovering && in.Now.Sub(res.PhaseSince) >= cfg.CalmFor && due {
-		n, held := releaseCapacity(cs, cfg.Step, in.Hold)
+	traffic := cfg.StepPercent > 0 && !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight < 0 })
+	calm := res.Phase == v1alpha1.PhaseRecovering && in.Now.Sub(res.PhaseSince) >= cfg.CalmFor
+	if calm && due {
+		n, held := releaseCapacity(cs, cfg.Step, in.Hold, traffic)
 		res.Held = held
 		if n != "" {
 			if !slices.Contains(actions, "release_capacity") {
@@ -204,11 +206,18 @@ func Plan(in Input) Result {
 			notes = append(notes, n)
 		}
 	}
-	traffic := cfg.StepPercent > 0 && !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight < 0 })
-	if traffic && res.Phase != v1alpha1.PhaseSteady && due {
-		if n := shiftTraffic(cs, cfg, escalated, in.LastStep); n != "" {
-			actions, notes = append(actions, "shift_traffic"), append(notes, n)
-		}
+	// Traffic moves for relief while a member is short or over its SLO, and otherwise
+	// only back toward the Steady weights, slowly: whatever serves well is left alone.
+	var moved string
+	switch {
+	case !traffic || res.Phase == v1alpha1.PhaseSteady || !due:
+	case res.Phase == v1alpha1.PhaseEscalated || slices.ContainsFunc(cs, func(c Cluster) bool { return violates(c, cfg) }):
+		moved = shiftTraffic(cs, cfg, escalated, in.LastStep)
+	case calm && (in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.CalmFor):
+		moved = returnTraffic(cs, cfg, in.LastStep)
+	}
+	if moved != "" {
+		actions, notes = append(actions, "shift_traffic"), append(notes, moved)
 	}
 	if res.Phase == v1alpha1.PhaseRecovering && atRest(cs, traffic) {
 		res.Phase, res.PhaseSince = v1alpha1.PhaseSteady, in.Now
@@ -482,9 +491,10 @@ func hasShortage(cs []Cluster) bool {
 
 // releaseCapacity lowers floors by step in the reverse of the order they were taken:
 // dynamic before static (Karpenter consolidates what it added while existing nodes stay
-// in use). A fresh report must acknowledge the previous floor before another release;
-// members without a usable report are returned as held.
-func releaseCapacity(cs []Cluster, step int32, hold map[string]bool) (string, []string) {
+// in use). A floor stays while its cluster still carries more than its Steady share of
+// traffic: the traffic comes back first. A fresh report must acknowledge the previous
+// floor before another release; members without a usable report are returned as held.
+func releaseCapacity(cs []Cluster, step int32, hold map[string]bool, traffic bool) (string, []string) {
 	last := int32(-1) // the tier taken last is released first
 	for _, c := range cs {
 		if c.Floor > 0 {
@@ -496,6 +506,8 @@ func releaseCapacity(cs []Cluster, step int32, hold map[string]bool) (string, []
 		switch {
 		case c.Floor == 0 || c.Tier != last:
 			continue
+		case traffic && c.Weight > steadyWeight(c):
+			continue // still serving borrowed traffic
 		case c.Report == nil:
 			held = append(held, c.Spec.Name)
 			continue
@@ -651,11 +663,77 @@ func capacityOf(c Cluster, cfg Config) float64 {
 	return cmp.Or(cfg.ReplicaCapacity, 1)
 }
 
+func steadyWeight(c Cluster) int32 {
+	return min(max(c.Spec.Weight, c.Spec.MinWeight), c.Spec.MaxWeight)
+}
+
+// returnTraffic moves one step of traffic back toward the Steady weights: from the
+// cluster furthest above its Steady weight (the tier taken last first, as floors are
+// released) to the one furthest below. Plan calls it at most once per CalmFor.
+func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
+	donor, receiver := -1, -1
+	over := func(c Cluster) int32 { return c.Weight - steadyWeight(c) }
+	for i, c := range cs {
+		if over(c) > 0 && (donor < 0 || c.Tier > cs[donor].Tier || (c.Tier == cs[donor].Tier && over(c) > over(cs[donor]))) {
+			donor = i
+		}
+		if over(c) < 0 && c.Report != nil && c.Report.ReadyReplicas > 0 && (receiver < 0 || over(c) < over(cs[receiver])) {
+			receiver = i
+		}
+	}
+	if donor < 0 || receiver < 0 {
+		return ""
+	}
+	n := min(cfg.StepPercent, over(cs[donor]), -over(cs[receiver]))
+	note, err := canReturn(cs, cfg, cs[donor], cs[receiver], n, lastStep)
+	if err != nil {
+		return ""
+	}
+	cs[donor].Weight -= n
+	cs[receiver].Weight += n
+	return fmt.Sprintf("%s %d→%d%%, %s %d→%d%% back%s", cs[donor].Spec.Name, cs[donor].Weight+n, cs[donor].Weight,
+		cs[receiver].Spec.Name, cs[receiver].Weight-n, cs[receiver].Weight, note)
+}
+
+// canReturn says whether n points of traffic may move back from d to r. With pressure
+// reported, only if r's pressure afterwards stays within what a replica of this workload
+// has been seen to serve without being short: r's own safePressure, or d's, carried over
+// by the clusters' replica capacities (d serves this very traffic now). It judges on
+// reports taken after the last step. Without pressure nothing tells, and a step at a time,
+// a CalmFor apart, is the only caution.
+func canReturn(cs []Cluster, cfg Config, d, r Cluster, n int32, lastStep time.Time) (string, error) {
+	if pressured(cs) == 0 {
+		return "", nil
+	}
+	for _, c := range []Cluster{d, r} {
+		if c.Report == nil || c.Report.Pressure == nil || (!lastStep.IsZero() && !c.Report.Time.After(lastStep)) {
+			return "", fmt.Errorf("no fresh pressure from %s", c.Spec.Name)
+		}
+	}
+	if r.Report.ReadyReplicas == 0 || d.Weight <= 0 {
+		return "", fmt.Errorf("%s has no ready replicas", r.Spec.Name)
+	}
+	load := func(c Cluster) float64 {
+		return c.Report.Pressure.AsApproximateFloat64() * float64(c.Report.ReadyReplicas)
+	}
+	after := (load(r) + load(d)*float64(n)/float64(d.Weight)) / float64(r.Report.ReadyReplicas)
+	limit := -1.0
+	if s := r.Report.SafePressure; s != nil {
+		limit = s.AsApproximateFloat64()
+	}
+	if s := d.Report.SafePressure; s != nil {
+		limit = max(limit, s.AsApproximateFloat64()*capacityOf(r, cfg)/capacityOf(d, cfg))
+	}
+	if limit < 0 || after > limit {
+		return "", fmt.Errorf("%s would reach pressure %s, above what a replica has served safely (%s)", r.Spec.Name, fmtLoad(after), fmtLoad(max(limit, 0)))
+	}
+	return fmt.Sprintf(" (%s pressure about %s, served safely up to %s)", r.Spec.Name, fmtLoad(after), fmtLoad(limit)), nil
+}
+
 // atRest: no floors left and, when traffic is managed, every share back at its Steady weight.
 func atRest(cs []Cluster, traffic bool) bool {
 	for _, c := range cs {
-		steady := min(max(c.Spec.Weight, c.Spec.MinWeight), c.Spec.MaxWeight)
-		if c.Floor > 0 || (traffic && c.Weight != steady) {
+		if c.Floor > 0 || (traffic && c.Weight != steadyWeight(c)) {
 			return false
 		}
 	}

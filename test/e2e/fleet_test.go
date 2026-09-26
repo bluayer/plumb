@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,9 +121,10 @@ func startMember(t *testing.T, cl *cluster, name string, prom *adapters.Promethe
 func ptrTo[T any](v T) *T { return &v }
 
 // fakePrometheus answers the "pressure" query for one member like a queue would: its
-// share of the route's traffic per ready replica. Traffic moved to the member raises its
-// pressure, so the hub's balancing is exercised as a closed loop.
-func fakePrometheus(t *testing.T, e, routes *env, backend string) *adapters.Prometheus {
+// share of the route's traffic per ready replica, scaled by demand (percent, shared by
+// the members). Traffic moved to the member raises its pressure, so the hub's balancing
+// is exercised as a closed loop.
+func fakePrometheus(t *testing.T, e, routes *env, backend string, demand *atomic.Int64) *adapters.Prometheus {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		weights, err := adapters.RouteWeights(ctx, routes.cl.c, v1alpha1.RouteRef{Namespace: routes.ns, Name: "llm"},
@@ -137,7 +139,7 @@ func fakePrometheus(t *testing.T, e, routes *env, backend string) *adapters.Prom
 		}
 		pressure := 0.0
 		if d.Status.ReadyReplicas > 0 {
-			pressure = float64(weights["me"]) / float64(d.Status.ReadyReplicas)
+			pressure = float64(weights["me"]) * float64(demand.Load()) / 100 / float64(d.Status.ReadyReplicas)
 		}
 		_, _ = fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[%d,"%g"]}]}}`,
 			time.Now().Unix(), pressure)
@@ -316,13 +318,15 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 	saved := core.Horizons // outcome checkpoints, shortened for the test
 	core.Horizons = []time.Duration{2 * time.Second, 20 * time.Second}
 	t.Cleanup(func() { core.Horizons = saved })
-	mh := startMember(t, home, "home", fakePrometheus(t, h, h, "llm-home"), time.Second)
+	demand := &atomic.Int64{}
+	demand.Store(100)
+	mh := startMember(t, home, "home", fakePrometheus(t, h, h, "llm-home", demand), time.Second)
 	eventually(t, 30*time.Second, "home leading a fleet of one", func() bool {
 		fs := h.get().Status.Fleet
 		return fs != nil && fs.Hub == mh.identity
 	})
 	joinFleet(t, home, remote)
-	mr := startMember(t, remote, "remote", fakePrometheus(t, r, h, "llm-remote"), time.Second)
+	mr := startMember(t, remote, "remote", fakePrometheus(t, r, h, "llm-remote", demand), time.Second)
 
 	// Escalation lands on remote's idle static capacity, served to KEDA by remote's scaler.
 	start := time.Now()
@@ -373,8 +377,11 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 		t.Fatalf("balanced pressure must hold the split, got %v", w)
 	}
 
-	// Load drops at home: no one is short. After calmFor the floor goes, traffic returns.
+	// Balanced traffic stays balanced: home can take more only once demand drops. Then no
+	// one is short and, after calmFor, traffic comes back a step at a time, as far as home
+	// has served safely; the floor goes once remote carries none.
 	h.scale("llm", 2)
+	demand.Store(25)
 	eventually(t, 60*time.Second, "back to Steady", func() bool {
 		fs := hubStatus(h, r)
 		w := h.routeWeights("llm")

@@ -363,6 +363,15 @@ type ClusterReport struct {
 	// ShortSince is when NeededReplicas became positive.
 	// +optional
 	ShortSince *metav1.Time `json:"shortSince,omitempty"`
+	// SafePressure is the highest pressure this cluster has reported while it was not
+	// short and every signal was read, since SafeSince. The hub moves traffic back to a
+	// cluster only as far as this level: never to a load it has not been seen to serve.
+	// +optional
+	SafePressure *resource.Quantity `json:"safePressure,omitempty"`
+	// SafeSince is when SafePressure started being tracked; after a day it starts over,
+	// so it follows changes in the model, the GPUs or the requests.
+	// +optional
+	SafeSince *metav1.Time `json:"safeSince,omitempty"`
 	// +optional
 	Error string `json:"error,omitempty"`
 	// Metrics are the values of spec.signals.metrics, with the time Prometheus sampled them.

@@ -66,7 +66,7 @@ Take two members, `use1` and `usw2`, with the default `LocalFirst` placement. Tr
 3. **The hub borrows capacity.** It raises `usw2`'s replica floor by at most `step`: idle existing nodes first, new nodes only if those are not enough. `usw2`'s scaler serves the floor to KEDA, which scales the Deployment there.
 4. **It waits for the replicas to be ready.** If they never reach a node within `readyTimeout`, the floor is taken back and the shortage placed elsewhere. If they are on nodes but still loading, the hub only warns.
 5. **Traffic follows ready capacity.** HTTPRoute weights move toward `usw2` by at most `stepPercent` per step, and never toward a cluster over its SLO.
-6. **Everything is given back.** Once no member is short and the fleet has been calm for `calmFor`, floors come down by `step`, newest capacity first, then weights return to normal.
+6. **Everything is given back, slowly.** While `usw2` serves well, nothing moves. Once no member is short and the fleet has been calm for `calmFor`, traffic comes back to `use1` one `stepPercent` step per `calmFor`, and only as far as `use1`'s replicas have been seen to serve without a shortage. When `usw2` carries no borrowed traffic, its floors come down by `step`, newest capacity first. If `use1` can't take the traffic back, `usw2` keeps serving it.
 
 The fleet moves through three phases on the way:
 
@@ -76,7 +76,7 @@ stateDiagram-v2
   Steady --> Escalated: a member stays short
   Escalated --> Recovering: no member short
   Recovering --> Escalated: short again
-  Recovering --> Steady: calm for calmFor,<br/>floors and weights back
+  Recovering --> Steady: calm for calmFor,<br/>traffic back, then floors
 ```
 
 At most one step per `cooldown`, and every timing value is the policy's own, so a large model can wait longer than a small one. In `shadow` mode (the default) the hub decides the same way but writes nothing, and simulates the plan forward in `status.fleet` for you to review.
@@ -92,7 +92,7 @@ A shortage is first its own cluster's to solve; the fleet is the fallback. `spec
 | 3 | other members' existing nodes | own NodePools |
 | 4 | other members' NodePools | other members' NodePools |
 
-*Static room* is existing nodes, reserved ones included. *Dynamic room* is what the NodePools may still add.
+*Static room* is existing nodes, reserved ones included. *Dynamic room* is what the NodePools may still add. Static room on NodePool nodes lasts only as long as Karpenter keeps them: with its default consolidation (`consolidateAfter: 0s`), an empty node is removed within moments, so GPUs meant to be lent should be registered outside NodePools or protected from consolidation (see the [operations checklist](operations.md#checklist-know-these-before-you-run-it)).
 
 - **The member's own rows need no hub.** Its scheduler, KEDA and Karpenter do them. The hub decides only when the other members' rows start, and takes their static room before their dynamic room.
 - **Own dynamic room is used up** when the member registers no NodePools, they are at their limits, or launches keep failing (dynamic room counts as zero after recurring insufficient-capacity errors). The fleet then steps in once the member has been short for `earlyAfter`.
@@ -121,13 +121,22 @@ The clock lives in `status.fleet`, so a new hub picks it up. Shadow mode does no
 
 ## Traffic
 
-While any floor is held or any member is short, the hub sets cluster weights on the HTTPRoutes:
+Traffic moves for two reasons only, and otherwise stays where it is: a split that serves well is left alone.
+
+**Relief**, while a member is short (Escalated) or any cluster is over its SLO:
 
 - **With `signals.pressure`** (e.g. waiting requests per replica, KV-cache usage), it balances pressure: each step moves up to `stepPercent` from the busiest cluster to the least busy one. Nothing moves while the two are within 20% of each other, or until both have reported after the previous shift. Ready replicas are only a prior; measured pressure corrects it, whatever the GPU type, request lengths or cache state.
 - **Without pressure**, each cluster's share is proportional to `readyReplicas × replicaCapacity`.
 - **Always:** a cluster over its `latencySLO` or `errorRateSLO` never gains traffic (in pressure mode it is drained first), and shares stay within `[minWeight, maxWeight]`.
 
-Otherwise each cluster gets its Steady `weight`.
+**Return**, once no member has been short for `calmFor` (Recovering): traffic comes back toward the Steady `weight`s, never toward borrowed capacity.
+
+- One `stepPercent` step per `calmFor`, from the cluster furthest above its Steady weight (the tier taken last first) to the one furthest below.
+- With pressure, a step is taken only if the receiver's pressure afterwards stays within what a replica of the workload has been seen to serve without a shortage. That is the receiver's own `status.report.safePressure` (the highest in the last day), or the donor's, converted by the clusters' `replicaCapacity`. Otherwise the split holds, and the borrowed capacity keeps serving. So if home can't take the traffic back, nothing moves back and forth.
+- Without pressure there is nothing to judge by: steps are simply a `calmFor` apart.
+- A shortage stops the return at once.
+
+A floor is released only once its cluster carries no more than its Steady share (see [release](#the-planning-step-in-detail)). The fleet is Steady again when no floor is left and every share is back.
 
 ## Where the state lives
 
@@ -195,7 +204,7 @@ At least every `--hub-interval` (10s), and sooner when a member's report changes
 4. **Ranking.** Static room, fewer launch failures, cost rank, more room, name. *Experimental:* a model may reorder them ([below](#ranking-model)).
 5. **Allocation.** Two passes over the ranking, one per **tier**: static room (tier 0), then dynamic room (tier 1), the latter only when the fleet may launch nodes for this shortage ([placement](#placement)). Each cluster gains at most `step` replicas per step. Floors are absolute: `max(current floor, desired) + added`. A cluster whose report predates the last floor the hub wrote there, for any policy, takes nothing this step.
 6. **Traffic.** Weights as described in [traffic](#traffic).
-7. **Release.** After `calmFor` in Recovering, floors drop by `step`, highest tier first, so Karpenter consolidates what it added while existing and reserved nodes stay in use. A floor drops only on a member that has reported since the hub last raised or lowered a floor there, so releases go one acknowledged step at a time. A member without a usable report (stale, out of sync, or none) keeps its floor, and the hub raises a `ReleaseHeld` Event naming it. A member reporting a shortage again, even one too young to borrow for, ends Recovering, and the calm interval starts over once it clears. Then weights return to Steady.
+7. **Release.** After `calmFor` in Recovering, floors drop by `step` on clusters whose traffic has come back to their Steady share, highest tier first, so Karpenter consolidates what it added while existing and reserved nodes stay in use. A floor drops only on a member that has reported since the hub last raised or lowered a floor there, so releases go one acknowledged step at a time. A member without a usable report (stale, out of sync, or none) keeps its floor, and the hub raises a `ReleaseHeld` Event naming it. A member reporting a shortage again, even one too young to borrow for, ends Recovering, and the calm interval starts over once it clears.
 
 The rules decide *where*; the policy and arithmetic decide *how much*.
 
@@ -236,7 +245,7 @@ flowchart LR
 
 1. **Planner (background).** While a member is short or the fleet is not Steady, at most once per `--planner-interval`, the planner gets the intent, each cluster's state and metrics (value, unit, meaning, age) and what followed recent decisions. It proposes up to 3 plans of actions: add replicas to a cluster's floor, release some, shift traffic between two clusters. Hub steps never wait for it: its plans join the candidates of the steps after they arrive, until newer ones come or they are two intervals old. A plan is one step: once one is picked the policy's plans are spent, and plans made for an earlier version of the policy are never offered.
 2. **Candidates.** Each step offers the planner's plans, the rules' plan, holding, and every one-step change the limits allow.
-3. **Validation.** Every candidate is checked action by action on the state the previous action leaves: the cluster exists; `maxReplicas`, `step` and `stepPercent`; room left after other policies' reservations; the rule that a member takes nothing until it reports after the last floor written there; traffic only to clusters with ready replicas, within their SLO and weight bounds; no release while any member reports a shortage, or on a member without a report since the last floor written there; nothing but holding within the cooldown. Invalid and duplicate candidates are dropped with the reason logged. The placement order is a preference the models are told, not a check.
+3. **Validation.** Every candidate is checked action by action on the state the previous action leaves: the cluster exists; `maxReplicas`, `step` and `stepPercent`; room left after other policies' reservations; the rule that a member takes nothing until it reports after the last floor written there; traffic only to clusters with ready replicas, within their SLO and weight bounds; no release while any member reports a shortage, on a member without a report since the last floor written there, or on one still carrying more than its Steady share; with no shortage or SLO breach, traffic only toward the Steady weights, once per `calmFor`, within what the receiver can serve safely; nothing but holding within the cooldown. Invalid and duplicate candidates are dropped with the reason logged. The placement order is a preference the models are told, not a check.
 4. **Choice.** Jev gets the intent, the observations, each plan's validated changes, past times to ready, and the planner's hypothesis, each kept apart and labelled, and picks one. Below `confidenceThresholdPercent`, on an error, or with a single candidate, the rules' plan runs.
 5. **Mode.** In `shadow` the rules' plan runs and Jev's pick is recorded; in `apply` Jev's pick runs, through the same floors, weights and fencing. If the policy changed while the models were asked, nothing decided on the old one is carried out.
 
