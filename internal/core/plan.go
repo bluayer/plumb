@@ -267,6 +267,11 @@ func AwaitReady(cs []Cluster, cfg Config, now time.Time) (released, warnings []s
 		c.WaitingSince = now
 		offNode := max(c.Floor-r.DesiredReplicas, 0) + r.PendingReplicas
 		if n := min(offNode, c.Added); n > 0 {
+			// The report still counts the taken-back replicas as pending; until the next
+			// one, they are not this cluster's shortage.
+			rc := *r
+			rc.PendingReplicas, rc.NeededReplicas = max(r.PendingReplicas-n, 0), max(r.NeededReplicas-n, 0)
+			c.Report = &rc
 			c.Floor, c.Added = c.Floor-n, c.Added-n
 			if c.Added == 0 {
 				c.Floor, c.Static, c.Tier, c.WaitingSince = 0, false, 0, time.Time{}
@@ -294,10 +299,13 @@ func escalation(cs []Cluster, i int, cfg Config, now time.Time) (dynamic, ok boo
 		return false, false
 	}
 	short := now.Sub(r.ShortSince.Time)
-	if short >= cfg.After || (dynamicRoom(cs[i]) == 0 && short >= cfg.EarlyAfter) {
+	// Replicas already on its nodes but not ready yet (loading the model) are the member
+	// helping itself: it gets `after` for them, as it would for its NodePools.
+	early := short >= cfg.EarlyAfter && r.DesiredReplicas-r.ReadyReplicas-r.PendingReplicas <= 0
+	if short >= cfg.After || (dynamicRoom(cs[i]) == 0 && early) {
 		return true, true
 	}
-	if cfg.StaticFirst && short >= cfg.EarlyAfter && staticRoomBesides(cs, i) > 0 {
+	if cfg.StaticFirst && early && staticRoomBesides(cs, i) > 0 {
 		return false, true
 	}
 	return false, false
@@ -551,12 +559,14 @@ func releaseCapacity(cs []Cluster, step int32, hold map[string]bool, traffic boo
 	return strings.Join(notes, ", "), held
 }
 
-// shiftTraffic moves shares while floors are held or a member is short, and back to the
-// Steady weights after. With pressure reported it balances pressure; otherwise shares
-// follow ready capacity. Either way a share moves at most StepPercent per step, a cluster
-// over its SLO never gains traffic, and members without a report keep their share.
+// shiftTraffic moves shares while floors are held, a member is short or shares are off
+// their Steady weights (relief already under way: going back is returnTraffic's, with its
+// checks), and toward the Steady weights otherwise. With pressure reported it balances
+// pressure; otherwise shares follow ready capacity. Either way a share moves at most
+// StepPercent per step, a cluster over its SLO never gains traffic, and members without a
+// report keep their share.
 func shiftTraffic(cs []Cluster, cfg Config, escalated bool, lastStep time.Time) string {
-	follow := escalated || slices.ContainsFunc(cs, func(c Cluster) bool { return c.Floor > 0 })
+	follow := escalated || slices.ContainsFunc(cs, func(c Cluster) bool { return c.Floor > 0 || over(c) != 0 })
 	if follow && pressured(cs) >= 2 {
 		return balance(cs, cfg, lastStep)
 	}
@@ -589,7 +599,7 @@ func shiftTraffic(cs []Cluster, cfg Config, escalated bool, lastStep time.Time) 
 	var imbalance int32
 	for i, c := range cs {
 		t := min(max(int32(math.Round(target[c.Spec.Name])), c.Spec.MinWeight), c.Spec.MaxWeight)
-		if follow && violates(c, cfg) {
+		if violates(c, cfg) {
 			t = min(t, c.Weight) // SLO brake: no more traffic to a cluster over its objective
 		}
 		deltas[i] = min(max(t-c.Weight, -cfg.StepPercent), cfg.StepPercent)
@@ -685,10 +695,35 @@ func balance(cs []Cluster, cfg Config, lastStep time.Time) string {
 		return ""
 	}
 	n := min(cfg.StepPercent, cs[donor].Weight-cs[donor].Spec.MinWeight, cs[receiver].Spec.MaxWeight-cs[receiver].Weight)
+	if overshoots(cs[donor], cs[receiver], n) {
+		return ""
+	}
 	cs[donor].Weight -= n
 	cs[receiver].Weight += n
 	return fmt.Sprintf("%s %d→%d%%, %s %d→%d%% (pressure %s vs %s)", cs[donor].Spec.Name, cs[donor].Weight+n, cs[donor].Weight,
 		cs[receiver].Spec.Name, cs[receiver].Weight-n, cs[receiver].Weight, fmtLoad(d), fmtLoad(r))
+}
+
+// overshoots reports whether moving n percent from a donor over its SLO because of its
+// load (busier than the receiver) would leave the receiver busier than the donor: both
+// are out of room, and the move would only bounce back next step. A donor over its SLO
+// while less busy, with no ready replicas, or with no pressure reading gives way anyway.
+func overshoots(donor, receiver Cluster, n int32) bool {
+	d, r := donor.Report, receiver.Report
+	if d.Pressure == nil || d.ReadyReplicas == 0 || donor.Weight == 0 || r.ReadyReplicas == 0 {
+		return false
+	}
+	pd := d.Pressure.AsApproximateFloat64()
+	var pr float64
+	if r.Pressure != nil {
+		pr = r.Pressure.AsApproximateFloat64()
+	}
+	if pd <= pr {
+		return false
+	}
+	perPercent := pd * float64(d.ReadyReplicas) / float64(donor.Weight) // load one percent carries
+	after := pr + float64(n)*perPercent/float64(r.ReadyReplicas)
+	return after > pd*float64(donor.Weight-n)/float64(donor.Weight)
 }
 
 func fmtLoad(v float64) string {
@@ -722,14 +757,15 @@ func steadyWeight(c Cluster) int32 {
 func over(c Cluster) int32 { return c.Weight - steadyWeight(c) }
 
 // returnPair picks where traffic comes back from and to: the cluster furthest above its
-// Steady weight (the tier taken last first) and the one furthest below with ready replicas.
+// Steady weight (the tier taken last first) and the one furthest below with ready replicas,
+// unless it is skipped because replicas raised there never reached a node.
 func returnPair(cs []Cluster) (donor, receiver int) {
 	donor, receiver = -1, -1
 	for i, c := range cs {
 		if over(c) > 0 && (donor < 0 || c.Tier > cs[donor].Tier || (c.Tier == cs[donor].Tier && over(c) > over(cs[donor]))) {
 			donor = i
 		}
-		if over(c) < 0 && c.Report != nil && c.Report.ReadyReplicas > 0 && (receiver < 0 || over(c) < over(cs[receiver])) {
+		if over(c) < 0 && c.Report != nil && c.Report.ReadyReplicas > 0 && c.SkippedUntil.IsZero() && (receiver < 0 || over(c) < over(cs[receiver])) {
 			receiver = i
 		}
 	}
@@ -837,10 +873,12 @@ func canReturn(cs []Cluster, cfg Config, d, r Cluster, n int32, lastStep time.Ti
 			return "", fmt.Errorf("no fresh pressure from %s", c.Spec.Name)
 		}
 	}
-	if r.Report.ReadyReplicas == 0 || d.Weight <= 0 {
+	// Ready replicas its autoscaler is scaling in do not take traffic back.
+	keep := min(r.Report.ReadyReplicas, max(r.Report.DesiredReplicas, r.Floor))
+	if keep <= 0 || d.Weight <= 0 {
 		return "", fmt.Errorf("%s has no ready replicas", r.Spec.Name)
 	}
-	after := (loadOf(r) + loadOf(d)*float64(n)/float64(d.Weight)) / float64(r.Report.ReadyReplicas)
+	after := (loadOf(r) + loadOf(d)*float64(n)/float64(d.Weight)) / float64(keep)
 	limit := returnLimit(cfg, d, r)
 	if limit < 0 || after > limit {
 		return "", fmt.Errorf("%s would reach pressure %s, above what a replica has served safely (%s)", r.Spec.Name, fmtLoad(after), fmtLoad(max(limit, 0)))

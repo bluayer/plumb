@@ -21,28 +21,54 @@ make proto         # regenerate KEDA's external scaler gRPC code (needs protoc)
 make build         # bin/plumb
 ```
 
+## Test layers
+
+Test a change at the cheapest level that can show it:
+
+| Layer | Where | What it is for |
+|---|---|---|
+| Planning | `internal/core/*_test.go` | One `Plan` step on hand-made inputs: a rule, a limit, a bug's exact input |
+| Simulations | `internal/core/sim_test.go` | `Plan` against a crude fleet over hours of simulated time: KEDA (with the HPA's 5-minute scale-in window), node launches, model loading, latency from load. Every step of every run is checked against invariants (limits, no release while short, no traffic to a cluster over its SLO or to borrowed capacity without cause, no traffic bouncing between the same two clusters, no borrowing again right after giving back). A table of named scenarios adds what each is about; 500 seeded random fleets run the invariants over shapes nobody wrote down |
+| Members and hub | `internal/controller/*_test.go` | Reconcilers against fake clients: what is read, written and recorded |
+| End to end | `test/e2e/` | Everything against real API servers and the real scheduler, below |
+
+A behavior change to planning belongs in a scenario (`simScenarios`) as well as a unit test. To look at a failing random run, `go test ./internal/core/ -run 'TestSimulationsRandom/seed_42' -v` prints the steps that led to it.
+
 ## End-to-end tests
 
-The e2e suite runs Plumb in-process against two real, disposable clusters with the real kube-scheduler. GPU nodes are [KWOK](https://kwok.sigs.k8s.io) fake nodes, so no GPUs or cloud accounts are needed.
+The e2e suite runs Plumb in-process against three real, disposable clusters ("home", "remote", "third"; most tests use the first two) with the real kube-scheduler. GPU nodes are [KWOK](https://kwok.sigs.k8s.io) fake nodes, so no GPUs or cloud accounts are needed. What runs around Plumb in a real cluster is played by loops in the test process (`test/e2e/harness_test.go`): traffic split by the HTTPRoute's weights, answered to each member as pressure and latency like Prometheus would; KEDA, scaling to the larger of Plumb's floor (read through its external scaler) and the load; and Karpenter, launching KWOK nodes for unschedulable pods within a NodePool's limits, keeping `status.resources`, consolidating empty nodes, or failing launches the way it reports insufficient capacity.
 
 ```sh
-make e2e-up       # PROVIDER=kind (default) | minikube | kwok; creates clusters "home" and "remote"
-make e2e          # about 3 minutes
+make e2e-up       # PROVIDER=kind (default) | minikube | kwok; creates clusters "home", "remote" and "third"
+make e2e          # about 4 minutes
 make e2e-down
 ```
 
 - **Setup.** `hack/e2e.sh up` installs the KWOK controller (the version in `hack/tools/go.mod`) and writes kubeconfigs to `.e2e/`. Karpenter, Gateway API and ClusterProfile CRDs are installed; their controllers are not run.
 - **Permissions.** Members run as a ServiceAccount bound to the chart's generated `plumb-agent` ClusterRole, not as admin, so a permission Plumb needs but the chart lacks fails the suite. Leftovers of an earlier run (`e2e-*` namespaces, scenario nodes) are removed first.
 - **Safety check.** The suite refuses to run against a context that is not `kind-*`, `kwok-*`, `minikube` or `plumb-e2e*`, unless `PLUMB_E2E_ALLOW_ANY_CLUSTER=1`.
-- **Logs.** `PLUMB_E2E_LOG=1` prints the agents' logs.
+- **Logs.** `PLUMB_E2E_LOG=1` prints the agents' logs. A failed fleet test prints both copies' status and every decision.
+- **One at a time.** Members reconcile every namespace and share the hub Lease, so fleet tests run one after another. Home's member starts first and leads the fleet, so every run takes the same path.
 
 | Test | What it checks |
 |---|---|
 | `TestStaticCapacityMatchesScheduler` | The placement simulation against the real scheduler in 10 scenarios: predicts N, then scaling to N+2 binds exactly N |
-| `TestFleetEscalationToStaticCapacity` | A cluster joins a running fleet; a short member's replicas land on the other member's idle static capacity, once; the scaler serves the floor; traffic balances pressure from a fake Prometheus that answers with each cluster's share per ready replica, and holds when even; outcome records are joined to the decision; everything returns to Steady; the hub fails over |
 | `TestMemberReportsLaunchFailures` | Karpenter launch failures appear in the member's report and the NodePool is never edited, even in `auto` mode; status writes stay at one per report interval |
 | `TestFleetPoliciesShareCapacity` | Two policies short at once compete for 4 idle GPUs on the other member while KEDA reacts slowly: together they are promised exactly 4, and following the floors leaves nothing unschedulable |
 | `TestAdaptivePlannerAndJev` | The experimental adaptive path with a scripted planner and Jev: the planner answers in the background, the plan beyond the limits is rejected, Jev's pick of the valid one becomes a floor on the other member, and no floor ever exceeds the room it reported |
+| `TestFleetJoinAndLeave` | With its peer's ClusterProfile gone, a member leads a fleet of one and borrows nothing; once the peer joins, its idle GPUs take the shortage |
+| `TestFleetEscalationToStaticCapacity` | A short member without NodePools gets the other member's idle GPUs after `earlyAfter`; the scaler serves the floor; traffic balances pressure as the replicas become ready, then holds, and nothing is given back while it carries traffic |
+| `TestFleetReturnGrowsHomeFirst` | Demand drops: home's floor is raised (tier -1) before traffic comes back, traffic returns a step at a time, the borrowed floor goes before home's, and the capacity decision's outcome is joined to what followed |
+| `TestFleetLateRouteCatchesUp` | A second route the policy steers is removed after the split settles and comes back with stale weights: the hub brings it to the split though the first route does not move |
+| `TestFleetThreeWayTrafficStep` | In a three-member fleet, the first traffic step moves at most `stepPercent` away from home and the backend weights sum to 100 |
+| `TestFleetFailover` | The hub stops mid-escalation: the other member takes the lease, carries on from `status.fleet`, re-issues the floor under its name, and the split holds |
+| `TestScalerFencing` | The scaler serves a floor only from the lease holder, unexpired, in `auto` mode, cut to the cluster's `maxReplicas`, against a real Lease |
+| `TestFleetReadyTimeoutTakesBack` | Floor replicas that never reach a node (no KEDA on the member) are taken back after `readyTimeout` and the member is skipped |
+| `TestFleetOutOfSyncHoldsRelease` | A member whose copy of the policy drifts is listed in `status.fleet.outOfSync` and its floor is kept, not given back blind; fixed, the floor goes |
+| `TestShadowModeWritesNothing` | In `shadow` mode decisions are recorded but no floor is written and no traffic moves |
+| `TestFleetDynamicCapacity` | The other member has only a NodePool: the floor is taken as new nodes, Karpenter launches them for the pending replicas, and traffic follows |
+| `TestFleetOwnNodePoolFirst` | A member whose NodePool can grow gets `after` to launch its own nodes and borrows nothing |
+| `TestFleetLaunchFailuresBorrowEarly` | A member whose launches keep failing borrows after `earlyAfter`, not `after` |
 
 ## Conventions
 
@@ -58,7 +84,7 @@ make e2e-down
   internal/adapters/aws/ karpenter.go (EC2 error codes, launch reasons, node labels), bedrock.go (planner on Bedrock)
   internal/scaler/       KEDA external scaler (externalscaler/ holds KEDA's .proto)
   charts/plumb/          Helm chart; CRD and ClusterRole are generated into it
-  test/e2e/              two-cluster e2e on KWOK fake GPU nodes
+  test/e2e/              multi-cluster e2e on KWOK fake GPU nodes, with KEDA, Karpenter and traffic played by the harness
   ```
 - **Strings from other projects.** Event reasons, labels, field paths and protocol details from Karpenter, Gateway API, cluster-inventory-api, KEDA, typesafe-sdk, the model hosts (Cloudflare, Vercel) or the AWS SDK are copied from the pinned version's source or the host's documentation, never guessed. A comment names the file or page.
 - **Behaviour changes.** New behaviour works in `shadow` mode first. Every hub decision is recorded in the decision log.

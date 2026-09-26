@@ -215,16 +215,17 @@ func (m *Member) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, 
 }
 
 // safePressure carries the highest pressure served safely forward: a report counts when
-// the cluster has ready replicas, is not short and every signal was read (a latency that
-// could not be read says nothing about the SLO). The window starts over after
-// SafePressureWindow.
+// the cluster has ready replicas, all it wants of them (while its autoscaler still adds
+// replicas, the pressure is above what it would settle at), is not short and every signal
+// was read (a latency that could not be read says nothing about the SLO). The window
+// starts over after SafePressureWindow.
 func safePressure(prev, rep *v1alpha1.ClusterReport, complete bool, now time.Time) (*resource.Quantity, *metav1.Time) {
 	var safe *resource.Quantity
 	since := &metav1.Time{Time: now}
 	if prev != nil && prev.SafeSince != nil && now.Sub(prev.SafeSince.Time) < SafePressureWindow {
 		safe, since = prev.SafePressure, prev.SafeSince
 	}
-	if q := rep.Pressure; q != nil && complete && rep.NeededReplicas == 0 && rep.ReadyReplicas > 0 && (safe == nil || q.Cmp(*safe) > 0) {
+	if q := rep.Pressure; q != nil && complete && rep.NeededReplicas == 0 && rep.ReadyReplicas > 0 && rep.ReadyReplicas >= rep.DesiredReplicas && (safe == nil || q.Cmp(*safe) > 0) {
 		safe = q
 	}
 	return safe, since

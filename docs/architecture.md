@@ -96,7 +96,7 @@ A shortage is first its own cluster's to solve; the fleet is the fallback. `spec
 
 - **The member's own rows need no hub.** Its scheduler, KEDA and Karpenter do them. The hub decides only when the other members' rows start, and takes their static room before their dynamic room.
 - **Own dynamic room is used up** when the member registers no NodePools, they are at their limits, or launches keep failing (dynamic room counts as zero after recurring insufficient-capacity errors). The fleet then steps in once the member has been short for `earlyAfter`.
-- **Otherwise the member keeps trying on its own** for up to `after`. If it is still short then, the fleet steps in whatever its NodePools report.
+- **Otherwise the member keeps trying on its own** for up to `after`. That includes replicas already on its nodes that are not ready yet (a model loading): while it has any, it gets `after` even with no NodePools, so a member growing on its own idle GPUs borrows nothing. If it is still short then, the fleet steps in whatever its NodePools report.
 - **With `StaticFirst`**, other members' idle existing nodes are lent after `earlyAfter` even while the member could still add nodes. Before `after`, only static room is used; other members' NodePools wait until the member's own can't help.
 - **Given back in reverse:** other members' dynamic floors first, then static ones.
 
@@ -114,7 +114,7 @@ Several policies can draw on the same nodes without being offered the same GPUs.
 
 The hub follows every floor it raised until the cluster has that many ready replicas. Past `spec.escalation.readyTimeout`:
 
-- **Replicas not on a node** (not created yet, or unschedulable) are taken back, the shortage is placed elsewhere in the same step, and that member takes no floor for another `readyTimeout`.
+- **Replicas not on a node** (not created yet, or unschedulable) are taken back, the shortage is placed elsewhere in the same step, and that member takes no floor, and no traffic back, for another `readyTimeout`. Until its next report, the taken-back replicas it still shows as pending are not counted as its shortage.
 - **Replicas on nodes but not ready** stay: a large model may still be loading. The hub records a warning in the decision log and a `ReplicasNotReady` Event, and checks again after another `readyTimeout`.
 
 The clock lives in `status.fleet`, so a new hub picks it up. Shadow mode does not follow floors, which never become replicas there.
@@ -123,16 +123,16 @@ The clock lives in `status.fleet`, so a new hub picks it up. Shadow mode does no
 
 Traffic moves for two reasons only, and otherwise stays where it is: a split that serves well is left alone.
 
-**Relief**, while a member is short (Escalated) or any cluster is over its SLO:
+**Relief**, while a member is short (Escalated) or any cluster is over its SLO. Once relief has moved shares off the Steady weights, relief never moves them back: that is the return's, with its checks.
 
-- **With `signals.pressure`** (e.g. waiting requests per replica, KV-cache usage), it balances pressure: each step moves up to `stepPercent` from the busiest cluster to the least busy one. Nothing moves while the two are within 20% of each other, or until both have reported after the previous shift. Ready replicas are only a prior; measured pressure corrects it, whatever the GPU type, request lengths or cache state.
+- **With `signals.pressure`** (e.g. waiting requests per replica, KV-cache usage), it balances pressure: each step moves up to `stepPercent` from the busiest cluster to the least busy one. Nothing moves while the two are within 20% of each other, or until both have reported after the previous shift. A cluster over its SLO because it is busier than the receiver gives traffic only while the receiver would stay less busy than it: when both are out of room, moving would only swap which one is over its SLO, and the traffic would bounce back. Ready replicas are only a prior; measured pressure corrects it, whatever the GPU type, request lengths or cache state.
 - **Without pressure**, each cluster's share is proportional to `readyReplicas × replicaCapacity`.
 - **Always:** a cluster over its `latencySLO` or `errorRateSLO` never gains traffic (in pressure mode it is drained first), and shares stay within `[minWeight, maxWeight]`.
 
 **Return**, once no member has been short for `calmFor` (Recovering): traffic comes back toward the Steady `weight`s, never toward borrowed capacity.
 
 - One `stepPercent` step per `calmFor`, from the cluster furthest above its Steady weight (the tier taken last first) to the one furthest below.
-- With pressure, a step is taken only if the receiver's pressure afterwards stays within what a replica of the workload has been seen to serve without a shortage. That is the receiver's own `status.report.safePressure` (the highest in the last day), or the donor's, converted by the clusters' `replicaCapacity`. Otherwise the split holds, and the borrowed capacity keeps serving. So if home can't take the traffic back, nothing moves back and forth.
+- With pressure, a step is taken only if the receiver's pressure afterwards stays within what a replica of the workload has been seen to serve without a shortage, with every replica its autoscaler wanted ready (a pressure seen while replicas were still loading is above where the autoscaler settles, and returning to it would make home short again). Only the receiver's ready replicas its autoscaler keeps count (not ones being scaled in). The limit is the receiver's own `status.report.safePressure` (the highest in the last day), or the donor's, converted by the clusters' `replicaCapacity`. Otherwise the split holds, and the borrowed capacity keeps serving. So if home can't take the traffic back, nothing moves back and forth.
 - Without pressure there is nothing to judge by: steps are simply a `calmFor` apart.
 - A shortage stops the return at once.
 

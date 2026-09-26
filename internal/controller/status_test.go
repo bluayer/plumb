@@ -350,13 +350,13 @@ func TestHubHoldsReleaseWithoutReport(t *testing.T) {
 	}
 }
 
-// The highest pressure served safely is kept, a short or incomplete report never raises
-// it, and it starts over after a day.
+// The highest pressure served safely is kept, a short, still scaling or incomplete report
+// never raises it, and it starts over after a day.
 func TestMemberSafePressure(t *testing.T) {
 	now := time.Now()
 	q := func(v string) *resource.Quantity { r := resource.MustParse(v); return &r }
 	rep := func(pressure string, need int32) *v1alpha1.ClusterReport {
-		return &v1alpha1.ClusterReport{ReadyReplicas: 2, NeededReplicas: need, Pressure: q(pressure)}
+		return &v1alpha1.ClusterReport{DesiredReplicas: 2, ReadyReplicas: 2, NeededReplicas: need, Pressure: q(pressure)}
 	}
 	prev := &v1alpha1.ClusterReport{SafePressure: q("6"), SafeSince: &metav1.Time{Time: now.Add(-time.Hour)}}
 	for _, tc := range []struct {
@@ -371,6 +371,7 @@ func TestMemberSafePressure(t *testing.T) {
 		{"lower keeps the highest", prev, rep("2", 0), true, "6"},
 		{"short does not count", prev, rep("9", 1), true, "6"},
 		{"a signal failed", prev, rep("9", 0), false, "6"},
+		{"still scaling up does not count", prev, &v1alpha1.ClusterReport{DesiredReplicas: 3, ReadyReplicas: 2, Pressure: q("9")}, true, "6"},
 		{"window over, starts again", &v1alpha1.ClusterReport{SafePressure: q("6"), SafeSince: &metav1.Time{Time: now.Add(-25 * time.Hour)}}, rep("2", 0), true, "2"},
 	} {
 		got, since := safePressure(tc.prev, tc.rep, tc.complete, now)

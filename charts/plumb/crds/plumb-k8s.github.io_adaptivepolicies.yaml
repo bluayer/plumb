@@ -828,8 +828,9 @@ spec:
                     - type: string
                     description: |-
                       SafePressure is the highest pressure this cluster has reported while it was not
-                      short and every signal was read, since SafeSince. The hub moves traffic back to a
-                      cluster only as far as this level: never to a load it has not been seen to serve.
+                      short, had every replica it wanted ready and every signal was read, since
+                      SafeSince. The hub moves traffic back to a cluster only as far as this level: never
+                      to a load it has not been seen to serve.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
                   safeSince:

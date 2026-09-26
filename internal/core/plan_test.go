@@ -461,3 +461,56 @@ func TestPlanRegionWithLaunchFailures(t *testing.T) {
 		t.Fatalf("existing nodes in a failing region still come first: %v", f)
 	}
 }
+
+// When both clusters are out of room, traffic does not move from the one over its SLO
+// to one that would then be as busy: it would only bounce back.
+func TestPlanNoOvershoot(t *testing.T) {
+	conf := cfg
+	conf.LatencySLO = 2
+	slow := resource.MustParse("3")
+	home := withPressure(short(member("home", 1, 0, 0, 100), 1, time.Hour), "9")
+	remote := withPressure(member("remote", 2, 0, 0, 0), "10.5")
+	home.Weight, remote.Weight, remote.Floor, remote.Added = 40, 60, 2, 2
+	remote.Report.Latency = &slow
+	in := Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0, Clusters: []Cluster{home, remote}}
+	if res := Plan(in); strings.Contains(res.Action, "shift_traffic") {
+		t.Fatalf("moved traffic onto a cluster that would be as busy: %s", res.Message)
+	}
+	in.Clusters[0] = withPressure(in.Clusters[0], "4") // home has room: remote gives
+	if res := Plan(in); res.Plans[0].Weight != 50 {
+		t.Fatalf("a cluster over its SLO kept its traffic though home has room: %+v %s", res.Plans, res.Message)
+	}
+}
+
+// Replicas on the member's own nodes that are still loading are the member helping
+// itself: the fleet waits `after` for them, not `earlyAfter`.
+func TestEscalationWaitsForLoadingReplicas(t *testing.T) {
+	c := short(member("home", 1, 0, 0, 100), 1, time.Minute)
+	c.Report.DesiredReplicas = 3 // two on nodes, loading
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0); ok {
+		t.Error("escalated after earlyAfter while the member's own replicas load")
+	}
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0.Add(2*time.Minute)); !ok {
+		t.Error("not escalated after `after`")
+	}
+	c.Report.PendingReplicas = 2 // no node for them
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0); !ok {
+		t.Error("not escalated after earlyAfter though the member's replicas have no node")
+	}
+}
+
+// A shortage renewed before it escalates, with no floors held, does not pull traffic
+// back to the short cluster: going back is returnTraffic's, with its checks.
+func TestPlanRenewedShortageKeepsRelief(t *testing.T) {
+	conf := cfg
+	conf.LatencySLO = 2
+	slow := resource.MustParse("3")
+	home := short(member("home", 1, 0, 0, 100), 1, 0)
+	home.Report.Latency = &slow
+	remote := member("remote", 2, 0, 0, 0)
+	home.Weight, remote.Weight = 40, 60
+	res := Plan(Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseRecovering, PhaseSince: t0.Add(-time.Hour), Clusters: []Cluster{home, remote}})
+	if res.Plans[0].Weight > 40 {
+		t.Fatalf("traffic pulled back to a short cluster over its SLO: %+v %s", res.Plans, res.Message)
+	}
+}
