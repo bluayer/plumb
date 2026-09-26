@@ -263,6 +263,15 @@ func (in *ClusterReport) DeepCopyInto(out *ClusterReport) {
 		in, out := &in.ShortSince, &out.ShortSince
 		*out = (*in).DeepCopy()
 	}
+	if in.SafePressure != nil {
+		in, out := &in.SafePressure, &out.SafePressure
+		x := (*in).DeepCopy()
+		*out = &x
+	}
+	if in.SafeSince != nil {
+		in, out := &in.SafeSince, &out.SafeSince
+		*out = (*in).DeepCopy()
+	}
 	if in.Metrics != nil {
 		in, out := &in.Metrics, &out.Metrics
 		*out = make([]MetricSample, len(*in))

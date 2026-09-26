@@ -365,6 +365,12 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 	index := func(name string) int {
 		return slices.IndexFunc(cs, func(c Cluster) bool { return c.Spec.Name == name })
 	}
+	// Without a shortage or an SLO breach, traffic only comes back toward the Steady
+	// weights, as the rules return it: once per CalmFor of calm, within what the receiver
+	// has served safely.
+	troubled := hasShortage(cs) || slices.ContainsFunc(cs, func(c Cluster) bool { return violates(c, cfg) })
+	calm := in.Phase == v1alpha1.PhaseRecovering && in.Now.Sub(in.PhaseSince) >= cfg.CalmFor &&
+		(in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.CalmFor)
 	traffic := cfg.StepPercent > 0 && !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight < 0 })
 	added, released, moved, static := map[string]int32{}, map[string]int32{}, map[string]int32{}, map[string]int32{}
 	for _, a := range c.Actions {
@@ -424,6 +430,8 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: no fresh report", a)
 			case in.Hold[a.Cluster]:
 				return nil, fmt.Errorf("%s: its report predates the last floor written there", a)
+			case traffic && cs[i].Weight > steadyWeight(cs[i]):
+				return nil, fmt.Errorf("%s: it still carries traffic above its Steady weight; that comes back first", a)
 			}
 			x := &cs[i]
 			x.Floor -= a.Replicas
@@ -451,6 +459,15 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: %s below minWeight %d", a, a.From, cs[f].Spec.MinWeight)
 			case cs[t].Weight+a.Percent > cs[t].Spec.MaxWeight:
 				return nil, fmt.Errorf("%s: %s above maxWeight %d", a, a.To, cs[t].Spec.MaxWeight)
+			case !troubled && cs[t].Weight+a.Percent > steadyWeight(cs[t]):
+				return nil, fmt.Errorf("%s: no member is short or over its SLO, so traffic only comes back toward the Steady weights", a)
+			case !troubled && !calm:
+				return nil, fmt.Errorf("%s: traffic comes back at most once per calmFor of calm", a)
+			}
+			if !troubled {
+				if _, err := canReturn(cs, cfg, cs[f], cs[t], a.Percent, in.LastStep); err != nil {
+					return nil, fmt.Errorf("%s: %w", a, err)
+				}
 			}
 			cs[f].Weight -= a.Percent
 			cs[t].Weight += a.Percent

@@ -50,6 +50,9 @@ const (
 	// IntentTTL: an intent lives this long unless the hub renews it, so a vanished hub's
 	// floors lapse and every cluster falls back to its own autoscaling.
 	IntentTTL = 5 * time.Minute
+	// SafePressureWindow is how long a member's highest safely served pressure is kept
+	// before it starts over.
+	SafePressureWindow = 24 * time.Hour
 )
 
 // Hub plans for every AdaptivePolicy while this member holds the fleet lease. It reads

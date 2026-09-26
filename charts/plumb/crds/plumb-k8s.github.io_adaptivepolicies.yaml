@@ -820,6 +820,22 @@ spec:
                       Region is the most common topology.kubernetes.io/region label on the cluster's
                       nodes; empty when none has it.
                     type: string
+                  safePressure:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      SafePressure is the highest pressure this cluster has reported while it was not
+                      short and every signal was read, since SafeSince. The hub moves traffic back to a
+                      cluster only as far as this level: never to a load it has not been seen to serve.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  safeSince:
+                    description: |-
+                      SafeSince is when SafePressure started being tracked; after a day it starts over,
+                      so it follows changes in the model, the GPUs or the requests.
+                    format: date-time
+                    type: string
                   saturation:
                     anyOf:
                     - type: integer

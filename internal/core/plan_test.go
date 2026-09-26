@@ -152,7 +152,20 @@ func TestPlanTrafficAndRecovery(t *testing.T) {
 	if res.Phase != v1alpha1.PhaseRecovering || floors(res)["b"] != 10 {
 		t.Fatalf("recovering: %+v", res)
 	}
-	in.Phase, in.PhaseSince, in.LastStep = res.Phase, t0.Add(-11*time.Minute), t0.Add(-time.Minute)
+	// Calm for CalmFor: traffic comes back first, one step, and no floor goes while b
+	// still carries borrowed traffic.
+	in.Phase, in.PhaseSince, in.LastStep = res.Phase, t0.Add(-11*time.Minute), t0.Add(-11*time.Minute)
+	res = Plan(in)
+	if f := floors(res); f["b"] != 10 || f["s"] != 6 || res.Plans[0].Weight != 60 || res.Plans[1].Weight != 40 {
+		t.Fatalf("traffic must come back before any floor: %v %+v", f, res.Plans)
+	}
+	in.Clusters[0].Weight, in.Clusters[1].Weight, in.LastStep = 60, 40, t0.Add(-time.Minute)
+	if res = Plan(in); res.Plans[1].Weight != 40 {
+		t.Fatalf("traffic came back again within CalmFor: %+v", res.Plans)
+	}
+
+	// Traffic back: dynamic floors go first, then static ones.
+	in.Clusters[0].Weight, in.Clusters[1].Weight = 100, 0
 	res = Plan(in)
 	if f := floors(res); f["b"] != 6 || f["s"] != 6 {
 		t.Fatalf("dynamic floors must go first: %v", f)
@@ -163,11 +176,9 @@ func TestPlanTrafficAndRecovery(t *testing.T) {
 		t.Fatalf("then static floors: %v", f)
 	}
 
-	// No floors left: weights step back to Steady, then the fleet is at rest.
+	// No floors left and weights at Steady: the fleet is at rest.
 	in.Clusters[2].Floor, in.Clusters[2].Static = 0, false
-	in.Clusters[0].Weight, in.Clusters[1].Weight = 95, 5
-	res = Plan(in)
-	if res.Plans[0].Weight != 100 || res.Plans[1].Weight != 0 || res.Phase != v1alpha1.PhaseSteady {
+	if res = Plan(in); res.Phase != v1alpha1.PhaseSteady {
 		t.Fatalf("back to steady: %+v %s", res.Plans, res.Phase)
 	}
 }
