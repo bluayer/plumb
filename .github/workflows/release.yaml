@@ -26,7 +26,6 @@ jobs:
     needs: main
     permissions:
       contents: read
-      pull-requests: read # reusable CI's approval job; tag builds need no PR approval
     uses: ./.github/workflows/ci.yaml
 
   release:
@@ -76,6 +75,8 @@ jobs:
         with:
           go-version-file: hack/tools/go.mod
           cache-dependency-path: hack/tools/go.sum
+      - name: Lint and render the chart
+        run: make chart
       - name: Package and push the chart
         run: |
           helm() { go tool -modfile=hack/tools/go.mod helm "$@"; } # version pinned in hack/tools/go.mod

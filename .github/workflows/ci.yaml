@@ -5,90 +5,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
-  workflow_call: # the release workflow runs the same checks first
+  workflow_call: # release tags run the same fast checks
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_review' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  approval:
-    name: Review approved
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    steps:
-      # No PR checkout, secrets, or write token. Native review rules also apply at merge.
-      # GitHub REST 2026-03-10: GET pull requests, reviews, and collaborator permissions.
-      - name: Require approval of the current PR head
-        if: github.event.pull_request != null
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          node <<'JS'
-          const fs = require('node:fs');
-          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-          const expected = event.pull_request;
-          async function api(path) {
-            const response = await fetch(process.env.GITHUB_API_URL + '/repos/' + process.env.GITHUB_REPOSITORY + path, {
-              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2026-03-10' },
-              signal: AbortSignal.timeout(30000),
-            });
-            if (!response.ok) throw new Error('GitHub API returned ' + response.status);
-            return response.json();
-          }
-          (async () => {
-            const pr = await api('/pulls/' + expected.number);
-            if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== expected.head.sha) {
-              throw new Error('PR is not ready, or its head changed; review the current commit.');
-            }
-            const latest = new Map();
-            for (let page = 1; ; page++) {
-              const reviews = await api('/pulls/' + pr.number + '/reviews?per_page=100&page=' + page);
-              for (let review of reviews) {
-                // The owner cannot natively approve their own PR. An explicit review comment
-                // carries GitHub's commit_id, so it cannot approve a later head.
-                const ownerSelf = review.user.id === event.repository.owner.id && review.user.id === pr.user.id;
-                const command = (review.body || '').trim();
-                if (ownerSelf && review.state === 'COMMENTED' && ['/approve', '/unapprove'].includes(command)) {
-                  review = {...review, state: command === '/approve' ? 'APPROVED' : 'DISMISSED', ownerApproval: true};
-                }
-                // Ordinary comments do not replace an approval.
-                if (!['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) continue;
-                const previous = latest.get(review.user.login);
-                if (!previous || review.id > previous.id) latest.set(review.user.login, review);
-              }
-              if (reviews.length < 100) break;
-            }
-            let approved = false;
-            for (const review of latest.values()) {
-              if (review.user.type !== 'User' || (review.user.login === pr.user.login && !review.ownerApproval)) continue;
-              const access = await api('/collaborators/' + encodeURIComponent(review.user.login) + '/permission');
-              // The permissions API maps maintain to write and triage to read.
-              if (!['write', 'admin'].includes(access.permission)) continue;
-              if (review.state === 'CHANGES_REQUESTED') throw new Error('A reviewer still requests changes.');
-              if (review.state === 'APPROVED' && review.commit_id === pr.head.sha) approved = true;
-            }
-            if (!approved) throw new Error('Awaiting a human approval of the current commit from a reviewer with write access.');
-            console.log('Current PR head has an eligible human approval.');
-          })().catch(error => {
-            console.error(error.message);
-            process.exitCode = 1;
-          });
-          JS
-
   go:
-    needs: approval
     name: Test and lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test review and E2E status handling
+        run: node --test .github/scripts/pr-checks.test.cjs
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -104,43 +37,3 @@ jobs:
         run: make verify-generate
       - name: go.mod and go.sum are tidy
         run: make verify-mod
-
-  chart:
-    needs: approval
-    name: Helm chart
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: hack/tools/go.mod
-          cache-dependency-path: hack/tools/go.sum
-      - name: Lint and render
-        run: make chart
-
-  image:
-    needs: approval
-    name: Container image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  required:
-    name: CI passed
-    needs: [approval, go, chart, image]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      # Skipped jobs are accepted by GitHub's required-check mechanism. This check isn't.
-      - name: Require every job to have actually succeeded
-        env:
-          RESULTS: ${{ join(needs.*.result, ',') }}
-        run: test "$RESULTS" = "success,success,success,success"

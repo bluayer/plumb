@@ -35,7 +35,11 @@
         "do_not_enforce_on_create": false,
         "required_status_checks": [
           {
-            "context": "CI passed",
+            "context": "Test and lint",
+            "integration_id": 15368
+          },
+          {
+            "context": "E2E passed",
             "integration_id": 15368
           }
         ]

@@ -1,0 +1,62 @@
+name: E2E
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: e2e-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  approval:
+    name: Review readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      approved: ${{ steps.review.outputs.approved }}
+    steps:
+      # This entire workflow is read-only, including for forks.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check current-head approval
+        id: review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/pr-checks.cjs approval
+
+  test:
+    name: E2E tests
+    needs: approval
+    if: needs.approval.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROVIDER: kwok
+      REMOTE: '1'
+    steps:
+      # Both PR events use GitHub's merge commit, so the base is included.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            hack/tools/go.sum
+      - name: Create home and remote clusters
+        run: make e2e-up
+      - name: Run E2E suite
+        run: make e2e
+      - name: Delete test clusters
+        if: always()
+        run: make e2e-down
