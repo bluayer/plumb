@@ -1,0 +1,17 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- range $c := list "agent" "scaler" }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "plumb.name" $ }}-{{ $c }}
+  labels:
+    {{- include "plumb.labels" $ | nindent 4 }}
+    {{- with $.Values.serviceMonitor.labels }}{{ toYaml . | nindent 4 }}{{ end }}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: {{ include "plumb.name" $ }}-{{ $c }}}
+  endpoints:
+    - {port: metrics, interval: {{ $.Values.serviceMonitor.interval }}}
+{{- end }}
+{{- end }}

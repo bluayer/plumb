@@ -1,0 +1,51 @@
+name: Bug report
+description: Plumb did something it should not, or did not do something it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [runbook](https://github.com/bluayer/plumb/blob/main/docs/operations.md#runbook) and [existing issues](https://github.com/bluayer/plumb/issues?q=is%3Aissue+label%3Abug) first. Security issues: report them privately (see SECURITY.md), not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The policy (redact what you need to), the fleet layout, and the steps.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Decision log and status
+      description: The relevant decision-log lines (`kind` decision, outcome or proposal), `kubectl get adaptivepolicies -A -o yaml` status, and agent logs.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Plumb version
+      description: "`plumb version`, the chart version or the image tag"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Policy mode
+      options: [shadow, auto]
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Kubernetes, KEDA, Karpenter and Gateway implementation versions; number of members; model or planner providers, if any.

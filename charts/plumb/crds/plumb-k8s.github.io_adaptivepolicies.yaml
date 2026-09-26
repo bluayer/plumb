@@ -1,0 +1,863 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: adaptivepolicies.plumb-k8s.github.io
+spec:
+  group: plumb-k8s.github.io
+  names:
+    kind: AdaptivePolicy
+    listKind: AdaptivePolicyList
+    plural: adaptivepolicies
+    shortNames:
+    - ap
+    singular: adaptivepolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .status.report.neededReplicas
+      name: Needed
+      type: integer
+    - jsonPath: .status.intent.replicas
+      name: Floor
+      type: integer
+    - jsonPath: .status.fleet.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AdaptivePolicy configures adaptive capacity for one workload
+          across member clusters.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              AdaptivePolicySpec is applied identically to every member cluster (e.g. by GitOps).
+              Each member reads it to observe its own cluster; the elected hub reads its own copy.
+            properties:
+              capacity:
+                description: CapacityPolicy says how much the hub may change at a
+                  time. The hub computes the rest.
+                properties:
+                  replicaCapacity:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      ReplicaCapacity is the demand one replica serves, in the unit of signals.demand.
+                      Traffic weights follow each cluster's ready replicas times its replica capacity.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  step:
+                    default: 2
+                    description: Step is the most replicas the hub adds to or releases
+                      from one cluster per step.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
+              clusters:
+                description: Clusters lists the member clusters that run the workload.
+                  Add one at any time.
+                items:
+                  description: ClusterSpec describes the workload in one member cluster.
+                  properties:
+                    backend:
+                      description: Backend is the backendRef in spec.traffic.routes
+                        that sends traffic to this cluster.
+                      properties:
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    costRank:
+                      description: CostRank orders clusters when everything else is
+                        equal. Lower is preferred.
+                      format: int32
+                      type: integer
+                    maxReplicas:
+                      description: MaxReplicas caps the replica floor the hub may
+                        set here.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    maxWeight:
+                      default: 100
+                      format: int32
+                      maximum: 100
+                      minimum: 0
+                      type: integer
+                    minWeight:
+                      description: MinWeight and MaxWeight bound the share the hub
+                        may give this cluster, in percent.
+                      format: int32
+                      maximum: 100
+                      minimum: 0
+                      type: integer
+                    name:
+                      description: 'Name is the member cluster: its ClusterProfile
+                        name and the --cluster-name of its agent.'
+                      maxLength: 63
+                      type: string
+                    nodePools:
+                      description: |-
+                        NodePools are the Karpenter NodePools Plumb may use for the workload here: their
+                        existing nodes count as static capacity and their limits as dynamic capacity. Other
+                        NodePools in the cluster are ignored. Without any, the cluster cannot add nodes as
+                        far as Plumb is concerned.
+                      items:
+                        type: string
+                      type: array
+                    nodeSelector:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        NodeSelector registers existing nodes that no Karpenter NodePool manages (e.g. a
+                        reserved node group) as static capacity, and narrows the NodePools' nodes to those
+                        that match. Without it, only the listed NodePools' nodes count. Either way the pod
+                        template's own constraints apply (node selector and affinity, tolerations, pod
+                        (anti-)affinity and topology spread).
+                      type: object
+                    region:
+                      description: |-
+                        Region is where this cluster gets new nodes from: clusters in one region compete for
+                        the same cloud capacity, so when one keeps failing to launch nodes, the others there
+                        go last for new nodes. Default: the cluster's topology.kubernetes.io/region node
+                        label, as its member reports it.
+                      maxLength: 63
+                      type: string
+                    replicaCapacity:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: ReplicaCapacity overrides spec.capacity.replicaCapacity
+                        here, e.g. for faster GPUs.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    weight:
+                      description: Weight is this cluster's share of traffic in the
+                        Steady phase, in percent.
+                      format: int32
+                      maximum: 100
+                      minimum: 0
+                      type: integer
+                  required:
+                  - maxReplicas
+                  - name
+                  type: object
+                maxItems: 255
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              confidenceThresholdPercent:
+                default: 90
+                description: |-
+                  ConfidenceThresholdPercent is the minimum probability Jev must give its pick, as the
+                  ranking model or choosing among the adaptive path's plans, for the pick to be used.
+                  Below it the rules decide. The default follows https://arxiv.org/html/2609.26550v1.
+                format: int32
+                maximum: 100
+                minimum: 0
+                type: integer
+              escalation:
+                description: EscalationPolicy says when a shortage becomes a fleet
+                  problem and when it is over.
+                properties:
+                  after:
+                    default: 2m
+                    description: |-
+                      After is how long a short cluster may keep trying to add nodes of its own before
+                      the fleet steps in anyway.
+                    type: string
+                  calmFor:
+                    default: 10m
+                    description: CalmFor is how long no cluster may be short before
+                      the hub starts giving back.
+                    type: string
+                  cooldown:
+                    default: 1m
+                    description: Cooldown is the minimum time between two hub steps
+                      (capacity or traffic).
+                    type: string
+                  earlyAfter:
+                    default: 30s
+                    description: |-
+                      EarlyAfter replaces After when waiting cannot help or is not wanted: the short
+                      cluster's own NodePools cannot add capacity (none listed, at their limits, or
+                      launches keep failing), or, with StaticFirst, another cluster has idle static room
+                      (then only that static room is used early).
+                    type: string
+                  readyTimeout:
+                    default: 10m
+                    description: |-
+                      ReadyTimeout is how long replicas the hub adds in a cluster may take to become
+                      ready: node launch, image pull and model load. Past it, replicas still not on a node
+                      are taken back and placed elsewhere, and the cluster is skipped for another
+                      ReadyTimeout; replicas on a node but not ready (a model still loading) only raise a
+                      warning. Outcomes are also followed at least this long.
+                    type: string
+                type: object
+              experimental:
+                description: Experimental features, off unless set.
+                properties:
+                  adaptive:
+                    description: |-
+                      Adaptive hands this policy's fleet decisions to a planner model and Jev: the planner
+                      proposes plans, Plumb validates them, Jev picks one. Needs --planner-provider and
+                      --model-provider on the agents; without them the rules decide.
+                    properties:
+                      intent:
+                        description: |-
+                          Intent is what matters for this workload and which trade-offs are acceptable, e.g.
+                          "Interactive: protect TTFT first, then reduce cost when there is slack". It is sent
+                          to the models; keep secrets out of it.
+                        maxLength: 1000
+                        minLength: 1
+                        type: string
+                    required:
+                    - intent
+                    type: object
+                type: object
+              mode:
+                default: shadow
+                description: Mode controls whether decisions are applied.
+                enum:
+                - shadow
+                - auto
+                type: string
+              placement:
+                default: LocalFirst
+                description: |-
+                  Placement orders the capacity used for a shortage: the short cluster's own nodes
+                  and other clusters', existing (static) and new (dynamic). The hub releases in the
+                  reverse order.
+                enum:
+                - LocalFirst
+                - StaticFirst
+                type: string
+              signals:
+                description: |-
+                  Signals are PromQL queries each member evaluates against its own Prometheus
+                  (--prometheus-url). Each must return one sample. Plumb reads them; it never routes
+                  requests itself.
+                properties:
+                  demand:
+                    description: |-
+                      Demand is the current demand, in the unit of replicaCapacity (e.g. requests/s). With
+                      replicaCapacity it tells how many replicas the cluster needs.
+                    type: string
+                  errorRate:
+                    description: ErrorRate is the fraction of failed requests, e.g.
+                      from the gateway's metrics.
+                    type: string
+                  errorRateSLO:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      ErrorRateSLO is the objective for errorRate, e.g. "0.01". Above it the cluster
+                      receives no more traffic and gives some away.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  latency:
+                    description: Latency is the latency the service is held to, e.g.
+                      time to first token p95 in seconds.
+                    type: string
+                  latencySLO:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      LatencySLO is the objective for latency. Above it the cluster needs at least
+                      spec.capacity.step more replicas and receives no more traffic.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  metrics:
+                    description: |-
+                      Metrics are named queries for spec.experimental.adaptive: each member reports their
+                      values, and the planner and Jev read them with their unit and meaning. The rules
+                      above do not use them.
+                    items:
+                      description: Metric is a query whose value the models are told
+                        how to read.
+                      properties:
+                        maxAge:
+                          default: 2m
+                          description: 'MaxAge: a sample older than this is marked
+                            stale for the models.'
+                          type: string
+                        meaning:
+                          description: Meaning of the value in plain words, e.g. "time
+                            to first token, p95".
+                          maxLength: 256
+                          type: string
+                        name:
+                          pattern: ^[a-z][a-z0-9_]{0,62}$
+                          type: string
+                        query:
+                          description: Query is PromQL returning one sample.
+                          minLength: 1
+                          type: string
+                        unit:
+                          description: Unit of the value, e.g. "seconds" or "requests
+                            per replica".
+                          maxLength: 64
+                          type: string
+                        window:
+                          description: Window is the range the query aggregates over,
+                            e.g. its rate() window.
+                          type: string
+                      required:
+                      - name
+                      - query
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  pressure:
+                    description: |-
+                      Pressure is how loaded the cluster's replicas are, higher meaning busier, e.g. waiting
+                      requests per replica or KV-cache usage. With it, the hub moves traffic from busier
+                      clusters to less busy ones instead of following ready replicas alone.
+                    type: string
+                  saturation:
+                    description: |-
+                      Saturation is compared with saturationThreshold, e.g. queued requests. While above it
+                      the cluster needs at least spec.capacity.step more replicas.
+                    type: string
+                  saturationThreshold:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+              traffic:
+                description: 'Traffic is optional: without it the hub only adds capacity.'
+                properties:
+                  routes:
+                    description: |-
+                      Routes are HTTPRoutes whose backendRefs include the clusters' backends. The hub sets
+                      the weight of every matching backendRef in every rule.
+                    items:
+                      description: RouteRef names a Gateway API HTTPRoute in a member
+                        cluster.
+                      properties:
+                        cluster:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                      - cluster
+                      - name
+                      - namespace
+                      type: object
+                    maxItems: 16
+                    minItems: 1
+                    type: array
+                  stepPercent:
+                    default: 10
+                    description: StepPercent is the most a cluster's share moves per
+                      step, in percentage points.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                required:
+                - routes
+                type: object
+              workload:
+                description: Workload is the Deployment replicated across clusters.
+                properties:
+                  name:
+                    description: Name of the Deployment. The same name is expected
+                      in every cluster.
+                    type: string
+                  namespace:
+                    description: Namespace of the Deployment. Defaults to the policy
+                      namespace.
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - clusters
+            - workload
+            type: object
+            x-kubernetes-validations:
+            - message: with spec.traffic every cluster needs a backend
+              rule: '!has(self.traffic) || self.clusters.all(c, has(c.backend))'
+            - message: every route must live in a listed cluster
+              rule: '!has(self.traffic) || self.traffic.routes.all(r, self.clusters.exists(c,
+                c.name == r.cluster))'
+          status:
+            description: |-
+              AdaptivePolicyStatus has one writer per field: the member writes Report and
+              Conditions, the hub writes Intent and Fleet.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              fleet:
+                description: FleetStatus is the hub's plan, written on the hub's own
+                  copy of the policy.
+                properties:
+                  clusters:
+                    items:
+                      description: ClusterPlan is the hub's target for one cluster.
+                      properties:
+                        added:
+                          description: |-
+                            Added is how many replicas the hub has added here, ready or not; they count against
+                            the shortage until released.
+                          format: int32
+                          type: integer
+                        floor:
+                          format: int32
+                          type: integer
+                        name:
+                          type: string
+                        skippedUntil:
+                          description: |-
+                            SkippedUntil: the hub took back floors here that never reached a node, and adds none
+                            here before then.
+                          format: date-time
+                          type: string
+                        static:
+                          description: Static is true while the floor fits on existing
+                            nodes.
+                          type: boolean
+                        tier:
+                          description: Tier is the placement tier the floor was taken
+                            in; see Intent.
+                          format: int32
+                          type: integer
+                        waitingSince:
+                          description: |-
+                            WaitingSince is when the floor last rose above the cluster's ready replicas; cleared
+                            once they catch up. See spec.escalation.readyTimeout.
+                          format: date-time
+                          type: string
+                        weight:
+                          description: Weight is the traffic share in percent; -1
+                            when traffic is not managed.
+                          format: int32
+                          type: integer
+                      required:
+                      - floor
+                      - name
+                      - weight
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  hub:
+                    type: string
+                  lastDecision:
+                    description: DecisionSummary is the hub's last decision.
+                    properties:
+                      action:
+                        description: Action is add_capacity, release_capacity, shift_traffic
+                          or none.
+                        type: string
+                      applied:
+                        description: Applied is true only in auto mode after every
+                          change was written.
+                        type: boolean
+                      id:
+                        type: string
+                      message:
+                        type: string
+                      source:
+                        description: 'Source is model or rule: who ranked the clusters.'
+                        type: string
+                      time:
+                        format: date-time
+                        type: string
+                    required:
+                    - action
+                    - applied
+                    - id
+                    - time
+                    type: object
+                  lastStep:
+                    format: date-time
+                    type: string
+                  outOfSync:
+                    description: |-
+                      OutOfSync lists members whose report the hub ignores because their copy of the
+                      policy differs from the hub's in what the report is computed from.
+                    items:
+                      type: string
+                    type: array
+                  phase:
+                    type: string
+                  phaseSince:
+                    format: date-time
+                    type: string
+                  recent:
+                    description: |-
+                      Recent summarizes the last decisions whose outcome is complete, newest last; the
+                      experimental adaptive path gives them to the models as what happened before.
+                    items:
+                      description: RecentDecision is a decision and what followed
+                        it.
+                      properties:
+                        action:
+                          type: string
+                        applied:
+                          description: |-
+                            Applied: the decision was carried out. Shadow decisions are followed too, but have
+                            no ReadyAfterSeconds: replicas that became ready were not theirs.
+                          type: boolean
+                        followedBy:
+                          description: FollowedBy counts the decisions taken for this
+                            policy in the next 15 minutes.
+                          format: int32
+                          type: integer
+                        id:
+                          type: string
+                        message:
+                          type: string
+                        readyAfterSeconds:
+                          additionalProperties:
+                            format: int32
+                            type: integer
+                          description: 'ReadyAfterSeconds: for each floor the decision
+                            raised, how long until it was ready.'
+                          type: object
+                        time:
+                          format: date-time
+                          type: string
+                      required:
+                      - action
+                      - id
+                      - time
+                      type: object
+                    maxItems: 5
+                    type: array
+                  time:
+                    format: date-time
+                    type: string
+                  tracking:
+                    description: |-
+                      Tracking lists recent decisions whose outcome is still being recorded, so a new hub
+                      carries on after a failover.
+                    items:
+                      description: TrackedDecision is a decision whose outcome the
+                        hub records at fixed checkpoints.
+                      properties:
+                        action:
+                          type: string
+                        applied:
+                          description: 'Applied: the decision was carried out; only
+                            then are its floors'' readiness recorded.'
+                          type: boolean
+                        checkpoints:
+                          description: Checkpoints is how many outcome records have
+                            been written.
+                          format: int32
+                          type: integer
+                        floors:
+                          description: Floors are the floors the decision raised,
+                            and when each was first seen ready.
+                          items:
+                            description: TrackedFloor is one floor a decision raised.
+                            properties:
+                              cluster:
+                                type: string
+                              readyAt:
+                                format: date-time
+                                type: string
+                              replicas:
+                                format: int32
+                                type: integer
+                            required:
+                            - cluster
+                            - replicas
+                            type: object
+                          type: array
+                        followedBy:
+                          description: FollowedBy lists later decisions for the same
+                            policy ("<id> <action>").
+                          items:
+                            type: string
+                          maxItems: 32
+                          type: array
+                        id:
+                          type: string
+                        time:
+                          format: date-time
+                          type: string
+                      required:
+                      - action
+                      - checkpoints
+                      - id
+                      - time
+                      type: object
+                    maxItems: 32
+                    type: array
+                required:
+                - hub
+                - phase
+                - phaseSince
+                - time
+                type: object
+              intent:
+                description: |-
+                  Intent is the replica floor the hub asks this cluster to hold, written by the hub. The
+                  member's scaler serves it only while Hub still holds the fleet lease and it has not expired.
+                properties:
+                  added:
+                    description: |-
+                      Added is how many of those replicas the hub added for a shortage elsewhere; written
+                      with the floor, so it survives a failed status write or a hub failover.
+                    format: int32
+                    type: integer
+                  decisionId:
+                    type: string
+                  expires:
+                    format: date-time
+                    type: string
+                  hub:
+                    type: string
+                  replicas:
+                    format: int32
+                    type: integer
+                  tier:
+                    description: |-
+                      Tier is the placement tier the floor was taken in (0 first); floors are released
+                      from the highest tier down.
+                    format: int32
+                    type: integer
+                required:
+                - decisionId
+                - expires
+                - hub
+                - replicas
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              report:
+                description: ClusterReport is one member's view of its own cluster,
+                  written by its agent.
+                properties:
+                  demand:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  desiredReplicas:
+                    format: int32
+                    type: integer
+                  dynamicRoom:
+                    description: DynamicRoom is how many more replicas the NodePools
+                      may add, unless DynamicUnbounded.
+                    format: int32
+                    type: integer
+                  dynamicUnbounded:
+                    type: boolean
+                  error:
+                    type: string
+                  errorRate:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  latency:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  metrics:
+                    description: Metrics are the values of spec.signals.metrics, with
+                      the time Prometheus sampled them.
+                    items:
+                      description: MetricSample is one reported value of a spec.signals.metrics
+                        query.
+                      properties:
+                        name:
+                          type: string
+                        time:
+                          format: date-time
+                          type: string
+                        value:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      required:
+                      - name
+                      - time
+                      - value
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  neededReplicas:
+                    description: NeededReplicas is how many more ready replicas the
+                      cluster needs now.
+                    format: int32
+                    type: integer
+                  pendingReplicas:
+                    format: int32
+                    type: integer
+                  pressure:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  readyReplicas:
+                    format: int32
+                    type: integer
+                  recentICE:
+                    description: RecentICE counts insufficient-capacity launch failures
+                      in the last 10 minutes.
+                    format: int32
+                    type: integer
+                  region:
+                    description: |-
+                      Region is the most common topology.kubernetes.io/region label on the cluster's
+                      nodes; empty when none has it.
+                    type: string
+                  saturation:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  shortSince:
+                    description: ShortSince is when NeededReplicas became positive.
+                    format: date-time
+                    type: string
+                  specHash:
+                    description: |-
+                      SpecHash identifies what in the member's copy of the spec the report is computed
+                      from: the workload, signals, capacity and the member's own cluster entry. The hub
+                      ignores a report whose hash differs from the one its own copy gives for that member.
+                    type: string
+                  staticRoom:
+                    description: StaticRoom is how many more replicas fit on existing
+                      nodes.
+                    format: int32
+                    type: integer
+                  time:
+                    format: date-time
+                    type: string
+                required:
+                - desiredReplicas
+                - dynamicRoom
+                - neededReplicas
+                - pendingReplicas
+                - readyReplicas
+                - recentICE
+                - specHash
+                - staticRoom
+                - time
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,52 @@
+# pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: ^charts/plumb/templates/ # Helm templates are not plain YAML
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1-1
+    hooks:
+      - id: shellcheck
+  - repo: local
+    hooks:
+      # golangci-lint and actionlint at the versions pinned in hack/tools (Dependabot-managed).
+      - id: golangci-lint
+        name: golangci-lint (new issues, with --fix)
+        entry: go tool -modfile=hack/tools/go.mod golangci-lint run --new-from-rev HEAD --fix
+        language: system
+        types: [go]
+        pass_filenames: false
+      - id: golangci-lint-config-verify
+        name: golangci-lint config verify
+        entry: go tool -modfile=hack/tools/go.mod golangci-lint config verify
+        language: system
+        files: ^\.golangci\.yaml$
+        pass_filenames: false
+      - id: actionlint
+        name: actionlint
+        entry: go tool -modfile=hack/tools/actionlint/go.mod actionlint
+        language: system
+        files: ^\.github/workflows/
+        pass_filenames: false
+      # Generated DeepCopy, CRD and RBAC must match the API and RBAC markers.
+      - id: codegen
+        name: controller-gen output is up to date
+        entry: make verify-generate
+        language: system
+        files: ^(api/|internal/controller/)
+        pass_filenames: false
+      # Every hand-written source file carries the Apache-2.0 header (hack/boilerplate.go.txt).
+      - id: license-header
+        name: Apache-2.0 license header
+        language: pygrep
+        entry: Licensed under the Apache License, Version 2.0
+        args: [--negate]
+        types_or: [go, shell]
+        exclude: \.pb\.go$

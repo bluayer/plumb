@@ -1,0 +1,31 @@
+# Every version Plumb pins is in a file Dependabot reads:
+#   go.mod                        libraries (Go toolchain: the go/toolchain lines, by hand)
+#   hack/tools/go.mod             controller-gen, golangci-lint, helm, kwokctl, protoc plugins
+#   hack/tools/actionlint/go.mod  actionlint (its YAML library conflicts with the others)
+#   .github/workflows/*.yaml      actions, pinned by commit SHA
+#   Dockerfile                    base images, pinned by digest
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      kubernetes: # k8s.io and controller-runtime release together and must move together
+        patterns: ["k8s.io/*", "sigs.k8s.io/*"]
+      go:
+        update-types: [minor, patch]
+  - package-ecosystem: gomod
+    directories: [/hack/tools, /hack/tools/actionlint]
+    schedule: {interval: weekly}
+    groups:
+      tools:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}
