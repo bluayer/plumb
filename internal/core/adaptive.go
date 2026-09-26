@@ -265,9 +265,7 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 
 // Busy reports whether there is something to decide: a member short, or the fleet not Steady.
 func Busy(cs []Cluster, phase string) bool {
-	return cmp.Or(phase, v1alpha1.PhaseSteady) != v1alpha1.PhaseSteady || slices.ContainsFunc(cs, func(c Cluster) bool {
-		return c.Report != nil && c.Report.NeededReplicas > 0
-	})
+	return cmp.Or(phase, v1alpha1.PhaseSteady) != v1alpha1.PhaseSteady || hasShortage(cs)
 }
 
 func top(probs map[string]float64) (string, float64) {
@@ -419,6 +417,12 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: more than step %d", a, cfg.Step)
 			case a.Replicas > cs[i].Floor:
 				return nil, fmt.Errorf("%s: floor is %d", a, cs[i].Floor)
+			case hasShortage(cs):
+				return nil, fmt.Errorf("%s: a member still reports a shortage", a)
+			case cs[i].Report == nil:
+				return nil, fmt.Errorf("%s: no fresh report", a)
+			case in.Hold[a.Cluster]:
+				return nil, fmt.Errorf("%s: its report predates the last floor written there", a)
 			}
 			x := &cs[i]
 			x.Floor -= a.Replicas
