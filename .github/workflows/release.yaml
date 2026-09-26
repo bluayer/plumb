@@ -24,6 +24,8 @@ jobs:
 
   ci:
     needs: main
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yaml
 
   release:
@@ -73,6 +75,8 @@ jobs:
         with:
           go-version-file: hack/tools/go.mod
           cache-dependency-path: hack/tools/go.sum
+      - name: Lint and render the chart
+        run: make chart
       - name: Package and push the chart
         run: |
           helm() { go tool -modfile=hack/tools/go.mod helm "$@"; } # version pinned in hack/tools/go.mod

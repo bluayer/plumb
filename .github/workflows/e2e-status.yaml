@@ -1,0 +1,35 @@
+name: E2E status
+
+on:
+  workflow_run:
+    workflows: [E2E]
+    types: [requested, in_progress, completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  statuses: write
+
+# Serialize writes for a commit; each reporter reconciles the latest E2E run.
+concurrency:
+  group: e2e-status-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  status:
+    name: Report E2E status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # workflow_run uses the default branch. NEVER check out PR code, use its
+      # caches, or download its artifacts in this job with a write token.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Publish approval and E2E result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/pr-checks.cjs report

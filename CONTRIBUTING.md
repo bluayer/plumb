@@ -130,7 +130,14 @@ A Kubernetes library bump may also bump controller-gen's output: run `make gener
 
 ## Pull requests
 
-- `make test lint verify-generate verify-mod` passes. CI runs the same, plus a chart lint and an image build.
+`Test and lint` runs on every PR commit: unit tests, lint, generated-code checks and module checks. E2E starts after a human with write access approves the current head. Until then, the required `E2E passed` status stays pending; waiting for review is not a test failure. A new commit or revoked approval requires review again. Only the repository owner merges after both required checks pass. Helm checks and the edge image build run after merging to `main`.
+
+For their own PR, the owner can submit a review with `Comment` and body `/approve`; GitHub records the reviewed commit. `/unapprove` revokes it. This is a review comment, not a conversation comment. The owner must still pass both required checks.
+
+Branch and tag protection must also be configured in GitHub; `.github/rulesets/` contains the settings to apply.
+
+- `make test lint verify-generate verify-mod` passes. PR CI runs these without waiting for approval. Approved PRs also run `make e2e-up`, `make e2e` and cleanup with `PROVIDER=kwok` and `REMOTE=1`.
+- If changing the review/status scripts, run `node --test .github/scripts/pr-checks.test.cjs` (also run by CI). Node is only needed for these GitHub automation tests.
 - Every commit is signed off (`git commit -s`), certifying the [DCO](DCO).
 - The title is a type tag and an imperative summary, e.g. `[Bugfix] Keep reports from members out of sync`. Types: `Bugfix`, `Feature`, `Perf`, `Refactor`, `Doc`, `Test`, `CI`, `Deps`, `Misc`. Release notes come from titles.
 
@@ -150,12 +157,12 @@ Maintainers push a semver tag on `main`:
 git tag v0.2.0 && git push origin v0.2.0      # v0.2.0-rc.1 for a pre-release
 ```
 
-CI runs on pull requests and on every push to `main`. The release workflow checks that the tag is on `main` and runs CI, then publishes:
+Fast CI runs on every pull request commit and every push to `main`; PR E2E waits for approval. The release workflow checks that the tag is on `main`, reruns fast CI and validates the chart, then publishes:
 
 - the multi-arch image `ghcr.io/bluayer/plumb:<version>`, with SBOM and provenance
 - the Helm chart `oci://ghcr.io/bluayer/charts/plumb`, with the chart version and appVersion set to the tag
 - a GitHub release with generated notes, the chart package and the CRD
 
-Every push to `main` also publishes the edge image `ghcr.io/bluayer/plumb:main` (and `:sha-<commit>`), from its own workflow (`edge.yaml`), the only one besides the release that may write packages.
+Every push to `main` validates the Helm chart and publishes the edge image `ghcr.io/bluayer/plumb:main` (and `:sha-<commit>`), from the main build workflow (`edge.yaml`), the only one besides the release that may write packages. Versioned image and Helm chart publishing remains tied to release tags.
 
 **First publish.** GHCR links both packages to this repository through `org.opencontainers.image.source` (the Dockerfile label, and `sources` in `Chart.yaml` for the chart), so the workflows' `GITHUB_TOKEN` can keep writing them. A new package may start private: after the first edge image and the first release, check each package's visibility under the owner's Packages (`plumb`, `charts/plumb`) and make it public, or have clusters pull with `imagePullSecrets`.
