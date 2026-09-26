@@ -130,6 +130,10 @@ A Kubernetes library bump may also bump controller-gen's output: run `make gener
 
 ## Pull requests
 
+PRs need a human approval of their current head before the Go, chart and image jobs run. A new commit needs a new approval; dismissed approvals do not count. Only the repository owner merges after `CI passed` succeeds. For their own PR, the owner can submit a review with `Comment` and body `/approve`; GitHub records the reviewed commit. `/unapprove` revokes it. This is a review comment, not a conversation comment. All CI checks remain mandatory.
+
+These requirements must be activated in GitHub as well as committed in the repository; see [repository governance](docs/repository-governance.md).
+
 - `make test lint verify-generate verify-mod` passes. CI runs the same, plus a chart lint and an image build.
 - Every commit is signed off (`git commit -s`), certifying the [DCO](DCO).
 - The title is a type tag and an imperative summary, e.g. `[Bugfix] Keep reports from members out of sync`. Types: `Bugfix`, `Feature`, `Perf`, `Refactor`, `Doc`, `Test`, `CI`, `Deps`, `Misc`. Release notes come from titles.
@@ -150,7 +154,7 @@ Maintainers push a semver tag on `main`:
 git tag v0.2.0 && git push origin v0.2.0      # v0.2.0-rc.1 for a pre-release
 ```
 
-CI runs on pull requests and on every push to `main`. The release workflow checks that the tag is on `main` and runs CI, then publishes:
+CI runs after an eligible approval on pull requests and on every push to `main`. The release workflow checks that the tag is on `main` and runs CI, then publishes:
 
 - the multi-arch image `ghcr.io/bluayer/plumb:<version>`, with SBOM and provenance
 - the Helm chart `oci://ghcr.io/bluayer/charts/plumb`, with the chart version and appVersion set to the tag

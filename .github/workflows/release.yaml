@@ -24,6 +24,9 @@ jobs:
 
   ci:
     needs: main
+    permissions:
+      contents: read
+      pull-requests: read # reusable CI's approval job; tag builds need no PR approval
     uses: ./.github/workflows/ci.yaml
 
   release:
