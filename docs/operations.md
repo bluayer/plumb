@@ -182,7 +182,8 @@ Its report is missing, older than 2 minutes, or computed from a different spec:
 **Traffic stays on the other cluster after the shortage ended** (Recovering, weights not back)
 
 1. This is on purpose while home can't take it: the hub returns a step only if home's pressure afterwards stays within what a replica has been seen to serve safely (`status.report.safePressure` on home and on the cluster carrying the traffic). The step's reason is in the decision log.
-2. Home grows, or demand drops, and the return resumes, one `stepPercent` per `calmFor`. The borrowed floor goes once that cluster's share is back to its Steady weight.
+2. If home has room (existing nodes or NodePool headroom), the hub raises home's floor first (`tier: -1` in home's `status.intent`), and the return resumes once those replicas are ready. If they never reach a node within `readyTimeout`, they are taken back and home is skipped for a while.
+3. Otherwise the return resumes when demand drops, one `stepPercent` per `calmFor`. The borrowed floor goes once that cluster's share is back to its Steady weight, and home's floor last.
 
 **Floor kept after the shortage ended** (`ReleaseHeld` event, `held` in the decision log)
 

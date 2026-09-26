@@ -392,12 +392,14 @@ type MetricSample struct {
 // member's scaler serves it only while Hub still holds the fleet lease and it has not expired.
 type Intent struct {
 	Replicas int32 `json:"replicas"`
-	// Added is how many of those replicas the hub added for a shortage elsewhere; written
-	// with the floor, so it survives a failed status write or a hub failover.
+	// Added is how many of those replicas the hub added: for a shortage elsewhere, or (tier
+	// -1) so this cluster can take traffic back. Written with the floor, so it survives a
+	// failed status write or a hub failover.
 	// +optional
 	Added int32 `json:"added,omitempty"`
-	// Tier is the placement tier the floor was taken in (0 first); floors are released
-	// from the highest tier down.
+	// Tier is the placement tier the floor was taken in (0 existing nodes, 1 new nodes);
+	// floors are released from the highest tier down. -1 marks a floor raised on the
+	// cluster traffic comes back to, released last.
 	// +optional
 	Tier       int32       `json:"tier,omitempty"`
 	Hub        string      `json:"hub"`

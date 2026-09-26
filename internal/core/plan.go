@@ -213,8 +213,15 @@ func Plan(in Input) Result {
 	case !traffic || res.Phase == v1alpha1.PhaseSteady || !due:
 	case res.Phase == v1alpha1.PhaseEscalated || slices.ContainsFunc(cs, func(c Cluster) bool { return violates(c, cfg) }):
 		moved = shiftTraffic(cs, cfg, escalated, in.LastStep)
-	case calm && (in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.CalmFor):
-		moved = returnTraffic(cs, cfg, in.LastStep)
+	case calm:
+		if in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.CalmFor {
+			moved = returnTraffic(cs, cfg, in.LastStep)
+		}
+		if moved == "" {
+			if n := prepareReturn(cs, cfg, in); n != "" {
+				actions, notes = append(actions, "add_capacity"), append(notes, n)
+			}
+		}
 	}
 	if moved != "" {
 		actions, notes = append(actions, "shift_traffic"), append(notes, moved)
@@ -283,7 +290,7 @@ func AwaitReady(cs []Cluster, cfg Config, now time.Time) (released, warnings []s
 // could still add nodes of its own.
 func escalation(cs []Cluster, i int, cfg Config, now time.Time) (dynamic, ok bool) {
 	r := cs[i].Report
-	if r == nil || r.NeededReplicas <= 0 || r.ShortSince == nil {
+	if r == nil || shortBy(cs[i]) <= 0 || r.ShortSince == nil {
 		return false, false
 	}
 	short := now.Sub(r.ShortSince.Time)
@@ -315,14 +322,16 @@ func staticRoomBesides(cs []Cluster, skip int) int32 {
 func addCapacity(res *Result, in Input, cs []Cluster, short map[int]bool) (string, bool) {
 	var need, dyn int32 // dyn: the part of need other clusters may launch nodes for
 	for i, dynamic := range short {
-		need += cs[i].Report.NeededReplicas
+		need += shortBy(cs[i])
 		if dynamic {
-			dyn += cs[i].Report.NeededReplicas
+			dyn += shortBy(cs[i])
 		}
 	}
 	for _, c := range cs {
-		need -= c.Added
-		dyn -= c.Added
+		if c.Tier != TierReturn { // raised for the return, not for this shortage
+			need -= c.Added
+			dyn -= c.Added
+		}
 	}
 	if need <= 0 {
 		return "", false
@@ -414,6 +423,9 @@ func addCapacity(res *Result, in Input, cs []Cluster, short map[int]bool) (strin
 const (
 	TierStatic  int32 = iota // existing nodes
 	TierDynamic              // nodes their NodePools launch
+	// TierReturn marks a floor raised on the cluster traffic comes back to, so it can take
+	// the traffic before the borrowed floors go. It is released last.
+	TierReturn int32 = -1
 )
 
 // headroom is how far the floor may still rise under MaxReplicas.
@@ -484,9 +496,21 @@ func maxValue(m map[string]float64) float64 {
 }
 
 func hasShortage(cs []Cluster) bool {
-	return slices.ContainsFunc(cs, func(c Cluster) bool {
-		return c.Report != nil && c.Report.NeededReplicas > 0
-	})
+	return slices.ContainsFunc(cs, func(c Cluster) bool { return shortBy(c) > 0 })
+}
+
+// shortBy is what a member still misses: its report, less the replicas the hub raised there
+// for traffic coming back that are not ready yet. Those wait for a node by design; they
+// are not a shortage.
+func shortBy(c Cluster) int32 {
+	if c.Report == nil {
+		return 0
+	}
+	n := c.Report.NeededReplicas
+	if c.Tier == TierReturn && c.Added > 0 {
+		n -= max(min(c.Added, c.Floor-c.Report.ReadyReplicas), 0)
+	}
+	return max(n, 0)
 }
 
 // releaseCapacity lowers floors by step in the reverse of the order they were taken:
@@ -495,12 +519,13 @@ func hasShortage(cs []Cluster) bool {
 // traffic: the traffic comes back first. A fresh report must acknowledge the previous
 // floor before another release; members without a usable report are returned as held.
 func releaseCapacity(cs []Cluster, step int32, hold map[string]bool, traffic bool) (string, []string) {
-	last := int32(-1) // the tier taken last is released first
+	last := int32(math.MinInt32) // the tier taken last is released first
 	for _, c := range cs {
 		if c.Floor > 0 {
 			last = max(last, c.Tier)
 		}
 	}
+	back := !traffic || !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight > steadyWeight(c) })
 	var notes, held []string
 	for i, c := range cs {
 		switch {
@@ -508,6 +533,8 @@ func releaseCapacity(cs []Cluster, step int32, hold map[string]bool, traffic boo
 			continue
 		case traffic && c.Weight > steadyWeight(c):
 			continue // still serving borrowed traffic
+		case c.Tier == TierReturn && !back:
+			continue // still taking traffic back
 		case c.Report == nil:
 			held = append(held, c.Spec.Name)
 			continue
@@ -667,12 +694,13 @@ func steadyWeight(c Cluster) int32 {
 	return min(max(c.Spec.Weight, c.Spec.MinWeight), c.Spec.MaxWeight)
 }
 
-// returnTraffic moves one step of traffic back toward the Steady weights: from the
-// cluster furthest above its Steady weight (the tier taken last first, as floors are
-// released) to the one furthest below. Plan calls it at most once per CalmFor.
-func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
-	donor, receiver := -1, -1
-	over := func(c Cluster) int32 { return c.Weight - steadyWeight(c) }
+// over is how far a cluster's share is above its Steady weight (negative: below).
+func over(c Cluster) int32 { return c.Weight - steadyWeight(c) }
+
+// returnPair picks where traffic comes back from and to: the cluster furthest above its
+// Steady weight (the tier taken last first) and the one furthest below with ready replicas.
+func returnPair(cs []Cluster) (donor, receiver int) {
+	donor, receiver = -1, -1
 	for i, c := range cs {
 		if over(c) > 0 && (donor < 0 || c.Tier > cs[donor].Tier || (c.Tier == cs[donor].Tier && over(c) > over(cs[donor]))) {
 			donor = i
@@ -681,6 +709,81 @@ func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
 			receiver = i
 		}
 	}
+	return donor, receiver
+}
+
+// prepareReturn is borrowing in reverse, home first: when the next step of traffic can't
+// come back because the receiver's replicas would be too busy, it raises the receiver's
+// floor to the replicas that would carry all the borrowed traffic within what a replica
+// has served safely, as far as its room, maxReplicas and step allow. The traffic follows
+// once they are ready; the floor goes last, when every borrowed floor is gone. It needs
+// pressure to size the floor, and room on the receiver: a cluster that can't grow keeps
+// the borrowed capacity. Replicas that never reach a node are taken back by AwaitReady,
+// which skips the cluster for a while.
+func prepareReturn(cs []Cluster, cfg Config, in Input) string {
+	donor, receiver := returnPair(cs)
+	if donor < 0 || receiver < 0 || pressured(cs) == 0 {
+		return ""
+	}
+	d, r := cs[donor], cs[receiver]
+	n := min(cfg.StepPercent, over(d), -over(r))
+	if _, err := canReturn(cs, cfg, d, r, n, in.LastStep); err == nil || r.Report.Pressure == nil || d.Report == nil || d.Report.Pressure == nil {
+		return "" // the traffic can come back as it is, or nothing tells how far
+	}
+	switch {
+	case in.Hold[r.Spec.Name] || in.Now.Before(r.SkippedUntil):
+		return ""
+	case r.Added > 0 && r.Report.ReadyReplicas < r.Floor:
+		return "" // still waiting for the replicas already raised
+	}
+	limit := returnLimit(cfg, d, r)
+	if limit <= 0 {
+		return ""
+	}
+	borrowed := 0.0
+	for _, c := range cs {
+		if over(c) > 0 && c.Report != nil && c.Report.Pressure != nil && c.Weight > 0 {
+			borrowed += loadOf(c) * float64(over(c)) / float64(c.Weight)
+		}
+	}
+	want := int32(math.Ceil((loadOf(r) + borrowed) / limit))
+	base := max(r.Floor, r.Report.DesiredReplicas)
+	room := r.Report.StaticRoom + dynamicRoom(r)
+	add := min(want-base, cfg.Step, room, headroom(r))
+	if add <= 0 {
+		return ""
+	}
+	i := receiver
+	cs[i].Static = (cs[i].Floor == 0 || cs[i].Static) && add <= r.Report.StaticRoom
+	cs[i].Floor = base + add
+	cs[i].Added += add
+	cs[i].Tier = TierReturn
+	return fmt.Sprintf("+%d on %s to take traffic back (%d replicas carry it within pressure %s)", add, r.Spec.Name, want, fmtLoad(limit))
+}
+
+func loadOf(c Cluster) float64 {
+	return c.Report.Pressure.AsApproximateFloat64() * float64(c.Report.ReadyReplicas)
+}
+
+// returnLimit is the pressure a replica of r may reach: the highest r has served without
+// being short, or d's, carried over by the clusters' replica capacities (d serves this
+// very traffic now). Negative when neither is known.
+func returnLimit(cfg Config, d, r Cluster) float64 {
+	limit := -1.0
+	if s := r.Report.SafePressure; s != nil {
+		limit = s.AsApproximateFloat64()
+	}
+	if s := d.Report.SafePressure; s != nil {
+		limit = max(limit, s.AsApproximateFloat64()*capacityOf(r, cfg)/capacityOf(d, cfg))
+	}
+	return limit
+}
+
+// returnTraffic moves one step of traffic back toward the Steady weights: from the
+// cluster furthest above its Steady weight (the tier taken last first, as floors are
+// released) to the one furthest below. Plan calls it at most once per CalmFor.
+func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
+	donor, receiver := returnPair(cs)
 	if donor < 0 || receiver < 0 {
 		return ""
 	}
@@ -713,17 +816,8 @@ func canReturn(cs []Cluster, cfg Config, d, r Cluster, n int32, lastStep time.Ti
 	if r.Report.ReadyReplicas == 0 || d.Weight <= 0 {
 		return "", fmt.Errorf("%s has no ready replicas", r.Spec.Name)
 	}
-	load := func(c Cluster) float64 {
-		return c.Report.Pressure.AsApproximateFloat64() * float64(c.Report.ReadyReplicas)
-	}
-	after := (load(r) + load(d)*float64(n)/float64(d.Weight)) / float64(r.Report.ReadyReplicas)
-	limit := -1.0
-	if s := r.Report.SafePressure; s != nil {
-		limit = s.AsApproximateFloat64()
-	}
-	if s := d.Report.SafePressure; s != nil {
-		limit = max(limit, s.AsApproximateFloat64()*capacityOf(r, cfg)/capacityOf(d, cfg))
-	}
+	after := (loadOf(r) + loadOf(d)*float64(n)/float64(d.Weight)) / float64(r.Report.ReadyReplicas)
+	limit := returnLimit(cfg, d, r)
 	if limit < 0 || after > limit {
 		return "", fmt.Errorf("%s would reach pressure %s, above what a replica has served safely (%s)", r.Spec.Name, fmtLoad(after), fmtLoad(max(limit, 0)))
 	}

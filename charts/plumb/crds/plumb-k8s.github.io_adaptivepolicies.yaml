@@ -703,8 +703,9 @@ spec:
                 properties:
                   added:
                     description: |-
-                      Added is how many of those replicas the hub added for a shortage elsewhere; written
-                      with the floor, so it survives a failed status write or a hub failover.
+                      Added is how many of those replicas the hub added: for a shortage elsewhere, or (tier
+                      -1) so this cluster can take traffic back. Written with the floor, so it survives a
+                      failed status write or a hub failover.
                     format: int32
                     type: integer
                   decisionId:
@@ -719,8 +720,9 @@ spec:
                     type: integer
                   tier:
                     description: |-
-                      Tier is the placement tier the floor was taken in (0 first); floors are released
-                      from the highest tier down.
+                      Tier is the placement tier the floor was taken in (0 existing nodes, 1 new nodes);
+                      floors are released from the highest tier down. -1 marks a floor raised on the
+                      cluster traffic comes back to, released last.
                     format: int32
                     type: integer
                 required:
