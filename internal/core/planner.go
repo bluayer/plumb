@@ -19,6 +19,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -39,7 +40,7 @@ type Planner interface {
 
 // PlannerOptions configure a planner host; each host documents which it reads.
 type PlannerOptions struct {
-	Model, Region, Endpoint string
+	Model, Region, Endpoint, APIKey, ResponseFormat string
 }
 
 // PlannerSpec describes a registered planner host.
@@ -144,20 +145,26 @@ func Propose(ctx context.Context, p Planner, in AdaptiveInput) ([]Candidate, err
 	}
 	var out struct {
 		Plans []struct {
-			Actions    []Action `json:"actions"`
-			Hypothesis string   `json:"hypothesis"`
+			Actions    *[]Action `json:"actions"`
+			Hypothesis *string   `json:"hypothesis"`
 		} `json:"plans"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("planner answer: %w", err)
 	}
+	if len(out.Plans) == 0 {
+		return nil, errors.New("planner answer: no plans")
+	}
 	var cands []Candidate
 	for i, pl := range out.Plans[:min(len(out.Plans), n)] {
-		h := pl.Hypothesis
+		if pl.Actions == nil || pl.Hypothesis == nil {
+			return nil, fmt.Errorf("planner answer: plan %d needs actions and hypothesis", i+1)
+		}
+		h := *pl.Hypothesis
 		if r := []rune(h); len(r) > 1000 {
 			h = string(r[:1000])
 		}
-		cands = append(cands, Candidate{ID: fmt.Sprintf("p%d", i+1), Source: SourcePlanner, Actions: pl.Actions, Hypothesis: h})
+		cands = append(cands, Candidate{ID: fmt.Sprintf("p%d", i+1), Source: SourcePlanner, Actions: *pl.Actions, Hypothesis: h})
 	}
 	return cands, nil
 }

@@ -170,6 +170,16 @@ helm upgrade plumb ... --set planner.provider=bedrock --set planner.model=<model
   --set agent.serviceAccountAnnotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::<account>:role/<role>
 ```
 
+An in-cluster model serving OpenAI-compatible Chat Completions can be the planner instead. Give `planner.endpoint` its explicit `/v1` base URL; Plumb calls `/v1/chat/completions`. The model must return a JSON object with `plans` in the assistant message. Plumb includes the plan schema in the system message and validates every proposed action before it can run. An invalid or incomplete response is logged and the rules decide that step.
+
+```sh
+helm upgrade plumb ... --set planner.provider=openai --set planner.model=<served-model-id> \
+  --set planner.endpoint=http://model.models.svc:8000/v1 --set planner.only=true \
+  --set planner.responseFormat=json_schema
+```
+
+`planner.responseFormat=json_schema` asks a server that supports structured output to enforce the plan schema. Omit it for compatible servers that only accept basic Chat Completions fields; Plumb still checks the answer before use. `planner.only=true` runs without Jev; it starts in shadow mode and records the planner's choice beside the rules. After reviewing the decision log, set `model.mode=apply` to let validated plans run. To let Jev choose among multiple planner proposals instead, configure `model.provider` as above and leave `planner.only=false`. For an authenticated endpoint, create a Secret and set `planner.apiKeySecret.name` (and optionally `.key`); its value is sent as a Bearer token. An endpoint outside the cluster must use HTTPS.
+
 Then add to the policy, in every member:
 
 ```yaml

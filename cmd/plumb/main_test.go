@@ -77,6 +77,7 @@ func TestNewRanker(t *testing.T) {
 }
 
 func TestNewPlanner(t *testing.T) {
+	t.Setenv("PLUMB_PLANNER_API_KEY", "")
 	if p, err := newPlanner("", core.PlannerOptions{}); p != nil || err != nil {
 		t.Errorf("no provider: %v %v", p, err)
 	}
@@ -85,6 +86,15 @@ func TestNewPlanner(t *testing.T) {
 	}
 	if _, err := newPlanner("bedrock", core.PlannerOptions{Model: "m", Region: "us-east-1", Endpoint: "http://example.com"}); err == nil {
 		t.Error("plain http endpoint off-cluster accepted")
+	}
+	if _, err := newPlanner("openai", core.PlannerOptions{Model: "m"}); err == nil {
+		t.Error("openai planner without endpoint accepted")
+	}
+	if _, err := newPlanner("openai", core.PlannerOptions{Model: "m", Endpoint: "http://example.com/v1"}); err == nil {
+		t.Error("plain http endpoint off-cluster accepted")
+	}
+	if p, err := newPlanner("openai", core.PlannerOptions{Model: "m", Endpoint: "http://model.models.svc:8000/v1"}); p == nil || err != nil {
+		t.Errorf("in-cluster openai planner: %v %v", p, err)
 	}
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")

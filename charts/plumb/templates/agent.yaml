@@ -47,6 +47,7 @@ spec:
             - --planner-model={{ .Values.planner.model }}
             - --planner-region={{ .Values.planner.region }}
             - --planner-endpoint={{ .Values.planner.endpoint }}
+            - --planner-response-format={{ .Values.planner.responseFormat }}
             - --planner-interval={{ .Values.planner.interval }}
             - --planner-timeout={{ .Values.planner.timeout }}
             - --planner-only={{ .Values.planner.only }}
@@ -58,6 +59,10 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
             {{- with .Values.model.apiKeySecret }}{{ if .name }}
             - name: PLUMB_MODEL_API_KEY
+              valueFrom: {secretKeyRef: {name: {{ .name }}, key: {{ .key }}}}
+            {{- end }}{{ end }}
+            {{- with .Values.planner.apiKeySecret }}{{ if .name }}
+            - name: PLUMB_PLANNER_API_KEY
               valueFrom: {secretKeyRef: {name: {{ .name }}, key: {{ .key }}}}
             {{- end }}{{ end }}
           ports:

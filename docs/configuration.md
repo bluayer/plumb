@@ -123,9 +123,11 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `model.name` | `""` | Model name; `""` is the provider's default (`jev-latest`, `typesafe/jev`, `typesafe-ai/jev`) |
 | `model.timeout` | `1s` | Per-call timeout; rules decide on expiry |
 | `model.apiKeySecret.{name,key}` | `""`, `api-key` | Secret exposed as `PLUMB_MODEL_API_KEY`: the TypeSafe or AI Gateway API key, or the Cloudflare API token. A provider's default endpoint is only called when set |
-| `planner.provider` | `""` | **Experimental.** The planner for `experimental.adaptive`: `""` (none) or `bedrock` (Amazon Bedrock Converse API) |
-| `planner.model` | `""` | Model id, e.g. a Bedrock model or inference profile id |
-| `planner.region`, `planner.endpoint` | `""` | Overrides; for Bedrock, the AWS SDK's default chain otherwise |
+| `planner.provider` | `""` | **Experimental.** The planner for `experimental.adaptive`: `""` (none), `bedrock` (Amazon Bedrock Converse API), or `openai` (OpenAI-compatible Chat Completions) |
+| `planner.model` | `""` | Bedrock model or inference profile id, or model id served by the OpenAI-compatible endpoint |
+| `planner.region`, `planner.endpoint` | `""` | Region and endpoint override for Bedrock. `openai` requires an explicit `/v1` base URL; plain HTTP is allowed only for local or in-cluster hosts |
+| `planner.responseFormat` | `""` | For `openai`: `""`/`text` uses the common Chat Completions fields; `json_schema` requests schema-constrained output if the server supports it |
+| `planner.apiKeySecret.{name,key}` | `""`, `api-key` | Optional Bearer token for `openai`, exposed as `PLUMB_PLANNER_API_KEY`; in-cluster endpoints may omit it |
 | `planner.interval` | `2m` | At most one planner call per policy per interval, only while a member is short or the fleet is not Steady. Calls run in the background |
 | `planner.timeout` | `1m` | Per-call timeout |
 | `planner.only` | `false` | Planner only, without Jev: the planner proposes one plan, carried out once validated (recorded only while `model.mode=shadow`) |
@@ -153,14 +155,14 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `--clusterprofile-provider-file` | `""` | Access providers JSON (`{"providers": [...]}`); empty is a fleet of one |
 | `--prometheus-url` | `""` | Prometheus for `spec.signals` |
 | `--model-provider`, `--model-mode`, `--model-url`, `--model`, `--model-timeout` | see Helm values | The experimental ranking model |
-| `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-interval`, `--planner-timeout`, `--planner-only` | see Helm values | The experimental planner |
+| `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-response-format`, `--planner-interval`, `--planner-timeout`, `--planner-only` | see Helm values | The experimental planner |
 | `--interval` / `--hub-interval` | `30s` / `10s` | Report and planning intervals |
 | `--decision-log` | `-` | Decision log path |
 | `--leader-elect` | `true` | Elect one agent per cluster |
 | `--metrics-bind-address` / `--health-probe-bind-address` | `:8080` / `:8081` | Endpoints |
 | `--zap-log-level`, `--zap-encoder`, … | JSON, info | Logging (controller-runtime zap flags) |
 
-Environment: `PLUMB_MODEL_API_KEY` (model API key; else the provider's own `TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN` or `AI_GATEWAY_API_KEY`), `POD_NAMESPACE`, and for Bedrock the AWS SDK's (`AWS_REGION`, IRSA or Pod Identity).
+Environment: `PLUMB_MODEL_API_KEY` (model API key; else the provider's own `TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN` or `AI_GATEWAY_API_KEY`), `PLUMB_PLANNER_API_KEY` (optional Bearer token for an OpenAI-compatible planner), `POD_NAMESPACE`, and for Bedrock the AWS SDK's (`AWS_REGION`, IRSA or Pod Identity).
 
 `plumb suggest` (writes a first policy; see [installation](installation.md#3-apply-the-policy-in-every-member))
 

@@ -87,7 +87,7 @@ It is then selectable with `--model-provider=myhost` (Helm: `model.provider`). A
 
 ### Planner providers
 
-The experimental planner (the model proposing plans for `spec.experimental.adaptive`) plugs in the same way: one file whose `init` calls `core.RegisterPlanner`, selectable with `--planner-provider`. A planner host only carries a request: it gets a system prompt, the request (JSON) and the answer's JSON schema, and returns the model's answer as JSON. Prompt, schema, parsing, validation and the background scheduling are shared. A host that needs a cloud SDK lives under `internal/adapters/<cloud>/` (Bedrock: `internal/adapters/aws/bedrock.go`); test it against an `httptest` server as `bedrock_test.go` does.
+The experimental planner (the model proposing plans for `spec.experimental.adaptive`) plugs in the same way: one file whose `init` calls `core.RegisterPlanner`, selectable with `--planner-provider`. A planner host only carries a request: it gets a system prompt, the request (JSON) and the answer's JSON schema, and returns the model's answer as JSON. Prompt, schema, parsing, validation and the background scheduling are shared. A host that needs a cloud SDK lives under `internal/adapters/<cloud>/` (Bedrock: `internal/adapters/aws/bedrock.go`); a generic HTTP host can live in `internal/core/` (OpenAI-compatible Chat Completions: `internal/core/planner_openai.go`). Test the wire format against an `httptest` server as those providers do.
 
 ```go
 func init() { core.RegisterPlanner("myhost", core.PlannerSpec{New: newMyHost}) }
