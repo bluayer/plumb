@@ -583,13 +583,37 @@ func shiftTraffic(cs []Cluster, cfg Config, escalated bool, lastStep time.Time) 
 			}
 		}
 	}
-	var notes []string
+	// Backend weights are ratios. Keep their total fixed so StepPercent also bounds
+	// the effective traffic share when more than two clusters are configured.
+	deltas := make([]int32, len(cs))
+	var imbalance int32
 	for i, c := range cs {
 		t := min(max(int32(math.Round(target[c.Spec.Name])), c.Spec.MinWeight), c.Spec.MaxWeight)
 		if follow && violates(c, cfg) {
 			t = min(t, c.Weight) // SLO brake: no more traffic to a cluster over its objective
 		}
-		w := c.Weight + min(max(t-c.Weight, -cfg.StepPercent), cfg.StepPercent)
+		deltas[i] = min(max(t-c.Weight, -cfg.StepPercent), cfg.StepPercent)
+		imbalance += deltas[i]
+	}
+	// Trim only the side with more requested movement. Round-robin trimming keeps
+	// several receivers (or donors) moving when the other side has less to give.
+	for imbalance != 0 {
+		for i := range deltas {
+			if imbalance > 0 && deltas[i] > 0 {
+				deltas[i]--
+				imbalance--
+			} else if imbalance < 0 && deltas[i] < 0 {
+				deltas[i]++
+				imbalance++
+			}
+			if imbalance == 0 {
+				break
+			}
+		}
+	}
+	var notes []string
+	for i, c := range cs {
+		w := c.Weight + deltas[i]
 		if w != c.Weight {
 			notes = append(notes, fmt.Sprintf("%s %d→%d%%", c.Spec.Name, c.Weight, w))
 			cs[i].Weight = w

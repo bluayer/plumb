@@ -22,6 +22,7 @@ limitations under the License.
 //
 //	PLUMB_E2E_KUBECONFIG         first member cluster, "home" (required)
 //	PLUMB_E2E_REMOTE_KUBECONFIG  second member cluster, "remote" (optional; fleet tests skip without it)
+//	PLUMB_E2E_THIRD_KUBECONFIG   third member cluster, "third" (optional; three-way traffic test skips without it)
 //	PLUMB_E2E_LOG                set to 1 to print the members' logs
 //	PLUMB_E2E_ALLOW_ANY_CLUSTER  set to 1 to run against a context not named kind-*, kwok-*, minikube or plumb-e2e*
 package e2e
@@ -76,8 +77,8 @@ type cluster struct {
 }
 
 var (
-	scheme       = runtime.NewScheme()
-	home, remote *cluster
+	scheme              = runtime.NewScheme()
+	home, remote, third *cluster
 	// secretReader is the cluster-inventory-api kubeconfig-secretreader exec plugin, the
 	// standard way a member gets credentials for another from its ClusterProfile.
 	secretReader string
@@ -112,7 +113,13 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
-	for _, cl := range []*cluster{home, remote} {
+	if p := os.Getenv("PLUMB_E2E_THIRD_KUBECONFIG"); p != "" {
+		if third, err = connect("third", p); err != nil {
+			fmt.Fprintln(os.Stderr, "e2e:", err)
+			os.Exit(1)
+		}
+	}
+	for _, cl := range []*cluster{home, remote, third} {
 		if cl == nil {
 			continue
 		}

@@ -300,6 +300,7 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 		t.Fatalf("setup: %d scheduled, %d pending", s, u)
 	}
 	h.route("llm")
+	r.route("llm-secondary")
 	sec := func(s int) metav1.Duration { return metav1.Duration{Duration: time.Duration(s) * time.Second} }
 	spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"},
 		Clusters: []v1alpha1.ClusterSpec{
@@ -310,7 +311,10 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 		Capacity: v1alpha1.CapacityPolicy{Step: 2},
 		// readyTimeout no later than the shortened outcome checkpoints below, which it would extend.
 		Escalation: v1alpha1.EscalationPolicy{After: sec(60), EarlyAfter: sec(2), ReadyTimeout: sec(20), CalmFor: sec(3), Cooldown: sec(1)},
-		Traffic:    &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: "home", Namespace: h.ns, Name: "llm"}}, StepPercent: 25},
+		Traffic: &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{
+			{Cluster: "home", Namespace: h.ns, Name: "llm"},
+			{Cluster: "remote", Namespace: r.ns, Name: "llm-secondary"},
+		}, StepPercent: 25},
 	}
 	h.createPolicy(spec)
 	r.createPolicy(spec)
@@ -376,6 +380,25 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 	if w := h.routeWeights("llm"); w["home"] != 50 || w["remote"] != 50 {
 		t.Fatalf("balanced pressure must hold the split, got %v", w)
 	}
+	// Remove the second route after the fleet settles, then bring it back with
+	// stale weights. The first route does not move, so a normal traffic step
+	// cannot hide a missing reconciliation pass.
+	second := &unstructured.Unstructured{}
+	second.SetGroupVersionKind(adapters.HTTPRouteGVK)
+	second.SetNamespace(r.ns)
+	second.SetName("llm-secondary")
+	if err := r.cl.c.Delete(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "second route removed", func() bool {
+		err := r.cl.c.Get(context.Background(), client.ObjectKeyFromObject(second), second)
+		return apierrors.IsNotFound(err)
+	})
+	r.route("llm-secondary")
+	eventually(t, 30*time.Second, "late route caught up with the settled split", func() bool {
+		w := r.routeWeights("llm-secondary")
+		return w["home"] == 50 && w["remote"] == 50
+	})
 
 	// Balanced traffic stays balanced: home can take more only once demand drops. Then no
 	// one is short and, after calmFor, traffic comes back a step at a time, as far as home
@@ -451,6 +474,80 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 		fs := otherEnv.get().Status.Fleet // the new hub writes its own copy
 		return fs != nil && fs.Hub == other.identity
 	})
+}
+
+// A shortage in a three-member fleet moves at most one step of effective traffic
+// away from home. Gateway backend weights are ratios, so their sum must stay 100.
+func TestFleetThreeWayTrafficStep(t *testing.T) {
+	if remote == nil || third == nil {
+		t.Skip("needs PLUMB_E2E_REMOTE_KUBECONFIG and PLUMB_E2E_THIRD_KUBECONFIG")
+	}
+	h := newEnv(t, home)
+	r := envFor(t, remote, h.scenario)
+	x := envFor(t, third, h.scenario)
+	for _, e := range []*env{h, r, x} {
+		e.node("a", "z1", 2)
+		e.waitNodesReady()
+	}
+	h.deployment("llm", 4, llm, h.podSpec(1))
+	r.deployment("llm", 2, llm, r.podSpec(1))
+	x.deployment("llm", 2, llm, x.podSpec(1))
+	if s, u := h.settle(llm, 4); s != 2 || u != 2 {
+		t.Fatalf("home setup: %d scheduled, %d pending", s, u)
+	}
+	for _, e := range []*env{r, x} {
+		if s, u := e.settle(llm, 2); s != 2 || u != 0 {
+			t.Fatalf("%s setup: %d scheduled, %d pending", e.cl.name, s, u)
+		}
+	}
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(adapters.HTTPRouteGVK)
+	route.SetNamespace(h.ns)
+	route.SetName("llm")
+	route.Object["spec"] = map[string]any{"rules": []any{map[string]any{"backendRefs": []any{
+		map[string]any{"name": "llm-home", "port": int64(80), "weight": int64(1)},
+		map[string]any{"name": "llm-remote", "port": int64(80), "weight": int64(0)},
+		map[string]any{"name": "llm-third", "port": int64(80), "weight": int64(0)},
+	}}}}
+	if err := h.cl.c.Create(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	sec := func(s int) metav1.Duration { return metav1.Duration{Duration: time.Duration(s) * time.Second} }
+	spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"},
+		Clusters: []v1alpha1.ClusterSpec{
+			{Name: "home", MaxReplicas: 10, NodeSelector: kwokNodes, Backend: &v1alpha1.BackendRef{Name: "llm-home"}, Weight: 100, MaxWeight: 100},
+			{Name: "remote", MaxReplicas: 10, NodeSelector: kwokNodes, Backend: &v1alpha1.BackendRef{Name: "llm-remote"}, MaxWeight: 100},
+			{Name: "third", MaxReplicas: 10, NodeSelector: kwokNodes, Backend: &v1alpha1.BackendRef{Name: "llm-third"}, MaxWeight: 100},
+		},
+		Escalation: v1alpha1.EscalationPolicy{After: sec(60), EarlyAfter: sec(2), Cooldown: sec(20)},
+		Traffic:    &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: "home", Namespace: h.ns, Name: "llm"}}, StepPercent: 10},
+	}
+	for _, e := range []*env{h, r, x} {
+		e.createPolicy(spec)
+	}
+	joinFleet(t, home, remote, third)
+	for _, e := range []*env{h, r, x} {
+		startMember(t, e.cl, e.cl.name, nil, time.Second)
+	}
+	backends := map[string]v1alpha1.BackendRef{
+		"home": {Name: "llm-home"}, "remote": {Name: "llm-remote"}, "third": {Name: "llm-third"},
+	}
+	var weights map[string]int32
+	eventually(t, 60*time.Second, "first three-way traffic step", func() bool {
+		var err error
+		weights, err = adapters.RouteWeights(context.Background(), h.cl.c,
+			v1alpha1.RouteRef{Namespace: h.ns, Name: "llm"}, backends)
+		if err != nil {
+			return false
+		}
+		return weights["home"] < 100 && weights["remote"] > 0 && weights["third"] > 0
+	})
+	if total := weights["home"] + weights["remote"] + weights["third"]; total != 100 {
+		t.Fatalf("backend weights sum to %d, want 100: %v", total, weights)
+	}
+	if weights["home"] != 90 || weights["remote"] > 10 || weights["third"] > 10 {
+		t.Fatalf("first step exceeds 10 percentage points: %v", weights)
+	}
 }
 
 // A member only reports: launch failures show up in its report (the hub uses them to

@@ -183,6 +183,28 @@ func TestPlanTrafficAndRecovery(t *testing.T) {
 	}
 }
 
+// Gateway API treats backend weights as ratios. With three backends, independently
+// stepping each one can change the effective share by more than StepPercent.
+func TestPlanTrafficStepKeepsTotalWeight(t *testing.T) {
+	a, b, c := member("a", 10, 0, 0, 100), member("b", 10, 0, 0, 0), member("c", 10, 0, 0, 0)
+	b.Floor = 10
+	in := Input{Now: t0, Config: cfg, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0, Clusters: []Cluster{short(a, 2, time.Hour), b, c}}
+	res := Plan(in)
+	var total int32
+	for i, p := range res.Plans {
+		total += p.Weight
+		if change := p.Weight - in.Clusters[i].Weight; change < -cfg.StepPercent || change > cfg.StepPercent {
+			t.Errorf("%s moved %d points, limit %d", p.Name, change, cfg.StepPercent)
+		}
+	}
+	if total != 100 {
+		t.Errorf("backend weights total %d, want 100: %+v", total, res.Plans)
+	}
+	if res.Plans[1].Weight == 0 || res.Plans[2].Weight == 0 {
+		t.Errorf("both idle backends should receive a share: %+v", res.Plans)
+	}
+}
+
 func withPressure(c Cluster, p string) Cluster {
 	q := resource.MustParse(p)
 	c.Report.Pressure = &q
