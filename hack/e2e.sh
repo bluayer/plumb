@@ -15,8 +15,8 @@
 
 # hack/e2e.sh up|down
 #
-# up creates disposable clusters for the e2e suite ("home" and "remote", with an
-# optional third member) and
+# up creates disposable clusters for the e2e suite ("home", "remote" and
+# "third") and
 # makes KWOK manage fake nodes in them, so tests can create GPU nodes without GPUs.
 #
 #   PROVIDER=kind     hack/e2e.sh up   # default; needs docker + kind
@@ -26,13 +26,13 @@
 # The real kube-scheduler places pods in every mode; KWOK only simulates the kubelet
 # of nodes annotated kwok.x-k8s.io/node=fake. Kubeconfigs land in .e2e/.
 # REMOTE=0 skips the second cluster (multi-region tests are then skipped).
-# THIRD=1 adds a third cluster for three-way traffic tests.
+# THIRD=0 skips the third cluster (three-way traffic tests are then skipped).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROVIDER=${PROVIDER:-kind}
 REMOTE=${REMOTE:-1}
-THIRD=${THIRD:-0}
+THIRD=${THIRD:-$REMOTE}
 KWOK_VERSION=${KWOK_VERSION:-$(go list -modfile=hack/tools/go.mod -m -f '{{.Version}}' sigs.k8s.io/kwok)} # Dependabot bumps it there
 KIND_IMAGE=${KIND_IMAGE:-}          # e.g. kindest/node:v1.33.7
 PREFIX=${PREFIX:-plumb-e2e}
