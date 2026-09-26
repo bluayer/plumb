@@ -402,6 +402,15 @@ var kwokNodes = map[string]string{"type": "kwok"}
 // kubernetes.io/os label on purpose, so DaemonSets (kube-proxy, kindnet) stay off it.
 func (e *env) node(name, zone string, gpus int64, opts ...nodeOpt) string {
 	e.t.Helper()
+	name, err := e.nodeCtx(context.Background(), name, gpus, append([]nodeOpt{withLabels(zoneKey, zone)}, opts...)...)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return name
+}
+
+// nodeCtx is node for the harness loops, which can't fail the test; the zone is z1.
+func (e *env) nodeCtx(ctx context.Context, name string, gpus int64, opts ...nodeOpt) (string, error) {
 	name = e.scenario + "-" + name
 	rl := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("64"),
@@ -413,17 +422,14 @@ func (e *env) node(name, zone string, gpus int64, opts ...nodeOpt) string {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Annotations: map[string]string{kwokAnno: "fake"},
-			Labels:      map[string]string{hostKey: name, zoneKey: zone, scenarioLabel: e.scenario, "type": "kwok"},
+			Labels:      map[string]string{hostKey: name, zoneKey: "z1", scenarioLabel: e.scenario, "type": "kwok"},
 		},
 		Status: corev1.NodeStatus{Capacity: rl, Allocatable: rl.DeepCopy()},
 	}
 	for _, o := range opts {
 		o(n)
 	}
-	if err := e.cl.c.Create(context.Background(), n); err != nil {
-		e.t.Fatal(err)
-	}
-	return name
+	return name, e.cl.c.Create(ctx, n)
 }
 
 // waitNodesReady waits until KWOK has made every scenario node Ready and the node

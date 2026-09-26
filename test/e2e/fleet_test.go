@@ -22,15 +22,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -119,34 +117,6 @@ func startMember(t *testing.T, cl *cluster, name string, prom *adapters.Promethe
 }
 
 func ptrTo[T any](v T) *T { return &v }
-
-// fakePrometheus answers the "pressure" query for one member like a queue would: its
-// share of the route's traffic per ready replica, scaled by demand (percent, shared by
-// the members). Traffic moved to the member raises its pressure, so the hub's balancing
-// is exercised as a closed loop.
-func fakePrometheus(t *testing.T, e, routes *env, backend string, demand *atomic.Int64) *adapters.Prometheus {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		weights, err := adapters.RouteWeights(ctx, routes.cl.c, v1alpha1.RouteRef{Namespace: routes.ns, Name: "llm"},
-			map[string]v1alpha1.BackendRef{"me": {Name: backend}})
-		d := &appsv1.Deployment{}
-		if err == nil {
-			err = e.cl.c.Get(ctx, client.ObjectKey{Namespace: e.ns, Name: "llm"}, d)
-		}
-		if err != nil || r.URL.Query().Get("query") != "pressure" {
-			http.Error(w, fmt.Sprint("unsupported: ", err), http.StatusBadRequest)
-			return
-		}
-		pressure := 0.0
-		if d.Status.ReadyReplicas > 0 {
-			pressure = float64(weights["me"]) * float64(demand.Load()) / 100 / float64(d.Status.ReadyReplicas)
-		}
-		_, _ = fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[%d,"%g"]}]}}`,
-			time.Now().Unix(), pressure)
-	}))
-	t.Cleanup(srv.Close)
-	return &adapters.Prometheus{URL: srv.URL}
-}
 
 // joinFleet plays the cluster manager: in each member it writes a ClusterProfile for the
 // other member and the Secret its kubeconfig-secretreader access provider reads.
@@ -279,203 +249,6 @@ func hubStatus(envs ...*env) *v1alpha1.FleetStatus {
 	return best
 }
 
-// A cluster joins a running fleet. Then a member keeps running out of GPUs while the new
-// one has idle static capacity. The short member has no NodePools to add nodes of its own,
-// so the fleet escalates after earlyAfter, puts the missing replicas on the idle nodes,
-// moves traffic as they become ready, and once calm gives everything back. Then the hub member stops and
-// the other member takes over the fleet lease.
-func TestFleetEscalationToStaticCapacity(t *testing.T) {
-	if remote == nil {
-		t.Skip("needs PLUMB_E2E_REMOTE_KUBECONFIG")
-	}
-	h := newEnv(t, home)
-	r := envFor(t, remote, h.scenario)
-	h.node("a", "z1", 2)
-	r.node("a", "z1", 4) // idle, e.g. reserved capacity
-	h.waitNodesReady()
-	r.waitNodesReady()
-	h.deployment("llm", 4, llm, h.podSpec(1))
-	r.deployment("llm", 0, llm, r.podSpec(1))
-	if s, u := h.settle(llm, 4); s != 2 || u != 2 {
-		t.Fatalf("setup: %d scheduled, %d pending", s, u)
-	}
-	h.route("llm")
-	r.route("llm-secondary")
-	sec := func(s int) metav1.Duration { return metav1.Duration{Duration: time.Duration(s) * time.Second} }
-	spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"},
-		Clusters: []v1alpha1.ClusterSpec{
-			{Name: "home", MaxReplicas: 10, NodeSelector: kwokNodes, Backend: &v1alpha1.BackendRef{Name: "llm-home"}, Weight: 100, MaxWeight: 100},
-			{Name: "remote", MaxReplicas: 10, NodeSelector: kwokNodes, Backend: &v1alpha1.BackendRef{Name: "llm-remote"}, Weight: 0, MaxWeight: 100},
-		},
-		Signals:  v1alpha1.Signals{Pressure: "pressure"},
-		Capacity: v1alpha1.CapacityPolicy{Step: 2},
-		// readyTimeout no later than the shortened outcome checkpoints below, which it would extend.
-		Escalation: v1alpha1.EscalationPolicy{After: sec(60), EarlyAfter: sec(2), ReadyTimeout: sec(20), CalmFor: sec(3), Cooldown: sec(1)},
-		Traffic: &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{
-			{Cluster: "home", Namespace: h.ns, Name: "llm"},
-			{Cluster: "remote", Namespace: r.ns, Name: "llm-secondary"},
-		}, StepPercent: 25},
-	}
-	h.createPolicy(spec)
-	r.createPolicy(spec)
-	// home runs alone first; remote joins later, the way a cluster is added to a fleet.
-	saved := core.Horizons // outcome checkpoints, shortened for the test
-	core.Horizons = []time.Duration{2 * time.Second, 20 * time.Second}
-	t.Cleanup(func() { core.Horizons = saved })
-	demand := &atomic.Int64{}
-	demand.Store(100)
-	mh := startMember(t, home, "home", fakePrometheus(t, h, h, "llm-home", demand), time.Second)
-	eventually(t, 30*time.Second, "home leading a fleet of one", func() bool {
-		fs := h.get().Status.Fleet
-		return fs != nil && fs.Hub == mh.identity
-	})
-	joinFleet(t, home, remote)
-	mr := startMember(t, remote, "remote", fakePrometheus(t, r, h, "llm-remote", demand), time.Second)
-
-	// Escalation lands on remote's idle static capacity, served to KEDA by remote's scaler.
-	start := time.Now()
-	policy := h.ns + "/llm" // the hub logs every policy in the cluster; this test reads its own
-	// On failure, show where each copy ended up and every decision taken.
-	t.Cleanup(func() {
-		if !t.Failed() {
-			return
-		}
-		for _, e := range []*env{h, r} {
-			b, _ := json.Marshal(e.get().Status)
-			t.Logf("status in %s: %s", e.cl.name, b)
-		}
-		for _, m := range []*memberProc{mh, mr} {
-			m.log.Mu.Lock()
-			for _, rec := range m.log.Records {
-				if d, ok := rec.(core.Record); ok && d.Action != "none" && d.Policy == policy {
-					t.Logf("decision %s by %s: %s (%s) before=%v after=%v", d.DecisionID, d.Hub, d.Action, d.Message, d.Before, d.After)
-				}
-			}
-			m.log.Mu.Unlock()
-		}
-	})
-	eventually(t, 60*time.Second, "an intent on remote", func() bool {
-		in := r.get().Status.Intent
-		return in != nil && in.Replicas == 2
-	})
-	t.Logf("remote joined → intent on remote: %v", time.Since(start).Round(100*time.Millisecond))
-	srv := &scaler.Server{Reader: remote.c, Namespace: fleetNS}
-	ref := &externalscaler.ScaledObjectRef{Namespace: r.ns, ScalerMetadata: map[string]string{scaler.MetaPolicy: "llm"}}
-	if f, err := srv.Floor(context.Background(), ref); err != nil || f != 2 {
-		t.Fatalf("remote scaler floor = %d, %v", f, err)
-	}
-	fs := hubStatus(h, r)
-	if fs.Phase != v1alpha1.PhaseEscalated || fs.LastDecision == nil || !strings.Contains(fs.LastDecision.Message, "static on remote") {
-		t.Fatalf("fleet status %+v", fs)
-	}
-
-	// KEDA scales remote to the floor. Traffic moves toward the less loaded cluster until
-	// the pressures (share per ready replica, 2 : 2) are even, then stops.
-	r.scale("llm", 2)
-	eventually(t, 60*time.Second, "traffic split 50/50", func() bool {
-		w := h.routeWeights("llm")
-		return w["home"] == 50 && w["remote"] == 50
-	})
-	time.Sleep(3 * time.Second) // several cooldowns
-	if w := h.routeWeights("llm"); w["home"] != 50 || w["remote"] != 50 {
-		t.Fatalf("balanced pressure must hold the split, got %v", w)
-	}
-	// Remove the second route after the fleet settles, then bring it back with
-	// stale weights. The first route does not move, so a normal traffic step
-	// cannot hide a missing reconciliation pass.
-	second := &unstructured.Unstructured{}
-	second.SetGroupVersionKind(adapters.HTTPRouteGVK)
-	second.SetNamespace(r.ns)
-	second.SetName("llm-secondary")
-	if err := r.cl.c.Delete(context.Background(), second); err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, 10*time.Second, "second route removed", func() bool {
-		err := r.cl.c.Get(context.Background(), client.ObjectKeyFromObject(second), second)
-		return apierrors.IsNotFound(err)
-	})
-	r.route("llm-secondary")
-	eventually(t, 30*time.Second, "late route caught up with the settled split", func() bool {
-		w := r.routeWeights("llm-secondary")
-		return w["home"] == 50 && w["remote"] == 50
-	})
-
-	// Balanced traffic stays balanced: home can take more only once demand drops. Then no
-	// one is short and, after calmFor, traffic comes back a step at a time, as far as home
-	// has served safely; the floor goes once remote carries none.
-	h.scale("llm", 2)
-	demand.Store(25)
-	eventually(t, 60*time.Second, "back to Steady", func() bool {
-		fs := hubStatus(h, r)
-		w := h.routeWeights("llm")
-		return fs.Phase == v1alpha1.PhaseSteady && r.get().Status.Intent == nil && w["home"] == 100 && w["remote"] == 0
-	})
-
-	// Every step is in the hub's decision log, and the capacity decision's outcome is
-	// joined to it: when remote became ready, and what followed.
-	type logs struct {
-		actions  []string
-		added    []string // add_capacity decisions
-		outcomes map[string][]core.Outcome
-	}
-	read := func() logs {
-		l := logs{outcomes: map[string][]core.Outcome{}}
-		for _, m := range []*memberProc{mh, mr} {
-			m.log.Mu.Lock()
-			for _, rec := range m.log.Records {
-				switch r := rec.(type) {
-				case core.Record:
-					if r.Policy != policy {
-						continue
-					}
-					l.actions = append(l.actions, r.Action)
-					if strings.Contains(r.Action, "add_capacity") {
-						l.added = append(l.added, r.DecisionID)
-					}
-				case core.Outcome:
-					if r.Policy != policy {
-						continue
-					}
-					l.outcomes[r.DecisionID] = append(l.outcomes[r.DecisionID], r)
-				}
-			}
-			m.log.Mu.Unlock()
-		}
-		return l
-	}
-	var l logs
-	eventually(t, 30*time.Second, "the final outcome of the capacity decision", func() bool {
-		l = read()
-		return len(l.added) > 0 && len(l.outcomes[l.added[0]]) == 2
-	})
-	for _, want := range []string{"add_capacity", "shift_traffic", "release_capacity"} {
-		if !slices.ContainsFunc(l.actions, func(a string) bool { return strings.Contains(a, want) }) {
-			t.Errorf("decision log has no %s: %v", want, l.actions)
-		}
-	}
-	if len(l.added) != 1 {
-		t.Errorf("capacity was added %d times for one shortage: %v", len(l.added), l.actions)
-	}
-	last := l.outcomes[l.added[0]][1]
-	if _, ready := last.ReadyAfterSeconds["remote"]; !last.Final || !ready || last.Clusters["home"].Pressure == nil ||
-		!slices.ContainsFunc(last.FollowedBy, func(f string) bool { return strings.Contains(f, "shift_traffic") }) {
-		t.Fatalf("outcome not joined to what happened: %+v", last)
-	}
-	t.Logf("floor on remote ready after %.1fs; followed by %v", last.ReadyAfterSeconds["remote"], last.FollowedBy)
-
-	// The hub member stops; the other takes over the fleet within a few lease periods.
-	hub, other := mh, mr
-	if strings.HasPrefix(hubStatus(h, r).Hub, "remote/") {
-		hub, other = mr, mh
-	}
-	hub.stop()
-	otherEnv := map[*memberProc]*env{mh: h, mr: r}[other]
-	eventually(t, 45*time.Second, "failover", func() bool {
-		fs := otherEnv.get().Status.Fleet // the new hub writes its own copy
-		return fs != nil && fs.Hub == other.identity
-	})
-}
-
 // A shortage in a three-member fleet moves at most one step of effective traffic
 // away from home. Gateway backend weights are ratios, so their sum must stay 100.
 func TestFleetThreeWayTrafficStep(t *testing.T) {
@@ -600,10 +373,11 @@ func (e *env) nodePool(name, capacityType string, gpuLimit int64) {
 	np.SetGroupVersionKind(karpenter.NodePoolGVK)
 	np.SetName(name)
 	np.Object["spec"] = map[string]any{
-		"template": map[string]any{"spec": map[string]any{
+		"template": map[string]any{"metadata": map[string]any{"labels": map[string]any{scenarioLabel: e.scenario, "type": "kwok"}}, "spec": map[string]any{
 			"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"},
 			"requirements": []any{map[string]any{"key": karpenter.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}}},
 		}},
+		// Its nodes carry the scenario's labels, so the scenario's pods may use it.
 		"limits":     map[string]any{string(gpu): fmt.Sprint(gpuLimit)},
 		"disruption": map[string]any{"consolidateAfter": "30s"},
 	}
@@ -619,42 +393,48 @@ func (e *env) nodePool(name, capacityType string, gpuLimit int64) {
 // (lifecycle/events.go), and the NodeClaim is deleted (lifecycle/launch.go).
 func (e *env) ice(pool, capacityType, code string, n int) {
 	e.t.Helper()
-	ctx := context.Background()
-	for i := 0; i < n; i++ {
-		name := fmt.Sprintf("%s-%s-%d-%d", pool, e.scenario, time.Now().UnixNano()%100000, i)
-		nc := &unstructured.Unstructured{}
-		nc.SetGroupVersionKind(karpenter.NodeClaimGVK)
-		nc.SetName(name)
-		nc.SetLabels(map[string]string{karpenter.NodePoolLabelKey: pool})
-		nc.Object["spec"] = map[string]any{
-			"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"},
-			"requirements": []any{
-				map[string]any{"key": karpenter.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}},
-				map[string]any{"key": karpenter.InstanceTypeLabelKey, "operator": "In", "values": []any{"p5.48xlarge"}},
-			},
-		}
-		if err := e.cl.c.Create(ctx, nc); err != nil {
+	for range n {
+		if err := e.iceOnce(context.Background(), pool, capacityType, code); err != nil {
 			e.t.Fatal(err)
 		}
-		// Karpenter's launch call takes seconds, so its NodeClaim informer sees the claim
-		// before the ICE event; keep that order without the wait of a real launch.
-		time.Sleep(200 * time.Millisecond)
-		now := metav1.Now()
-		ev := &corev1.Event{
-			ObjectMeta:     metav1.ObjectMeta{Name: name + ".ice", Namespace: "default"},
-			InvolvedObject: corev1.ObjectReference{Kind: "NodeClaim", Name: name, APIVersion: "karpenter.sh/v1", UID: nc.GetUID()},
-			Reason:         karpenter.EventReasonInsufficientCapacity,
-			Message: fmt.Sprintf("NodeClaim %s event: creating instance, insufficient capacity, with fleet error(s), "+
-				"%s: We currently do not have sufficient p5.48xlarge capacity in the Availability Zone you requested.", name, code),
-			Type: corev1.EventTypeWarning, Count: 1, FirstTimestamp: now, LastTimestamp: now,
-			Source: corev1.EventSource{Component: "karpenter"},
-		}
-		if err := e.cl.c.Create(ctx, ev); err != nil {
-			e.t.Fatal(err)
-		}
-		_ = e.cl.c.Delete(ctx, nc)
-		e.t.Cleanup(func() { _ = e.cl.c.Delete(context.Background(), ev) })
 	}
+}
+
+func (e *env) iceOnce(ctx context.Context, pool, capacityType, code string) error {
+	name := fmt.Sprintf("%s-%s-%d", pool, e.scenario, time.Now().UnixNano()%10000000)
+	nc := &unstructured.Unstructured{}
+	nc.SetGroupVersionKind(karpenter.NodeClaimGVK)
+	nc.SetName(name)
+	nc.SetLabels(map[string]string{karpenter.NodePoolLabelKey: pool})
+	nc.Object["spec"] = map[string]any{
+		"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"},
+		"requirements": []any{
+			map[string]any{"key": karpenter.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}},
+			map[string]any{"key": karpenter.InstanceTypeLabelKey, "operator": "In", "values": []any{"p5.48xlarge"}},
+		},
+	}
+	if err := e.cl.c.Create(ctx, nc); err != nil {
+		return err
+	}
+	// Karpenter's launch call takes seconds, so its NodeClaim informer sees the claim
+	// before the ICE event; keep that order without the wait of a real launch.
+	time.Sleep(200 * time.Millisecond)
+	now := metav1.Now()
+	ev := &corev1.Event{
+		ObjectMeta:     metav1.ObjectMeta{Name: name + ".ice", Namespace: "default"},
+		InvolvedObject: corev1.ObjectReference{Kind: "NodeClaim", Name: name, APIVersion: "karpenter.sh/v1", UID: nc.GetUID()},
+		Reason:         karpenter.EventReasonInsufficientCapacity,
+		Message: fmt.Sprintf("NodeClaim %s event: creating instance, insufficient capacity, with fleet error(s), "+
+			"%s: We currently do not have sufficient p5.48xlarge capacity in the Availability Zone you requested.", name, code),
+		Type: corev1.EventTypeWarning, Count: 1, FirstTimestamp: now, LastTimestamp: now,
+		Source: corev1.EventSource{Component: "karpenter"},
+	}
+	if err := e.cl.c.Create(ctx, ev); err != nil {
+		return err
+	}
+	_ = e.cl.c.Delete(ctx, nc)
+	e.t.Cleanup(func() { _ = e.cl.c.Delete(context.Background(), ev) })
+	return nil
 }
 
 // Two policies short at home at the same time compete for the same idle static capacity
@@ -738,5 +518,435 @@ func TestFleetPoliciesShareCapacity(t *testing.T) {
 	}
 	if total < 4 {
 		t.Fatalf("idle capacity left unused: floors %v", last)
+	}
+}
+
+// leaveFleet removes, in each cluster, the ClusterProfiles and kubeconfig Secrets of the
+// others: what a cluster manager does when a cluster leaves.
+func leaveFleet(t *testing.T, clusters ...*cluster) {
+	t.Helper()
+	ctx := context.Background()
+	for _, in := range clusters {
+		for _, peer := range clusters {
+			if peer == in {
+				continue
+			}
+			for _, obj := range []client.Object{
+				&cpv1alpha1.ClusterProfile{ObjectMeta: metav1.ObjectMeta{Name: peer.name, Namespace: fleetNS}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: peer.name + "-kubeconfig", Namespace: fleetNS}},
+			} {
+				if err := client.IgnoreNotFound(in.c.Delete(ctx, obj)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+}
+
+// balanced waits for the 50/50 split that even pressure (2 replicas each) settles at.
+func (f *fleet) balanced() {
+	f.t.Helper()
+	eventually(f.t, 60*time.Second, "traffic split 50/50", func() bool {
+		w := f.h.routeWeights("llm")
+		return w["home"] == 50 && w["remote"] == 50
+	})
+}
+
+// A cluster leaves and joins a running fleet. Alone, home leads a fleet of one and can
+// borrow nothing; once remote joins, its idle GPUs take home's shortage.
+func TestFleetJoinAndLeave(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	leaveFleet(t, home, remote)
+	t.Cleanup(func() { joinFleet(t, home, remote) })
+	f.h.createPolicy(f.spec())
+	f.r.createPolicy(f.spec())
+	f.mh = startMember(t, home, "home", f.tr.signals(f.h, "llm-home"), time.Second)
+	f.h.keda(f.tr, "llm-home", 1, 10, 3*time.Second)
+	eventually(t, 30*time.Second, "home leading a fleet of one, short", func() bool {
+		fs := f.h.get().Status.Fleet
+		return fs != nil && fs.Hub == f.mh.identity && fs.Phase == v1alpha1.PhaseEscalated
+	})
+	time.Sleep(3 * time.Second)
+	if n := intent(f.r); n != 0 {
+		t.Fatalf("an intent on remote before it joined: %d", n)
+	}
+
+	joinFleet(t, home, remote)
+	f.mr = startMember(t, remote, "remote", f.tr.signals(f.r, "llm-remote"), time.Second)
+	f.r.keda(f.tr, "llm-remote", 0, 10, 3*time.Second)
+	eventually(t, 60*time.Second, "the floor on remote once it joined", func() bool { return intent(f.r) == 2 })
+}
+
+// Home runs out of GPUs and has no NodePool: after earlyAfter the missing replicas go on
+// remote's idle static capacity, served to KEDA by remote's scaler, and traffic moves as
+// they become ready until pressure is even. The split then holds: home can't take more.
+func TestFleetEscalationToStaticCapacity(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	f.start(f.spec())
+	f.keda()
+	start := time.Now()
+	eventually(t, 60*time.Second, "an intent on remote", func() bool { return intent(f.r) == 2 })
+	t.Logf("shortage → intent on remote: %v", time.Since(start).Round(100*time.Millisecond))
+	srv := &scaler.Server{Reader: remote.c, Namespace: fleetNS, Cluster: "remote"}
+	ref := &externalscaler.ScaledObjectRef{Namespace: f.r.ns, ScalerMetadata: map[string]string{scaler.MetaPolicy: "llm"}}
+	if n, err := srv.Floor(context.Background(), ref); err != nil || n != 2 {
+		t.Fatalf("remote scaler floor = %d, %v", n, err)
+	}
+	if fs := hubStatus(f.h, f.r); fs.LastDecision == nil || !strings.Contains(fs.LastDecision.Message, "static on remote") {
+		t.Fatalf("fleet status %+v", fs)
+	}
+	f.balanced()
+	time.Sleep(5 * time.Second) // several cooldowns and calmFors
+	if w := f.h.routeWeights("llm"); w["home"] != 50 || w["remote"] != 50 || intent(f.r) != 2 {
+		t.Fatalf("a split that serves well must hold: %v, floor %d", w, intent(f.r))
+	}
+	for _, d := range f.records() {
+		if strings.Contains(d.Action, "release_capacity") {
+			t.Fatalf("released capacity that carries traffic: %s", d.Message)
+		}
+	}
+}
+
+// Demand drops while remote carries half the traffic. Home's KEDA scales in, so the next
+// step back would load home's one replica beyond what it has served safely: the hub
+// first raises home's floor (tier -1) on its idle GPU, then brings the traffic back a
+// step at a time, gives remote's floor back once it carries none, and home's last. The
+// capacity decision's outcome is joined to what followed.
+func TestFleetReturnGrowsHomeFirst(t *testing.T) {
+	saved := core.Horizons // outcome checkpoints, shortened for the test
+	core.Horizons = []time.Duration{2 * time.Second, 20 * time.Second}
+	t.Cleanup(func() { core.Horizons = saved })
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	spec := f.spec()
+	spec.Escalation.ReadyTimeout = seconds(20) // no later than the last checkpoint, which it would extend
+	f.start(spec)
+	f.keda()
+	f.balanced()
+
+	f.tr.demand.Store(15)
+	var tier int32
+	eventually(t, 90*time.Second, "back to Steady", func() bool {
+		if in := f.h.get().Status.Intent; in != nil && in.Tier == core.TierReturn {
+			tier = in.Tier
+		}
+		fs := hubStatus(f.h, f.r)
+		w := f.h.routeWeights("llm")
+		return fs.Phase == v1alpha1.PhaseSteady && intent(f.r) == 0 && intent(f.h) == 0 && w["home"] == 100
+	})
+	if tier != core.TierReturn {
+		t.Error("home's floor was never raised to take the traffic back")
+	}
+	var added []string
+	var actions []string
+	for _, d := range f.records() {
+		actions = append(actions, d.Action+": "+d.Message)
+		if strings.Contains(d.Message, "static on remote") {
+			added = append(added, d.DecisionID)
+		}
+	}
+	if len(added) != 1 {
+		t.Fatalf("capacity added on remote %d times for one shortage: %v", len(added), actions)
+	}
+	// The floor on remote goes before home's return floor.
+	remoteOff := slices.IndexFunc(actions, func(a string) bool { return strings.Contains(a, "-2 on remote") || strings.Contains(a, "on remote,") })
+	homeOff := slices.IndexFunc(actions, func(a string) bool { return strings.HasPrefix(a, "release_capacity") && strings.Contains(a, "on home") })
+	if remoteOff < 0 || homeOff < 0 || homeOff < remoteOff {
+		t.Errorf("home's return floor was not given back last: %v", actions)
+	}
+	var last core.Outcome
+	eventually(t, 30*time.Second, "the final outcome of the capacity decision", func() bool {
+		for _, m := range []*memberProc{f.mh, f.mr} {
+			m.log.Mu.Lock()
+			for _, rec := range m.log.Records {
+				if o, ok := rec.(core.Outcome); ok && o.DecisionID == added[0] && o.Final {
+					last = o
+				}
+			}
+			m.log.Mu.Unlock()
+		}
+		return last.Final
+	})
+	if _, ready := last.ReadyAfterSeconds["remote"]; !ready || last.Clusters["home"].Pressure == nil ||
+		!slices.ContainsFunc(last.FollowedBy, func(s string) bool { return strings.Contains(s, "shift_traffic") }) {
+		t.Fatalf("outcome not joined to what happened: %+v", last)
+	}
+}
+
+// The hub member stops while remote carries borrowed traffic. The other member takes the
+// lease, carries on from the latest status.fleet, and re-issues the floor under its own
+// name: the scaler keeps serving it, and the split holds.
+func TestFleetFailover(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	f.start(f.spec())
+	f.keda()
+	f.balanced()
+	hub, other := f.hub()
+	phase := hubStatus(f.h, f.r).Phase
+	hub.stop()
+	eventually(t, 45*time.Second, "failover", func() bool {
+		s := hubStatus(f.h, f.r)
+		in := f.r.get().Status.Intent
+		return s.Hub == other.identity && in != nil && in.Hub == other.identity && in.Replicas == 2
+	})
+	if s := hubStatus(f.h, f.r); s.Phase != phase && s.Phase != v1alpha1.PhaseRecovering {
+		t.Fatalf("the new hub started over: phase %s, was %s", s.Phase, phase)
+	}
+	srv := &scaler.Server{Reader: remote.c, Namespace: fleetNS, Cluster: "remote"}
+	ref := &externalscaler.ScaledObjectRef{Namespace: f.r.ns, ScalerMetadata: map[string]string{scaler.MetaPolicy: "llm"}}
+	if n, err := srv.Floor(context.Background(), ref); err != nil || n != 2 {
+		t.Fatalf("remote scaler floor after failover = %d, %v", n, err)
+	}
+	if w := f.h.routeWeights("llm"); w["remote"] != 50 {
+		t.Fatalf("traffic moved during failover: %v", w)
+	}
+}
+
+// The scaler serves a floor only while the intent is unexpired, from the hub holding the
+// lease in the scaler's own cluster, in auto mode, and never above the cluster's copy of
+// maxReplicas.
+func TestScalerFencing(t *testing.T) {
+	e := newEnv(t, home)
+	ctx := context.Background()
+	spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"},
+		Clusters: []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 3}}}
+	e.createPolicy(spec)
+	setIntent := func(hub string, expires time.Duration) {
+		t.Helper()
+		p := e.get()
+		p.Status.Intent = &v1alpha1.Intent{Replicas: 5, Hub: hub, Expires: metav1.NewTime(time.Now().Add(expires)), DecisionID: "d"}
+		if err := home.c.Status().Update(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: controller.HubLease, Namespace: fleetNS}}
+	_ = home.c.Delete(ctx, lease) // whatever an earlier test's hub left
+	holder := func(id string, renewed time.Duration) {
+		t.Helper()
+		l := &coordinationv1.Lease{}
+		err := home.c.Get(ctx, client.ObjectKeyFromObject(lease), l)
+		l.ObjectMeta = metav1.ObjectMeta{Name: lease.Name, Namespace: fleetNS, ResourceVersion: l.ResourceVersion}
+		l.Spec = coordinationv1.LeaseSpec{HolderIdentity: ptrTo(id), LeaseDurationSeconds: ptrTo[int32](15), RenewTime: &metav1.MicroTime{Time: time.Now().Add(-renewed)}}
+		if apierrors.IsNotFound(err) {
+			err = home.c.Create(ctx, l)
+		} else if err == nil {
+			err = home.c.Update(ctx, l)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = home.c.Delete(context.Background(), lease) })
+	srv := &scaler.Server{Reader: home.c, Namespace: fleetNS, Cluster: "home"}
+	ref := &externalscaler.ScaledObjectRef{Namespace: e.ns, ScalerMetadata: map[string]string{scaler.MetaPolicy: "llm"}}
+	floor := func() int32 {
+		t.Helper()
+		n, err := srv.Floor(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	holder("hub-a", 0)
+	setIntent("hub-a", time.Minute)
+	if n := floor(); n != 3 {
+		t.Fatalf("floor %d, want 5 cut to this cluster's maxReplicas 3", n)
+	}
+	holder("hub-b", 0)
+	if n := floor(); n != 0 {
+		t.Fatalf("a deposed hub's intent served: %d", n)
+	}
+	holder("hub-a", time.Minute)
+	if n := floor(); n != 0 {
+		t.Fatalf("an intent served under an expired lease: %d", n)
+	}
+	holder("hub-a", 0)
+	setIntent("hub-a", -time.Second)
+	if n := floor(); n != 0 {
+		t.Fatalf("an expired intent served: %d", n)
+	}
+	setIntent("hub-a", time.Minute)
+	p := e.get()
+	p.Spec.Mode = v1alpha1.ModeShadow
+	if err := home.c.Update(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if n := floor(); n != 0 {
+		t.Fatalf("a floor served in shadow mode: %d", n)
+	}
+}
+
+// Remote's KEDA never follows the floor (no ScaledObject there, say). Past readyTimeout
+// the replicas that never reached a node are taken back and remote is skipped.
+func TestFleetReadyTimeoutTakesBack(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	spec := f.spec()
+	spec.Escalation.ReadyTimeout = seconds(5)
+	f.start(spec)
+	f.h.keda(f.tr, "llm-home", 1, 10, 3*time.Second) // none on remote
+	eventually(t, 60*time.Second, "an intent on remote", func() bool { return intent(f.r) == 2 })
+	eventually(t, 30*time.Second, "the floor taken back", func() bool { return intent(f.r) == 0 })
+	var skipped bool
+	for _, c := range hubStatus(f.h, f.r).Clusters {
+		skipped = skipped || (c.Name == "remote" && c.SkippedUntil != nil)
+	}
+	if !skipped || !slices.ContainsFunc(f.records(), func(d core.Record) bool { return strings.Contains(d.Message, "not on a node") }) {
+		t.Fatalf("taken back without skipping remote or saying why: %+v", hubStatus(f.h, f.r).Clusters)
+	}
+}
+
+// Remote's copy of the policy drifts from the hub's (home's) in what its report is computed from:
+// the hub ignores its reports, says so in status.fleet.outOfSync, and keeps the floor it
+// raised there rather than give it back blind. Fixed, the floor goes.
+func TestFleetOutOfSyncHoldsRelease(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	spec := f.spec()
+	spec.Traffic = nil // capacity only: the floor goes as soon as home is calm
+	f.start(spec)
+	f.keda()
+	eventually(t, 60*time.Second, "an intent on remote", func() bool { return intent(f.r) == 2 })
+
+	drift := func(step int32) {
+		t.Helper()
+		p := f.r.get()
+		p.Spec.Capacity.Step = step
+		if err := remote.c.Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drift(1)
+	eventually(t, 30*time.Second, "remote out of sync", func() bool {
+		return slices.Contains(hubStatus(f.h, f.r).OutOfSync, "remote")
+	})
+	f.tr.demand.Store(15) // home is fine on its own now
+	eventually(t, 30*time.Second, "the release held", func() bool {
+		return slices.ContainsFunc(f.records(), func(d core.Record) bool { return slices.Contains(d.Held, "remote") })
+	})
+	if n := intent(f.r); n != 2 {
+		t.Fatalf("floor given back without a usable report: %d", n)
+	}
+	drift(2)
+	eventually(t, 30*time.Second, "the floor given back", func() bool { return intent(f.r) == 0 })
+}
+
+// In shadow mode the hub decides and records, but writes no floor and moves no traffic.
+func TestShadowModeWritesNothing(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	spec := f.spec()
+	spec.Mode = v1alpha1.ModeShadow
+	f.start(spec)
+	f.keda()
+	eventually(t, 60*time.Second, "a decision to add capacity, not applied", func() bool {
+		return slices.ContainsFunc(f.records(), func(d core.Record) bool { return strings.Contains(d.Action, "add_capacity") && !d.Applied })
+	})
+	time.Sleep(5 * time.Second)
+	if n := intent(f.r); n != 0 {
+		t.Fatalf("shadow mode wrote a floor: %d", n)
+	}
+	if w := f.h.routeWeights("llm"); w["remote"] != 0 {
+		t.Fatalf("shadow mode moved traffic: %v", w)
+	}
+	for _, d := range f.records() {
+		if d.Applied {
+			t.Fatalf("a shadow decision applied: %s %s", d.Action, d.Message)
+		}
+	}
+}
+
+// Remote has no idle GPUs, only a NodePool. Home, with none of its own, gets the missing
+// replicas on remote's new nodes: Karpenter launches them for the pending replicas, and
+// traffic follows once they are ready.
+func TestFleetDynamicCapacity(t *testing.T) {
+	f := newFleet(t, 2, 0, 2, 40, 10)
+	pool := fmt.Sprintf("e2e-%d", time.Now().UnixNano()%100000)
+	k := f.r.karpenter(pool, "on-demand", 4, 2, 3*time.Second, 10*time.Second)
+	spec := f.spec()
+	spec.Clusters[1].NodePools = []string{pool}
+	f.start(spec)
+	f.keda()
+	eventually(t, 60*time.Second, "an intent on remote", func() bool { return intent(f.r) == 2 })
+	if !slices.ContainsFunc(f.records(), func(d core.Record) bool { return strings.Contains(d.Message, "dynamic on remote") }) {
+		t.Fatal("capacity on remote not taken as new nodes")
+	}
+	f.balanced()
+	if k.nodes() == 0 {
+		t.Fatal("no node launched")
+	}
+}
+
+// Home has a NodePool that can grow: it gets `after` to launch its own nodes, which
+// resolves the shortage, and remote's idle GPUs are never used.
+func TestFleetOwnNodePoolFirst(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	pool := fmt.Sprintf("e2e-%d", time.Now().UnixNano()%100000)
+	k := f.h.karpenter(pool, "on-demand", 8, 2, 3*time.Second, 10*time.Second)
+	spec := f.spec()
+	spec.Clusters[0].NodePools = []string{pool}
+	f.start(spec)
+	f.keda()
+	eventually(t, 60*time.Second, "home's own nodes", func() bool { return k.nodes() > 0 })
+	eventually(t, 30*time.Second, "home no longer short", func() bool {
+		fs := hubStatus(f.h, f.r)
+		return fs != nil && fs.Phase == v1alpha1.PhaseSteady
+	})
+	time.Sleep(5 * time.Second)
+	if n := intent(f.r); n != 0 {
+		t.Fatalf("borrowed %d on remote while home's own NodePool could grow", n)
+	}
+	if w := f.h.routeWeights("llm"); w["remote"] != 0 {
+		t.Fatalf("traffic moved: %v", w)
+	}
+}
+
+// Home has a NodePool, but its launches keep failing: the hub stops waiting for it and
+// borrows remote's idle GPUs after earlyAfter instead of `after`.
+func TestFleetLaunchFailuresBorrowEarly(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	pool := fmt.Sprintf("e2e-%d", time.Now().UnixNano()%100000)
+	k := f.h.karpenter(pool, "on-demand", 8, 2, time.Second, 10*time.Second)
+	k.failing.Store(true)
+	spec := f.spec()
+	spec.Clusters[0].NodePools = []string{pool}
+	f.start(spec)
+	f.keda()
+	start := time.Now()
+	eventually(t, 45*time.Second, "an intent on remote well before `after` (60s)", func() bool { return intent(f.r) == 2 })
+	t.Logf("borrowed after %v", time.Since(start).Round(time.Second))
+	if k.nodes() != 0 {
+		t.Fatal("a failing NodePool launched nodes")
+	}
+}
+
+// The policy steers a second route, in remote. It is removed once the split has settled
+// and comes back with stale weights: the hub brings it to the settled split though the
+// first route does not move, so no ordinary traffic step can hide a missing pass.
+func TestFleetLateRouteCatchesUp(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	f.r.route("llm-secondary")
+	spec := f.spec()
+	spec.Traffic.Routes = append(spec.Traffic.Routes, v1alpha1.RouteRef{Cluster: "remote", Namespace: f.r.ns, Name: "llm-secondary"})
+	f.start(spec)
+	f.keda()
+	f.balanced()
+	eventually(t, 30*time.Second, "the second route at the split", func() bool {
+		w := f.r.routeWeights("llm-secondary")
+		return w["home"] == 50 && w["remote"] == 50
+	})
+	second := &unstructured.Unstructured{}
+	second.SetGroupVersionKind(adapters.HTTPRouteGVK)
+	second.SetNamespace(f.r.ns)
+	second.SetName("llm-secondary")
+	if err := remote.c.Delete(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "second route removed", func() bool {
+		return apierrors.IsNotFound(remote.c.Get(context.Background(), client.ObjectKeyFromObject(second), second))
+	})
+	f.r.route("llm-secondary")
+	eventually(t, 30*time.Second, "late route caught up with the settled split", func() bool {
+		w := f.r.routeWeights("llm-secondary")
+		return w["home"] == 50 && w["remote"] == 50
+	})
+	if w := f.h.routeWeights("llm"); w["home"] != 50 {
+		t.Fatalf("the first route moved: %v", w)
 	}
 }
