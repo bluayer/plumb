@@ -35,6 +35,7 @@ type simStep struct {
 	phase, action     string
 	homeWeight        int32
 	homeReady, remote int32 // ready replicas
+	homeFloor         int32
 	remoteFloor       int32
 }
 
@@ -105,7 +106,7 @@ func simulate(homeCanGrow func(time.Duration) bool, demand func(time.Duration) f
 		for i, p := range res.Plans {
 			cs[i].Floor, cs[i].Added, cs[i].Tier, cs[i].Static, cs[i].Weight = p.Floor, p.Added, p.Tier, p.Static, p.Weight
 		}
-		out = append(out, simStep{at, res.Phase, res.Action, cs[0].Weight, sides[0].ready, sides[1].ready, cs[1].Floor})
+		out = append(out, simStep{at, res.Phase, res.Action, cs[0].Weight, sides[0].ready, sides[1].ready, cs[0].Floor, cs[1].Floor})
 	}
 	return out
 }
@@ -308,5 +309,70 @@ func TestReturnFloorGoesLast(t *testing.T) {
 	pending.Report.NeededReplicas = 3
 	if shortBy(pending) != 1 {
 		t.Fatalf("a real shortage beyond them hidden: %d", shortBy(pending))
+	}
+}
+
+// risingDemand: 20 for the first 24 minutes, 30 until 40, then 4.
+func risingDemand(at time.Duration) float64 {
+	switch {
+	case at >= 40*time.Minute:
+		return 4
+	case at >= 24*time.Minute:
+		return 30
+	}
+	return 20
+}
+
+// Demand rises further while traffic is borrowed and home can't grow: nothing borrowed is
+// given back or shrinks, traffic only moves off home, and once demand drops everything
+// comes back, borrowed once.
+func TestReturnUnderRisingDemand(t *testing.T) {
+	steps := simulate(never, risingDemand)
+	if at, ok := reborrowed(steps); ok {
+		t.Fatalf("borrowed again at %s after giving back", at)
+	}
+	var floor int32
+	home := int32(100)
+	for _, s := range steps {
+		if s.at < 40*time.Minute {
+			if s.remoteFloor < floor || strings.Contains(s.action, "release_capacity") {
+				t.Fatalf("borrowed capacity went down while demand was high: %+v", s)
+			}
+			if s.at >= 24*time.Minute && s.homeWeight > home {
+				t.Fatalf("traffic moved back home while demand was rising: %+v", s)
+			}
+		}
+		floor, home = max(floor, s.remoteFloor), s.homeWeight
+	}
+	if end := steps[len(steps)-1]; end.remoteFloor != 0 || end.homeWeight != 100 || end.phase != v1alpha1.PhaseSteady {
+		t.Fatalf("did not come back after demand dropped: %+v", end)
+	}
+}
+
+// Demand rises while home is growing for the return: the borrowed floor stays until all
+// traffic is back, home's floor grows with the demand and stays until the borrowed floor
+// is gone, and nothing is borrowed twice.
+func TestReturnPrepareUnderRisingDemand(t *testing.T) {
+	steps := simulate(func(at time.Duration) bool { return at >= 20*time.Minute }, risingDemand)
+	if at, ok := reborrowed(steps); ok {
+		t.Fatalf("borrowed again at %s after giving back", at)
+	}
+	var remoteFloor, homeFloor int32
+	left := false // traffic has left home, so 100% means it came back
+	for _, s := range steps {
+		left = left || s.homeWeight < 100
+		if s.remoteFloor < remoteFloor && s.homeWeight != 100 {
+			t.Fatalf("borrowed floor went before all traffic was back: %+v", s)
+		}
+		if s.homeFloor < homeFloor && s.remoteFloor > 0 {
+			t.Fatalf("home's floor went before the borrowed one: %+v", s)
+		}
+		if left && s.homeWeight == 100 && s.remoteFloor > 0 && float64(s.homeReady)*8 < risingDemand(s.at) {
+			t.Fatalf("all traffic back on too few home replicas: %+v", s)
+		}
+		remoteFloor, homeFloor = s.remoteFloor, s.homeFloor
+	}
+	if end := steps[len(steps)-1]; end.remoteFloor != 0 || end.homeFloor != 0 || end.phase != v1alpha1.PhaseSteady {
+		t.Fatalf("did not settle at home: %+v", end)
 	}
 }
