@@ -364,8 +364,9 @@ type ClusterReport struct {
 	// +optional
 	ShortSince *metav1.Time `json:"shortSince,omitempty"`
 	// SafePressure is the highest pressure this cluster has reported while it was not
-	// short and every signal was read, since SafeSince. The hub moves traffic back to a
-	// cluster only as far as this level: never to a load it has not been seen to serve.
+	// short, had every replica it wanted ready and every signal was read, since
+	// SafeSince. The hub moves traffic back to a cluster only as far as this level: never
+	// to a load it has not been seen to serve.
 	// +optional
 	SafePressure *resource.Quantity `json:"safePressure,omitempty"`
 	// SafeSince is when SafePressure started being tracked; after a day it starts over,

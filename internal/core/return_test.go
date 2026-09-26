@@ -110,3 +110,43 @@ func TestReturnFloorGoesLast(t *testing.T) {
 		t.Fatalf("a real shortage beyond them hidden: %d", shortBy(pending))
 	}
 }
+
+// Ready replicas the receiver's autoscaler is scaling in do not take traffic back.
+func TestReturnCountsKeptReplicas(t *testing.T) {
+	q := func(v string) *resource.Quantity { r := resource.MustParse(v); return &r }
+	home, remote := member("home", 2, 0, 0, 100), member("remote", 2, 0, 0, 0)
+	home.Weight, remote.Weight = 40, 60
+	home.Report.Pressure, home.Report.SafePressure, remote.Report.Pressure = q("4"), q("7"), q("6")
+	cs := []Cluster{home, remote}
+	if _, err := canReturn(cs, cfg, remote, home, 10, time.Time{}); err != nil {
+		t.Fatalf("return to two replicas rejected: %v", err)
+	}
+	cs[0].Report.DesiredReplicas = 1 // one is being scaled in: 10 on the other
+	if _, err := canReturn(cs, cfg, remote, cs[0], 10, time.Time{}); err == nil {
+		t.Fatal("returned traffic counting a replica being scaled in")
+	}
+}
+
+// A return floor whose replicas never reached a node is taken back; the report still
+// counts them pending, but they are not a new shortage, and no traffic goes back to that
+// cluster while it is skipped.
+func TestReturnFloorTakenBack(t *testing.T) {
+	q := func(v string) *resource.Quantity { r := resource.MustParse(v); return &r }
+	conf := cfg
+	conf.ReadyTimeout, conf.CalmFor = 10*time.Minute, 2*time.Minute
+	home, remote := member("home", 2, 0, 0, 100), member("remote", 1, 0, 0, 0)
+	home.Weight, remote.Weight, remote.Floor, remote.Added = 80, 20, 1, 1
+	home.Floor, home.Added, home.Tier, home.WaitingSince = 3, 1, TierReturn, t0.Add(-11*time.Minute)
+	home.Report.DesiredReplicas, home.Report.PendingReplicas, home.Report.NeededReplicas = 3, 1, 1
+	home.Report.ShortSince = &metav1.Time{Time: t0.Add(-11 * time.Minute)}
+	home.Report.Pressure, home.Report.SafePressure, remote.Report.Pressure = q("6"), q("8"), q("3")
+	home.Report.Time, remote.Report.Time = metav1.Time{Time: t0}, metav1.Time{Time: t0}
+	res := Plan(Input{Now: t0, Config: conf, Clusters: []Cluster{home, remote},
+		Phase: v1alpha1.PhaseRecovering, PhaseSince: t0.Add(-time.Hour), LastStep: t0.Add(-time.Hour)})
+	if res.Phase != v1alpha1.PhaseRecovering || res.Plans[0].Floor != 0 {
+		t.Fatalf("taken-back return replicas counted as a shortage: %s %s %+v", res.Phase, res.Message, res.Plans)
+	}
+	if res.Plans[0].Weight != 80 {
+		t.Fatalf("traffic went back to a cluster whose replicas found no node: %+v %s", res.Plans, res.Message)
+	}
+}

@@ -41,6 +41,7 @@ const (
 	simSLO      = 2.0 // latency objective, seconds
 	simLoad     = time.Minute
 	simLaunch   = 2 * time.Minute
+	simScaleIn  = 5 * time.Minute // HPA's default downscale stabilization window
 	simMaxFloor = 20
 )
 
@@ -114,6 +115,7 @@ type simSide struct {
 	since, launchAt       time.Duration // when ready last differed from its target; when a launch started (-1: none)
 	short                 *metav1.Time
 	safe                  *resource.Quantity
+	recs                  []int32 // KEDA's recommendations over the last simScaleIn, one per tick
 }
 
 func simulate(t *testing.T, sc simScenario) *simRun {
@@ -151,13 +153,22 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 	var releasedAt time.Duration = -1
 	var releasedDemand float64
 	maxSinceRelease, minSinceRelease := 0.0, 0.0
+	turned := make([]struct {
+		at     time.Duration
+		dir    int32
+		demand float64
+		ready  string
+	}, len(sc.clusters))
 	for at := time.Duration(0); at < length; at += simTick {
 		now := t0.Add(at)
 		demand := sc.demand(at)
 		for i, s := range sides {
 			c := sc.clusters[i]
 			load := demand * float64(cs[i].Weight) / 100
-			s.want = min(max(cs[i].Floor, int32(math.Ceil(load/simPer)), c.min), c.max)
+			// KEDA: up at once, down to the highest recommendation of the last simScaleIn.
+			s.recs = append(s.recs, min(max(cs[i].Floor, int32(math.Ceil(load/simPer)), c.min), c.max))
+			s.recs = s.recs[max(len(s.recs)-int(simScaleIn/simTick), 0):]
+			s.want = slices.Max(s.recs)
 			// Nodes: existing ones, plus launched ones while wanted (consolidated after a minute).
 			room := c.pool(at) - s.launched
 			launching := s.launchAt >= 0
@@ -172,9 +183,9 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 				s.launched = max(s.want-c.nodes, 0)
 			}
 			target := min(s.want, c.nodes+s.launched)
-			switch {
-			case target == s.ready:
-				s.since = -1
+			switch { // replicas load for simLoad; scaled-in ones are gone at once
+			case target <= s.ready:
+				s.ready, s.since = target, -1
 			case s.since < 0:
 				s.since = at
 			case at-s.since >= simLoad:
@@ -197,7 +208,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			} else if s.short == nil {
 				s.short = &metav1.Time{Time: now}
 			}
-			if pressure != nil && need == 0 && (s.safe == nil || pressure.Cmp(*s.safe) > 0) {
+			if pressure != nil && need == 0 && s.ready >= s.want && (s.safe == nil || pressure.Cmp(*s.safe) > 0) {
 				s.safe = pressure
 			}
 			cs[i].Report = &v1alpha1.ClusterReport{Time: metav1.Time{Time: now}, DesiredReplicas: s.want, ReadyReplicas: s.ready,
@@ -216,6 +227,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			st.want = append(st.want, sides[i].want)
 			st.launched = append(st.launched, sides[i].launched)
 		}
+		run.steps = append(run.steps, st)
 		if err := invariants(conf, in, res, phase); err != nil {
 			t.Fatalf("%s at %s: %v\n%s", sc.name, at, err, run.trace(10))
 		}
@@ -224,6 +236,19 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 		if strings.Contains(res.Action, "add_capacity") && releasedAt >= 0 && maxSinceRelease <= releasedDemand && minSinceRelease >= releasedDemand &&
 			!strings.Contains(res.Message, "to take traffic back") {
 			t.Fatalf("%s at %s: borrowed again after giving back at %s, demand not higher since\n%s", sc.name, at, releasedAt, run.trace(20))
+		}
+		// A share that turns around within a minute of its last move, with demand and
+		// every cluster's ready replicas unchanged, bounces between clusters out of room.
+		ready := fmt.Sprint(st.ready)
+		for i, p := range res.Plans {
+			d := p.Weight - in.Clusters[i].Weight
+			if d == 0 {
+				continue
+			}
+			if turned[i].dir != 0 && (d > 0) != (turned[i].dir > 0) && at-turned[i].at <= time.Minute && demand == turned[i].demand && ready == turned[i].ready {
+				t.Fatalf("%s at %s: %s's share turned around %s after its last move\n%s", sc.name, at, sc.clusters[i].name, at-turned[i].at, run.trace(10))
+			}
+			turned[i].at, turned[i].dir, turned[i].demand, turned[i].ready = at, d, demand, ready
 		}
 		if released(in, res) {
 			releasedAt, releasedDemand, maxSinceRelease, minSinceRelease = at, demand, demand, demand
@@ -234,7 +259,6 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			cs[i].Floor, cs[i].Added, cs[i].Tier, cs[i].Static, cs[i].Weight = p.Floor, p.Added, p.Tier, p.Static, p.Weight
 			cs[i].WaitingSince, cs[i].SkippedUntil = timeOf(p.WaitingSince), timeOf(p.SkippedUntil)
 		}
-		run.steps = append(run.steps, st)
 	}
 	return run
 }
@@ -461,6 +485,17 @@ var simScenarios = []simScenario{
 		},
 	},
 	{
+		// Home has idle GPUs but no NodePool, and grows on them by itself: while the new
+		// replicas load, nothing is borrowed.
+		name: "home grows on its own nodes", demand: steps(8, 10*time.Minute, 24.0),
+		clusters: []simCluster{{name: "home", weight: 100, nodes: 4, min: 1, initReplica: 1}, {name: "remote", nodes: 5}},
+		check: func(t *testing.T, r *simRun) {
+			if at := r.firstAfter(0, func(s simState) bool { return s.floor[r.idx("remote")] > 0 }); at >= 0 {
+				t.Errorf("borrowed at %s while home's own replicas loaded\n%s", at, r.trace(5))
+			}
+		},
+	},
+	{
 		// Home's launches keep failing in region r1: new nodes come from r2 first, though
 		// remote-a in r1 has as much NodePool headroom. remote-a comes after, not never.
 		name: "region with launch failures", demand: flat(20),
@@ -522,27 +557,31 @@ func TestSimulations(t *testing.T) {
 // Random fleets and demand, seeded: only the invariants and the flap check, over many
 // shapes nobody wrote down.
 func TestSimulationsRandom(t *testing.T) {
-	for seed := range uint64(40) {
-		rng := rand.New(rand.NewPCG(seed, 7))
-		var clusters []simCluster
-		for i := range 2 + rng.IntN(2) {
-			c := simCluster{name: fmt.Sprintf("c%d", i), nodes: int32(rng.IntN(4)), region: fmt.Sprintf("r%d", rng.IntN(2))}
-			if i == 0 {
-				c.weight, c.min, c.initReplica, c.nodes = 100, 1, 1, max(c.nodes, 1)
-			}
-			if rng.IntN(2) == 0 {
-				c.pool = from(time.Duration(rng.IntN(60))*time.Minute, int32(rng.IntN(6)))
-			}
-			if rng.IntN(4) == 0 {
-				c.ice = from(time.Duration(rng.IntN(60))*time.Minute, RecurringICE)
-			}
-			clusters = append(clusters, c)
-		}
-		var changes []any
-		for m := 5; m < 90; m += 5 + rng.IntN(15) {
-			changes = append(changes, time.Duration(m)*time.Minute, float64(2+rng.IntN(35)))
-		}
-		sc := simScenario{name: fmt.Sprintf("seed %d", seed), clusters: clusters, demand: steps(float64(2+rng.IntN(20)), changes...), length: 2 * time.Hour}
+	for seed := range uint64(500) {
+		sc := randomScenario(seed)
 		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
 	}
+}
+
+func randomScenario(seed uint64) simScenario {
+	rng := rand.New(rand.NewPCG(seed, 7))
+	var clusters []simCluster
+	for i := range 2 + rng.IntN(2) {
+		c := simCluster{name: fmt.Sprintf("c%d", i), nodes: int32(rng.IntN(4)), region: fmt.Sprintf("r%d", rng.IntN(2))}
+		if i == 0 {
+			c.weight, c.min, c.initReplica, c.nodes = 100, 1, 1, max(c.nodes, 1)
+		}
+		if rng.IntN(2) == 0 {
+			c.pool = from(time.Duration(rng.IntN(60))*time.Minute, int32(rng.IntN(6)))
+		}
+		if rng.IntN(4) == 0 {
+			c.ice = from(time.Duration(rng.IntN(60))*time.Minute, RecurringICE)
+		}
+		clusters = append(clusters, c)
+	}
+	var changes []any
+	for m := 5; m < 90; m += 5 + rng.IntN(15) {
+		changes = append(changes, time.Duration(m)*time.Minute, float64(2+rng.IntN(35)))
+	}
+	return simScenario{name: fmt.Sprintf("seed %d", seed), clusters: clusters, demand: steps(float64(2+rng.IntN(20)), changes...), length: 2 * time.Hour}
 }
