@@ -37,6 +37,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -153,20 +154,78 @@ func (e *env) keda(tr *traffic, backend string, minR, maxR int32, down time.Dura
 			return fmt.Errorf("keda %s: load: %w", e.cl.name, err)
 		}
 		now := time.Now()
-		recs = append(recs, rec{now, min(max(floor, int32(math.Ceil(load/tr.perReplica)), minR), maxR)})
+		cur := rec{now, min(max(floor, int32(math.Ceil(load/tr.perReplica)), minR), maxR)}
+		recs = append(recs, cur)
 		recs = slices.DeleteFunc(recs, func(r rec) bool { return now.Sub(r.at) > down })
 		want := slices.MaxFunc(recs, func(a, b rec) int { return int(a.n - b.n) }).n
 		d := &appsv1.Deployment{}
 		if err := e.cl.c.Get(ctx, client.ObjectKey{Namespace: e.ns, Name: "llm"}, d); err != nil {
 			return fmt.Errorf("keda %s: %w", e.cl.name, err)
 		}
-		if *d.Spec.Replicas == want {
-			return nil
+		if *d.Spec.Replicas != want {
+			patch := client.MergeFrom(d.DeepCopy())
+			d.Spec.Replicas = ptr.To(want)
+			if err := e.cl.c.Patch(ctx, d, patch); err != nil {
+				return fmt.Errorf("keda %s: %w", e.cl.name, err)
+			}
 		}
-		patch := client.MergeFrom(d.DeepCopy())
-		d.Spec.Replicas = ptr.To(want)
-		return e.cl.c.Patch(ctx, d, patch)
+		if e.hpa {
+			return e.hpaStatus(ctx, want, want > cur.n)
+		}
+		return nil
 	})
+}
+
+// autoscaler creates the HPA KEDA makes for the "llm" workload in e, whose status keda
+// then writes as the HPA controller would. A real HPA controller in the cluster would
+// write it too (it can't read KEDA's metric): the test is skipped then. hack/e2e.sh turns
+// it off with PROVIDER=kwok.
+func (e *env) autoscaler() {
+	e.t.Helper()
+	ctx := context.Background()
+	h := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: e.ns, Name: "keda-hpa-llm"},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MaxReplicas: 10,
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "llm"},
+			Metrics: []autoscalingv2.MetricSpec{{Type: autoscalingv2.ExternalMetricSourceType, External: &autoscalingv2.ExternalMetricSource{
+				Metric: autoscalingv2.MetricIdentifier{Name: "s0-plumb"},
+				Target: autoscalingv2.MetricTarget{Type: autoscalingv2.AverageValueMetricType, AverageValue: ptr.To(resource.MustParse("1"))}}}}}}
+	if err := e.cl.c.Create(ctx, h); err != nil {
+		e.t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	if err := e.cl.c.Get(ctx, client.ObjectKeyFromObject(h), h); err != nil {
+		e.t.Fatal(err)
+	}
+	if len(h.Status.Conditions) > 0 {
+		e.t.Skipf("an HPA controller runs in %s (PROVIDER=kwok turns it off)", e.cl.name)
+	}
+	e.hpa = true
+}
+
+// hpaStatus is what the HPA controller writes after a sync that read its metrics:
+// desired replicas, and whether its scale-down window holds replicas above what the
+// metrics ask for now.
+func (e *env) hpaStatus(ctx context.Context, desired int32, held bool) error {
+	h := &autoscalingv2.HorizontalPodAutoscaler{}
+	if err := e.cl.c.Get(ctx, client.ObjectKey{Namespace: e.ns, Name: "keda-hpa-llm"}, h); err != nil {
+		return fmt.Errorf("hpa %s: %w", e.cl.name, err)
+	}
+	reason := "ReadyForNewScale"
+	if held {
+		reason = adapters.ScaleDownStabilized
+	}
+	conds := []autoscalingv2.HorizontalPodAutoscalerCondition{
+		{Type: autoscalingv2.AbleToScale, Status: corev1.ConditionTrue, Reason: reason, LastTransitionTime: metav1.Now()},
+		{Type: autoscalingv2.ScalingActive, Status: corev1.ConditionTrue, Reason: "ValidMetricFound", LastTransitionTime: metav1.Now()},
+	}
+	if h.Status.DesiredReplicas == desired && len(h.Status.Conditions) == 2 && h.Status.Conditions[0].Reason == reason {
+		return nil
+	}
+	h.Status.DesiredReplicas, h.Status.Conditions = desired, conds
+	if err := e.cl.c.Status().Update(ctx, h); err != nil {
+		return fmt.Errorf("hpa %s: %w", e.cl.name, err)
+	}
+	return nil
 }
 
 // fakeKarpenter plays Karpenter for one NodePool of e's scenario: for this scenario's pods

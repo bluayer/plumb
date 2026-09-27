@@ -67,6 +67,9 @@ type simScenario struct {
 	// conf adjusts the limits; decide replaces Plan (demand is every step's so far).
 	conf   func(*Config)
 	decide func(in Input, demand []float64) Result
+	// held: members do not count pending replicas while their HPA holds replicas the
+	// metrics no longer ask for (AbleToScale ScaleDownStabilized).
+	held bool
 }
 
 // simState is one step, after the hub decided.
@@ -221,7 +224,11 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			if lat > simSLO {
 				slow += load
 			}
-			need := Needed(s.want, pending, -1, lat > simSLO, conf.Step)
+			counted := pending
+			if sc.held && s.recs[len(s.recs)-1] < s.want {
+				counted = 0
+			}
+			need := Needed(s.want, counted, -1, lat > simSLO, conf.Step)
 			if need == 0 {
 				s.short = nil
 			} else if s.short == nil {
@@ -591,6 +598,9 @@ func TestSimulations(t *testing.T) {
 			run := simulate(t, sc)
 			sc.check(t, run)
 		})
+		// The same, with members that leave out the pending replicas their HPA holds.
+		sc.held, sc.name = true, sc.name+" held"
+		t.Run(sc.name, func(t *testing.T) { sc.check(t, simulate(t, sc)) })
 	}
 }
 
@@ -599,6 +609,10 @@ func TestSimulations(t *testing.T) {
 func TestSimulationsRandom(t *testing.T) {
 	for seed := range uint64(500) {
 		sc := randomScenario(seed)
+		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
+		// Members that leave out the pending replicas their HPA holds.
+		sc = randomScenario(seed)
+		sc.name, sc.held = sc.name+" held", true
 		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
 		// The same fleet on the adaptive path with a burst budget and a scripted planner.
 		sc = randomScenario(seed)

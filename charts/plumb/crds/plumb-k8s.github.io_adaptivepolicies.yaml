@@ -888,6 +888,12 @@ spec:
                     - type: string
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  scaleDownHeld:
+                    description: |-
+                      ScaleDownHeld: the workload's HPA holds replicas its metrics no longer ask for (its
+                      scale-down stabilization window). Its pending replicas are about to go and are not
+                      counted in NeededReplicas.
+                    type: boolean
                   shortSince:
                     description: ShortSince is when NeededReplicas became positive.
                     format: date-time

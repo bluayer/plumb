@@ -36,7 +36,7 @@ A behavior change to planning belongs in a scenario (`simScenarios`) as well as 
 
 ## End-to-end tests
 
-The e2e suite runs Plumb in-process against three real, disposable clusters ("home", "remote", "third"; most tests use the first two) with the real kube-scheduler. GPU nodes are [KWOK](https://kwok.sigs.k8s.io) fake nodes, so no GPUs or cloud accounts are needed. What runs around Plumb in a real cluster is played by loops in the test process (`test/e2e/harness_test.go`): traffic split by the HTTPRoute's weights, answered to each member as pressure and latency like Prometheus would; KEDA, scaling to the larger of Plumb's floor (read through its external scaler) and the load; and Karpenter, launching KWOK nodes for unschedulable pods within a NodePool's limits, keeping `status.resources`, consolidating empty nodes, or failing launches the way it reports insufficient capacity.
+The e2e suite runs Plumb in-process against three real, disposable clusters ("home", "remote", "third"; most tests use the first two) with the real kube-scheduler. GPU nodes are [KWOK](https://kwok.sigs.k8s.io) fake nodes, so no GPUs or cloud accounts are needed. What runs around Plumb in a real cluster is played by loops in the test process (`test/e2e/harness_test.go`): traffic split by the HTTPRoute's weights, answered to each member as pressure and latency like Prometheus would; KEDA, scaling to the larger of Plumb's floor (read through its external scaler) and the load, and, where a test creates its HPA, writing the HPA status; and Karpenter, launching KWOK nodes for unschedulable pods within a NodePool's limits, keeping `status.resources`, consolidating empty nodes, or failing launches the way it reports insufficient capacity.
 
 ```sh
 make e2e-up       # PROVIDER=kind (default) | minikube | kwok; creates clusters "home", "remote" and "third"
@@ -64,6 +64,7 @@ make e2e-down
 | `TestFleetThreeWayTrafficStep` | In a three-member fleet, the first traffic step moves at most `stepPercent` away from home and the backend weights sum to 100 |
 | `TestFleetFailover` | The hub stops mid-escalation: the other member takes the lease, carries on from `status.fleet`, re-issues the floor under its name, and the split holds |
 | `TestScalerFencing` | The scaler serves a floor only from the lease holder, unexpired, in `auto` mode, cut to the cluster's `maxReplicas`, against a real Lease |
+| `TestFleetHeldReplicasAreNotShort` | Traffic leaves a member whose replicas wait for a node; while its HPA holds them for its scale-down window (the harness writes the HPA status, so it needs `PROVIDER=kwok`, which turns the HPA controller off), they are not its shortage, and the hub neither adds capacity nor moves more traffic for them |
 | `TestFleetReadyTimeoutTakesBack` | Floor replicas that never reach a node (no KEDA on the member) are taken back after `readyTimeout` and the member is skipped |
 | `TestFleetOutOfSyncHoldsRelease` | A member whose copy of the policy drifts is listed in `status.fleet.outOfSync` and its floor is kept, not given back blind; fixed, the floor goes |
 | `TestShadowModeWritesNothing` | In `shadow` mode decisions are recorded but no floor is written and no traffic moves |

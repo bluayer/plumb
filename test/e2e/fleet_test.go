@@ -795,6 +795,34 @@ func TestFleetReadyTimeoutTakesBack(t *testing.T) {
 	}
 }
 
+// Home has room for one replica and demand for four: three wait for a node, and the hub
+// borrows remote's GPUs and moves traffic there. As home's load falls, its HPA keeps the
+// replicas it no longer needs for its scale-down window. Home says so, and they are not
+// its shortage: once it serves its share within the objective, the hub neither adds
+// capacity nor moves more traffic away for replicas that are about to go.
+func TestFleetHeldReplicasAreNotShort(t *testing.T) {
+	f := newFleet(t, 1, 4, 1, 40, 10)
+	f.h.autoscaler()
+	f.start(f.spec())
+	f.h.keda(f.tr, "llm-home", 1, 10, 45*time.Second)
+	f.r.keda(f.tr, "llm-remote", 0, 10, 3*time.Second)
+	eventually(t, 60*time.Second, "home's held replicas left out of its shortage", func() bool {
+		r := f.h.get().Status.Report
+		return r != nil && r.ScaleDownHeld && r.PendingReplicas > 0 && r.NeededReplicas == 0
+	})
+	adds := func() int {
+		return len(slices.DeleteFunc(f.records(), func(d core.Record) bool { return !strings.Contains(d.Action, "add_capacity") }))
+	}
+	before, share := adds(), f.h.routeWeights("llm")["home"]
+	time.Sleep(10 * time.Second) // within home's window
+	if r := f.h.get().Status.Report; !r.ScaleDownHeld || r.PendingReplicas == 0 {
+		t.Fatalf("home's window ended early: %+v", r)
+	}
+	if n, w := adds(), f.h.routeWeights("llm")["home"]; n != before || w < share {
+		t.Fatalf("the hub acted on replicas about to go: %d more capacity decisions, home %d→%d%%", n-before, share, w)
+	}
+}
+
 // Remote's copy of the policy drifts from the hub's (home's) in what its report is computed from:
 // the hub ignores its reports, says so in status.fleet.outOfSync, and keeps the floor it
 // raised there rather than give it back blind. Fixed, the floor goes.
@@ -868,9 +896,10 @@ func TestFleetDynamicCapacity(t *testing.T) {
 	f.start(spec)
 	f.keda()
 	eventually(t, 60*time.Second, "an intent on remote", func() bool { return intent(f.r) == 2 })
-	if !slices.ContainsFunc(f.records(), func(d core.Record) bool { return strings.Contains(d.Message, "dynamic on remote") }) {
-		t.Fatal("capacity on remote not taken as new nodes")
-	}
+	// The hub logs a decision after writing it.
+	eventually(t, 5*time.Second, "capacity on remote taken as new nodes", func() bool {
+		return slices.ContainsFunc(f.records(), func(d core.Record) bool { return strings.Contains(d.Message, "dynamic on remote") })
+	})
 	f.balanced()
 	if k.nodes() == 0 {
 		t.Fatal("no node launched")

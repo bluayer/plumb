@@ -25,6 +25,8 @@
 #
 # The real kube-scheduler places pods in every mode; KWOK only simulates the kubelet
 # of nodes annotated kwok.x-k8s.io/node=fake. Kubeconfigs land in .e2e/.
+# With PROVIDER=kwok the HPA controller is off: the tests write HPA status themselves
+# (tests that need it are skipped on the other providers).
 # REMOTE=0 skips the second cluster (multi-region tests are then skipped).
 # THIRD=0 skips the third cluster (three-way traffic tests are then skipped).
 set -euo pipefail
@@ -98,7 +100,9 @@ for n in "${names[@]}"; do
     kwok)
       read -ra extra <<<"${KWOKCTL_ARGS:-}" # e.g. "--etcd-binary /path/etcd"
       kwokctl get clusters 2>/dev/null | grep -qx "$cluster" ||
-        kwokctl create cluster --name "$cluster" --runtime "${KWOK_RUNTIME:-binary}" ${extra[@]+"${extra[@]}"} --wait 120s
+        kwokctl create cluster --name "$cluster" --runtime "${KWOK_RUNTIME:-binary}" \
+          --extra-args "kube-controller-manager=controllers=*,-horizontal-pod-autoscaler-controller" \
+          ${extra[@]+"${extra[@]}"} --wait 120s
       kwokctl get kubeconfig --name "$cluster" >"$kc"
       ;;
     *)

@@ -379,6 +379,11 @@ type ClusterReport struct {
 	DesiredReplicas int32  `json:"desiredReplicas"`
 	ReadyReplicas   int32  `json:"readyReplicas"`
 	PendingReplicas int32  `json:"pendingReplicas"`
+	// ScaleDownHeld: the workload's HPA holds replicas its metrics no longer ask for (its
+	// scale-down stabilization window). Its pending replicas are about to go and are not
+	// counted in NeededReplicas.
+	// +optional
+	ScaleDownHeld bool `json:"scaleDownHeld,omitempty"`
 	// StaticRoom is how many more replicas fit on existing nodes.
 	StaticRoom int32 `json:"staticRoom"`
 	// DynamicRoom is how many more replicas the NodePools may add, unless DynamicUnbounded.

@@ -9,6 +9,7 @@
 | `adaptivepolicies` | get, list, watch | Read policies |
 | `adaptivepolicies/status` | get, update, patch | Reports, intents, fleet status |
 | `deployments`, `pods`, `nodes` | get, list, watch | Replicas and the placement simulation |
+| `horizontalpodautoscalers` | get, list, watch | Whether the workload's HPA holds replicas for its scale-down window |
 | `events` (core) | get, list, watch | Karpenter launch-failure events |
 | `events` (`events.k8s.io`) | create, patch | Decision Events |
 | `nodepools` (`karpenter.sh`) | get, list, watch | Dynamic room (limits minus usage) |
