@@ -39,7 +39,7 @@ Plumb makes that call. It respects the capacity each cluster already has and the
 1. It notices, from unschedulable replicas or **Prometheus** demand and saturation, and from the cluster's node provisioning running out of room or failing to launch nodes.
 2. It places the missing replicas in other clusters, **existing nodes before new ones**.
 3. It shifts **Gateway API** traffic as that capacity becomes ready.
-4. It gives everything back once the fleet is calm.
+4. It brings traffic back slowly, only as far as the home cluster has served safely, and gives capacity back once no traffic depends on it.
 
 Plumb never creates or deletes nodes or pods, and never edits the provisioner's configuration (NodePools). It adjusts only two things your controllers already read:
 
@@ -65,7 +65,7 @@ flowchart LR
 ```
 
 - **Every cluster reports.** Each member runs `plumb agent`, which writes what its cluster has and needs (replicas, room on existing nodes and in NodePools, launch failures, Prometheus signals) to its own copy of the `AdaptivePolicy`.
-- **One cluster decides.** A majority of members elect one agent as hub. It reads every report and, only when a cluster stays short, raises replica floors elsewhere and shifts route weights, within the limits the policy sets. Later it gives everything back in reverse order.
+- **One cluster decides.** A majority of members elect one agent as hub. It reads every report and, only when a cluster stays short, raises replica floors elsewhere and shifts route weights, within the limits the policy sets. Later it returns traffic a step at a time and gives capacity back in reverse order.
 - **Nothing is hidden.** Every decision is in the hub's `status.fleet`, an Event and a JSONL decision log, with what followed at 1, 5 and 15 minutes.
 - **Losing it is harmless.** Floors expire after 5 minutes and are fenced to the current hub, so without a hub every cluster runs as if Plumb were not installed.
 
@@ -74,7 +74,7 @@ Read the [architecture](docs/architecture.md), starting with [a shortage, start 
 ## Features
 
 - **Own cluster first, then the fleet, in the order you choose.**
-  - `LocalFirst` (the default): a short cluster uses its own existing nodes, then its own NodePools; only when those cannot add nodes (limits reached, launches failing) or after `after` does it borrow other clusters' idle nodes, then their NodePools.
+  - `LocalFirst` (the default): a short cluster uses its own existing nodes, then its own NodePools; only when those cannot add nodes (none registered, limits reached, launches failing; replicas already loading on its own nodes get `after`) or after `after` does it borrow other clusters' idle nodes, then their NodePools.
   - `StaticFirst`: idle existing nodes anywhere in the fleet before any cluster launches new ones.
   - When a cluster keeps failing to launch nodes, the other clusters in its region (they compete for the same cloud capacity) go last for new nodes.
   - Only the NodePools and nodes you register per cluster are Plumb's; the rest of the cluster is left alone.
@@ -88,8 +88,8 @@ Read the [architecture](docs/architecture.md), starting with [a shortage, start 
   - **Gateway API** weights
   - a **KEDA** external scaler
   - standard Conditions, Events and Prometheus metrics
-- **Metrics and SLOs in, knobs out.** Pressure (e.g. queued requests or KV-cache usage per replica), latency and error-rate SLOs from Prometheus decide where traffic goes: shares move from busier clusters to less busy ones, and never toward a cluster over its SLO. Plumb only turns knobs (replica floors, cluster weights); per-request routing stays with your gateway and the Gateway API Inference Extension.
-- **You set the limits, Plumb computes within them.** Step sizes, weight bounds, replica capacity and timing come from the policy, and deterministic rules decide where capacity goes. *Experimental:* a fast typed-decision model (TypeSafe **Jev**, served by TypeSafe, Cloudflare Workers AI, Vercel AI Gateway or any `/v1/systemone` server) can be asked to rank candidate clusters within a placement tier. It is off by default, and when enabled it starts in shadow: its pick is logged next to the rules' decision until you choose to apply it. A further experimental path lets a workload state its operating intent and metrics in plain words: a planner model (Amazon Bedrock first, other hosts as plugins) proposes plans, Plumb validates them against the limits, and Jev picks one.
+- **Metrics and SLOs in, knobs out.** Pressure (e.g. queued requests or KV-cache usage per replica), latency and error-rate SLOs from Prometheus decide where traffic goes: shares move from busier clusters to less busy ones, and never toward a cluster over its SLO. Traffic that is served well stays where it is; moving it back is slow and bounded by what the home cluster has served safely, and it never bounces between clusters that are both out of room. Plumb only turns knobs (replica floors, cluster weights); per-request routing stays with your gateway and the Gateway API Inference Extension.
+- **You set the limits, Plumb computes within them.** Step sizes, weight bounds, replica capacity and timing come from the policy, and deterministic rules decide where capacity goes. *Experimental:* a fast typed-decision model (TypeSafe **Jev**, served by TypeSafe, Cloudflare Workers AI, Vercel AI Gateway or any `/v1/systemone` server) can be asked to rank candidate clusters within a placement tier. It is off by default, and when enabled it starts in shadow: its pick is logged next to the rules' decision until you choose to apply it. A further experimental path lets a workload state its operating intent and metrics in plain words: a planner model (Amazon Bedrock or any OpenAI-compatible Chat Completions endpoint; other hosts as plugins) proposes plans, Plumb validates them against the limits, and Jev picks one.
 - **Safe by construction.**
   - Shadow mode is the default.
   - Floors expire and are fenced to the current hub.
@@ -128,7 +128,7 @@ The [installation guide](docs/installation.md) walks through these steps. Polici
 | Prometheus | HTTP API `/api/v1/query` | — |
 | Cloud | Any cluster with Karpenter v1; AWS's launch errors and node labels are known, other clouds' can be added ([how](CONTRIBUTING.md#karpenter-cloud-providers)). Clusters without Karpenter lend static capacity | — |
 
-The e2e suite runs against real API servers and the real kube-scheduler, with Karpenter, Gateway API and ClusterProfile CRDs installed but not their controllers.
+The e2e suite runs against three real API servers and the real kube-scheduler; KEDA, Karpenter and traffic are played by the test harness. Fleet simulations check the planner against invariants over hours of simulated time.
 
 ## Project status
 
