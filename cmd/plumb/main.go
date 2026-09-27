@@ -182,7 +182,7 @@ func runAgent(ctx context.Context, args []string) error {
 	providers := fs.String("clusterprofile-provider-file", "", "ClusterProfile access providers (KEP-5339); empty: a fleet of one")
 	promURL := fs.String("prometheus-url", "", "this cluster's Prometheus, for spec.signals; empty: no metric signals")
 	modelProvider := fs.String("model-provider", "", "experimental: host serving a model that ranks clusters ("+strings.Join(core.Providers(), ", ")+`); "" for rules only`)
-	modelMode := fs.String("model-mode", "shadow", "experimental: shadow records the model's pick in the decision log while the rules decide; apply carries it out")
+	modelMode := fs.String("model-mode", "shadow", "experimental: shadow only records what a model picks (the ranking, and every policy's adaptive pick); apply carries out the ranking, and the adaptive pick of policies with spec.experimental.adaptive.mode=apply")
 	modelURL := fs.String("model-url", "", "model endpoint; empty: the provider's default")
 	modelName := fs.String("model", "", "model name; empty: the provider's default")
 	modelTimeout := fs.Duration("model-timeout", time.Second, "per-call model timeout; the rules decide on expiry")
@@ -193,7 +193,6 @@ func runAgent(ctx context.Context, args []string) error {
 	plannerResponseFormat := fs.String("planner-response-format", "", "OpenAI-compatible planner response format: text (default) or json_schema")
 	plannerInterval := fs.Duration("planner-interval", 2*time.Minute, "at most one planner call per policy per interval, only while a member is short or the fleet is not Steady")
 	plannerTimeout := fs.Duration("planner-timeout", time.Minute, "per-call planner timeout; the call runs in the background")
-	plannerOnly := fs.Bool("planner-only", false, "experimental: the planner proposes one plan, carried out once validated (subject to --model-mode), without Jev")
 	interval := fs.Duration("interval", 30*time.Second, "member report interval")
 	hubInterval := fs.Duration("hub-interval", 10*time.Second, "hub planning interval")
 	logPath := fs.String("decision-log", "-", "decision log JSONL path, - for stdout")
@@ -220,13 +219,8 @@ func runAgent(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	switch {
-	case *plannerOnly && planner == nil:
-		return fmt.Errorf("--planner-only needs --planner-provider")
-	case *plannerOnly:
-		ctrl.Log.Info("adaptive path: planner only, without Jev", "mode", *modelMode)
-	case (planner != nil) != (ranker != nil):
-		ctrl.Log.Info("spec.experimental.adaptive needs both --planner-provider and --model-provider (or --planner-only); its policies follow the rules")
+	if planner != nil && ranker == nil {
+		ctrl.Log.Info("no --model-provider: policies with spec.experimental.adaptive.chooser=jev follow the rules; chooser=planner works without it")
 	}
 	host, _ := os.Hostname()
 	identity := *name + "/" + host
@@ -264,7 +258,7 @@ func runAgent(ctx context.Context, args []string) error {
 	}
 	if _, err := controller.Setup(mgr, controller.Options{Name: *name, Namespace: *ns, Identity: identity, Adapters: karpenter.New(mgr),
 		Access: acc, Prometheus: prom, Model: ranker, ModelShadow: *modelMode == "shadow", Log: decisions,
-		Planner: planner, PlannerInterval: *plannerInterval, PlannerTimeout: *plannerTimeout, PlannerOnly: *plannerOnly, Interval: *interval, HubInterval: *hubInterval,
+		Planner: planner, PlannerInterval: *plannerInterval, PlannerTimeout: *plannerTimeout, Interval: *interval, HubInterval: *hubInterval,
 		NewCluster: func(rc *rest.Config) (cluster.Cluster, error) {
 			rc.Timeout = 15 * time.Second // one unreachable member must not hang the hub
 			return cluster.New(rc, karpenter.PeerClusterOptions(scheme))

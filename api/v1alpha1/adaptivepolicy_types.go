@@ -212,7 +212,29 @@ type Adaptive struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1000
 	Intent string `json:"intent"`
+	// Mode: shadow records the adaptive pick in the decision log while the rules decide;
+	// apply carries it out, where the agents allow it (--model-mode=apply). Each policy
+	// starts in shadow.
+	// +kubebuilder:validation:Enum=shadow;apply
+	// +kubebuilder:default=shadow
+	// +optional
+	Mode string `json:"mode,omitempty"`
+	// Chooser: jev picks among the planner's plans, the rules' plan and one-step changes
+	// (needs --model-provider); planner has the planner propose one plan, carried out once
+	// validated, without Jev.
+	// +kubebuilder:validation:Enum=jev;planner
+	// +kubebuilder:default=jev
+	// +optional
+	Chooser string `json:"chooser,omitempty"`
 }
+
+// Adaptive modes and choosers.
+const (
+	AdaptiveShadow = "shadow"
+	AdaptiveApply  = "apply"
+	ChooserJev     = "jev"
+	ChooserPlanner = "planner"
+)
 
 // CapacityPolicy says how much the hub may change at a time. The hub computes the rest.
 type CapacityPolicy struct {

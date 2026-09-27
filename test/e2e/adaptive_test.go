@@ -101,7 +101,7 @@ func TestAdaptivePlannerAndJev(t *testing.T) {
 		Clusters:     []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 10, NodeSelector: kwokNodes}, {Name: "remote", MaxReplicas: 10, NodeSelector: kwokNodes}},
 		Capacity:     v1alpha1.CapacityPolicy{Step: 2},
 		Escalation:   v1alpha1.EscalationPolicy{After: sec(60), EarlyAfter: sec(2), CalmFor: sec(60), Cooldown: sec(1)},
-		Experimental: &v1alpha1.Experimental{Adaptive: &v1alpha1.Adaptive{Intent: "Use idle GPUs anywhere, one replica at a time."}}}
+		Experimental: &v1alpha1.Experimental{Adaptive: &v1alpha1.Adaptive{Intent: "Use idle GPUs anywhere, one replica at a time.", Mode: v1alpha1.AdaptiveApply}}}
 	h.createPolicy(spec)
 	r.createPolicy(spec)
 

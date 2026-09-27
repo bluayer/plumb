@@ -25,9 +25,9 @@ Yes. Without other members it is a fleet of one: you get reports, metrics and th
 No. Deterministic rules decide by default, and nothing leaves the cluster. The models are experimental and opt-in:
 
 - **Ranking model (Jev):** reorders candidate clusters within a placement tier on the rules path.
-- **Adaptive path (planner + Jev):** for workloads whose priorities are easier to state in words than as a scoring rule. A planner proposes plans, Plumb validates them, Jev picks one; or, with `planner.only`, the planner's one plan runs once validated.
+- **Adaptive path (planner + Jev):** for workloads whose priorities are easier to state in words than as a scoring rule. A planner proposes plans, Plumb validates them, Jev picks one; or, with `chooser: planner`, the planner's one plan runs once validated. Each workload chooses: some can stay on the rules while others use the planner.
 
-Both start in `shadow`: their picks are logged next to the rules' until you choose `model.mode=apply`.
+Both start in `shadow`: their picks are logged next to the rules' until you choose `model.mode=apply` (and, on the adaptive path, `mode: apply` on the policy).
 
 ## What happens when the hub goes away?
 

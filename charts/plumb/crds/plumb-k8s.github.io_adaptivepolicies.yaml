@@ -238,6 +238,16 @@ spec:
                       proposes plans, Plumb validates them, Jev picks one. Needs --planner-provider and
                       --model-provider on the agents; without them the rules decide.
                     properties:
+                      chooser:
+                        default: jev
+                        description: |-
+                          Chooser: jev picks among the planner's plans, the rules' plan and one-step changes
+                          (needs --model-provider); planner has the planner propose one plan, carried out once
+                          validated, without Jev.
+                        enum:
+                        - jev
+                        - planner
+                        type: string
                       intent:
                         description: |-
                           Intent is what matters for this workload and which trade-offs are acceptable, e.g.
@@ -245,6 +255,16 @@ spec:
                           to the models; keep secrets out of it.
                         maxLength: 1000
                         minLength: 1
+                        type: string
+                      mode:
+                        default: shadow
+                        description: |-
+                          Mode: shadow records the adaptive pick in the decision log while the rules decide;
+                          apply carries it out, where the agents allow it (--model-mode=apply). Each policy
+                          starts in shadow.
+                        enum:
+                        - shadow
+                        - apply
                         type: string
                     required:
                     - intent

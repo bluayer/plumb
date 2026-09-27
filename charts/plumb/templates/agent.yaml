@@ -50,7 +50,6 @@ spec:
             - --planner-response-format={{ .Values.planner.responseFormat }}
             - --planner-interval={{ .Values.planner.interval }}
             - --planner-timeout={{ .Values.planner.timeout }}
-            - --planner-only={{ .Values.planner.only }}
             {{- if .Values.accessProviders }}
             - --clusterprofile-provider-file=/etc/plumb/providers.json
             {{- end }}

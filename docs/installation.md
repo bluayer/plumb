@@ -174,11 +174,11 @@ An in-cluster model serving OpenAI-compatible Chat Completions can be the planne
 
 ```sh
 helm upgrade plumb ... --set planner.provider=openai --set planner.model=<served-model-id> \
-  --set planner.endpoint=http://model.models.svc:8000/v1 --set planner.only=true \
+  --set planner.endpoint=http://model.models.svc:8000/v1 \
   --set planner.responseFormat=json_schema
 ```
 
-`planner.responseFormat=json_schema` asks a server that supports structured output to enforce the plan schema. Omit it for compatible servers that only accept basic Chat Completions fields; Plumb still checks the answer before use. `planner.only=true` runs without Jev; it starts in shadow mode and records the planner's choice beside the rules. After reviewing the decision log, set `model.mode=apply` to let validated plans run. To let Jev choose among multiple planner proposals instead, configure `model.provider` as above and leave `planner.only=false`. For an authenticated endpoint, create a Secret and set `planner.apiKeySecret.name` (and optionally `.key`); its value is sent as a Bearer token. An endpoint outside the cluster must use HTTPS.
+`planner.responseFormat=json_schema` asks a server that supports structured output to enforce the plan schema. Omit it for compatible servers that only accept basic Chat Completions fields; Plumb still checks the answer before use. Without Jev (no `model.provider`), give the policy `chooser: planner`: the planner proposes one plan, carried out once validated. To let Jev choose among several planner proposals instead, configure `model.provider` as above and keep the default `chooser: jev`. For an authenticated endpoint, create a Secret and set `planner.apiKeySecret.name` (and optionally `.key`); its value is sent as a Bearer token. An endpoint outside the cluster must use HTTPS.
 
 Then add to the policy, in every member:
 
@@ -187,13 +187,15 @@ spec:
   experimental:
     adaptive:
       intent: Interactive service. Protect TTFT first; reduce cost when there is slack.
+      chooser: jev   # or planner: the planner's one plan, without Jev
+      mode: shadow   # the default; apply carries out the pick (needs model.mode=apply on the agents)
   signals:
     metrics:
       - {name: ttft_p95, unit: seconds, meaning: time to first token p95, window: 2m,
          query: 'histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[2m])))'}
 ```
 
-It starts in `model.mode=shadow`; see [evaluating the adaptive path](operations.md#evaluating-the-adaptive-path). Without Jev, add `--set planner.only=true`: the planner's one plan is carried out once validated ([planner only](architecture.md#the-adaptive-path)). Another planner host: see [CONTRIBUTING](../CONTRIBUTING.md#planner-providers).
+Each policy starts in `mode: shadow`; see [evaluating the adaptive path](operations.md#evaluating-the-adaptive-path). To carry out its picks, set `mode: apply` on that policy and `model.mode=apply` on the agents; other policies stay as they are, on the rules or in shadow ([planner only](architecture.md#the-adaptive-path)). Another planner host: see [CONTRIBUTING](../CONTRIBUTING.md#planner-providers).
 
 ## 7. Go live
 

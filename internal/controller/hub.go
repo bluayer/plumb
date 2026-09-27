@@ -68,7 +68,9 @@ type Hub struct {
 	Identity string
 	Interval time.Duration
 	Model    *core.SystemOne // nil: rules rank clusters
-	// ModelShadow: the model's ranking is only recorded in the decision log (experimental).
+	// ModelShadow: nothing a model picks is carried out, only recorded in the decision log
+	// (experimental): the ranking model's order, and the adaptive pick of every policy,
+	// whatever its spec.experimental.adaptive.mode.
 	ModelShadow bool
 	// Planner proposes plans for policies with spec.experimental.adaptive (nil: those
 	// policies follow the rules). It is asked in the background, at most once per
@@ -76,10 +78,8 @@ type Hub struct {
 	Planner         core.Planner
 	PlannerInterval time.Duration
 	PlannerTimeout  time.Duration
-	// PlannerOnly: the planner's one plan is carried out once validated, without Jev.
-	PlannerOnly bool
-	Log         *core.Log
-	Recorder    events.EventRecorder // optional
+	Log             *core.Log
+	Recorder        events.EventRecorder // optional
 
 	wake chan struct{}
 	// leading is held while Lead runs: client-go starts a new leader callback without
@@ -279,10 +279,14 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 	}
 	var res core.Result
 	var adaptive *core.AdaptiveRecord
-	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && h.Planner != nil && (h.Model != nil || h.PlannerOnly) {
+	// Each policy chooses its own path: the rules, or the adaptive path with Jev or the
+	// planner alone as chooser, recorded or carried out.
+	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && h.Planner != nil && (h.Model != nil || x.Adaptive.Chooser == v1alpha1.ChooserPlanner) {
+		plannerOnly := x.Adaptive.Chooser == v1alpha1.ChooserPlanner
 		ain := core.AdaptiveInput{Input: in, Policy: *x.Adaptive, Metrics: p.Spec.Signals.Metrics, Placement: p.Spec.Placement,
-			Recent: fs.Recent, Proposed: h.proposed(key, hash, now), Shadow: h.ModelShadow, PlannerOnly: h.PlannerOnly}
-		if !h.PlannerOnly {
+			Recent: fs.Recent, Proposed: h.proposed(key, hash, now), PlannerOnly: plannerOnly,
+			Shadow: h.ModelShadow || x.Adaptive.Mode != v1alpha1.AdaptiveApply}
+		if !plannerOnly {
 			ain.Choose = func(state any, instructions string, options map[string]string) (map[string]float64, error) {
 				start := time.Now()
 				probs, err := h.Model.Choose(ctx, state, instructions, options)

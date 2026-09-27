@@ -423,7 +423,6 @@ type Options struct {
 	Planner         core.Planner
 	PlannerInterval time.Duration
 	PlannerTimeout  time.Duration
-	PlannerOnly     bool
 	Log             *core.Log
 	Interval        time.Duration // member reports
 	HubInterval     time.Duration
@@ -436,7 +435,7 @@ func Setup(mgr ctrl.Manager, o Options) (*Hub, error) {
 		return nil, err
 	}
 	hub := NewHub(Hub{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Identity: o.Identity, Interval: o.HubInterval, Model: o.Model, ModelShadow: o.ModelShadow, Log: o.Log,
-		Planner: o.Planner, PlannerInterval: o.PlannerInterval, PlannerTimeout: o.PlannerTimeout, PlannerOnly: o.PlannerOnly,
+		Planner: o.Planner, PlannerInterval: o.PlannerInterval, PlannerTimeout: o.PlannerTimeout,
 		Recorder: mgr.GetEventRecorder("plumb-hub")})
 	hub.Fleet = &Fleet{Self: o.Name, Namespace: o.Namespace, Local: mgr, Access: o.Access, NewCluster: o.NewCluster, Changed: hub.Wake}
 	if err := hub.Fleet.SetupWithManager(mgr); err != nil {

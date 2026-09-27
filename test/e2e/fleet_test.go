@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	clientcmdv1 "k8s.io/client-go/tools/clientcmd/api/v1"
+	"k8s.io/client-go/util/retry"
 	cpv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
 	"sigs.k8s.io/cluster-inventory-api/pkg/access"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -680,15 +681,15 @@ func TestFleetFailover(t *testing.T) {
 	f.start(f.spec())
 	f.keda()
 	f.balanced()
-	hub, other := f.hub()
-	phase := hubStatus(f.h, f.r).Phase
-	hub.stop()
+	phase := f.h.get().Status.Fleet.Phase
+	f.mh.stop() // home leads (start)
+	var s *v1alpha1.FleetStatus
 	eventually(t, 45*time.Second, "failover", func() bool {
-		s := hubStatus(f.h, f.r)
+		s = f.r.get().Status.Fleet // the new hub writes its own copy
 		in := f.r.get().Status.Intent
-		return s.Hub == other.identity && in != nil && in.Hub == other.identity && in.Replicas == 2
+		return s != nil && s.Hub == f.mr.identity && in != nil && in.Hub == f.mr.identity && in.Replicas == 2
 	})
-	if s := hubStatus(f.h, f.r); s.Phase != phase && s.Phase != v1alpha1.PhaseRecovering {
+	if s.Phase != phase && s.Phase != v1alpha1.PhaseRecovering {
 		t.Fatalf("the new hub started over: phase %s, was %s", s.Phase, phase)
 	}
 	srv := &scaler.Server{Reader: remote.c, Namespace: fleetNS, Cluster: "remote"}
@@ -807,9 +808,12 @@ func TestFleetOutOfSyncHoldsRelease(t *testing.T) {
 
 	drift := func(step int32) {
 		t.Helper()
-		p := f.r.get()
-		p.Spec.Capacity.Step = step
-		if err := remote.c.Update(context.Background(), p); err != nil {
+		// Retried: the member writes status in between, which changes the resourceVersion.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			p := f.r.get()
+			p.Spec.Capacity.Step = step
+			return remote.c.Update(context.Background(), p)
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
