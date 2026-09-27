@@ -19,6 +19,8 @@ prometheusURL: ""
 #               vercel      Vercel AI Gateway
 #   mode        shadow: its pick is only recorded in the decision log, the rules decide
 #               apply:  its pick is carried out when confident enough
+#               Also the ceiling for the adaptive path below: shadow keeps every policy's
+#               adaptive pick recorded only, whatever its adaptive.mode
 # A provider's hosted default is only called when an API key is set; it receives a compact
 # per-cluster summary (replicas, room, errors, cost rank). On errors, rules rank.
 # Values and flags here may change between releases.
@@ -33,11 +35,12 @@ model:
     key: api-key
 
 # EXPERIMENTAL. The planner model for policies with spec.experimental.adaptive: it proposes
-# plans, Plumb validates them, and the model above (Jev) picks one. Both are needed, unless
-# only is true: then the planner proposes one plan, carried out once validated, and Jev is
-# not used. Otherwise those policies follow the rules. Called in the background, at most
-# once per interval per policy, only while a member is short or the fleet is not Steady.
-# model.mode (shadow or apply) applies to the planner's pick too.
+# plans, Plumb validates them, and the model above (Jev) picks one; a policy with
+# adaptive.chooser=planner has the planner propose one plan, carried out once validated,
+# without Jev. Without the models a policy needs, it follows the rules. Called in the
+# background, at most once per interval per policy, only while a member is short or the
+# fleet is not Steady. Each policy is recorded only (adaptive.mode=shadow, its default) or
+# carried out (adaptive.mode=apply); model.mode=shadow keeps every policy recorded only.
 #   provider    "" (none, default), bedrock (Amazon Bedrock Converse; credentials from IRSA
 #               or EKS Pod Identity), or openai (OpenAI-compatible /v1/chat/completions)
 planner:
@@ -51,7 +54,6 @@ planner:
     key: api-key
   interval: 2m
   timeout: 1m
-  only: false    # planner only, without Jev
 
 # How this member reaches the others: ClusterProfile access providers (KEP-5339), matched
 # by name against status.accessProviders of the ClusterProfiles in this namespace. Their

@@ -60,11 +60,13 @@ Unschedulable replicas always count, with or without signals. Signals are read, 
 
 ### `spec.experimental.adaptive`
 
-Experimental; its fields may change between releases. Takes effect only on agents run with both `--planner-provider` and `--model-provider`, or with `--planner-provider` and `--planner-only`; otherwise the policy follows the rules.
+Experimental; its fields may change between releases. Each policy chooses on its own: policies without this section follow the rules, and each one with it sets its own chooser and mode, so one fleet can run some workloads on the rules and others on the adaptive path. It takes effect only on agents run with `--planner-provider`, plus `--model-provider` for `chooser: jev`; otherwise the policy follows the rules.
 
 | Field | Default | Description |
 |---|---|---|
 | `intent` | required | What matters for this workload and which trade-offs are acceptable, in plain words (up to 1,000 characters). Sent to both models |
+| `mode` | `shadow` | `shadow` records the adaptive pick in the decision log while the rules decide; `apply` carries it out. Agents run with `--model-mode=shadow` (Helm `model.mode`, the default) keep every policy in `shadow`, whatever it sets |
+| `chooser` | `jev` | `jev` picks among the planner's plans, the rules' plan and one-step changes; `planner` has the planner propose one plan, carried out once validated, without Jev ([planner only](architecture.md#the-adaptive-path)) |
 
 `maxReplicas`, `capacity.step`, `traffic.stepPercent`, `minWeight`/`maxWeight` and `escalation.cooldown` are enforced on every plan, whoever proposed it. To keep capacity or traffic out of a cluster, bound it there (`maxReplicas`, `maxWeight`). `placement` becomes a preference the models are told, not a fixed order.
 
@@ -118,7 +120,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `clusterName` | required | This member's name |
 | `prometheusURL` | `""` | Prometheus for `spec.signals`; empty disables metric signals |
 | `model.provider` | `""` | **Experimental.** `""` is rules only. Otherwise who serves the ranking model: `typesafe` (TypeSafe's API, or any `/v1/systemone` server), `cloudflare` (Workers AI), `vercel` (AI Gateway) |
-| `model.mode` | `shadow` | `shadow` records the model's pick in the decision log while the rules decide; `apply` carries it out (a cluster order on the rules' path, a whole plan on the adaptive path) |
+| `model.mode` | `shadow` | `shadow` records the model's pick in the decision log while the rules decide; `apply` carries it out: the ranking model's cluster order on the rules' path, and on the adaptive path the pick of each policy with `experimental.adaptive.mode: apply`. `shadow` keeps every policy recorded only |
 | `model.url` | `""` | Endpoint; `""` is the provider's default (`https://api.typesafe.ai`, `https://ai-gateway.vercel.sh/typesafe`; `cloudflare` has none: `https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run`). Plain `http` only for in-cluster or local hosts |
 | `model.name` | `""` | Model name; `""` is the provider's default (`jev-latest`, `typesafe/jev`, `typesafe-ai/jev`) |
 | `model.timeout` | `1s` | Per-call timeout; rules decide on expiry |
@@ -130,7 +132,6 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `planner.apiKeySecret.{name,key}` | `""`, `api-key` | Optional Bearer token for `openai`, exposed as `PLUMB_PLANNER_API_KEY`; in-cluster endpoints may omit it |
 | `planner.interval` | `2m` | At most one planner call per policy per interval, only while a member is short or the fleet is not Steady. Calls run in the background |
 | `planner.timeout` | `1m` | Per-call timeout |
-| `planner.only` | `false` | Planner only, without Jev: the planner proposes one plan, carried out once validated (recorded only while `model.mode=shadow`) |
 | `accessProviders` | `[]` | KEP-5339 providers used to reach other members |
 | `agent.replicas` | `2` | One is elected per cluster |
 | `agent.interval` | `30s` | Member report interval |
@@ -155,7 +156,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `--clusterprofile-provider-file` | `""` | Access providers JSON (`{"providers": [...]}`); empty is a fleet of one |
 | `--prometheus-url` | `""` | Prometheus for `spec.signals` |
 | `--model-provider`, `--model-mode`, `--model-url`, `--model`, `--model-timeout` | see Helm values | The experimental ranking model |
-| `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-response-format`, `--planner-interval`, `--planner-timeout`, `--planner-only` | see Helm values | The experimental planner |
+| `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-response-format`, `--planner-interval`, `--planner-timeout` | see Helm values | The experimental planner |
 | `--interval` / `--hub-interval` | `30s` / `10s` | Report and planning intervals |
 | `--decision-log` | `-` | Decision log path |
 | `--leader-elect` | `true` | Elect one agent per cluster |

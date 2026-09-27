@@ -329,7 +329,7 @@ func TestHubHoldsReleaseWithoutReport(t *testing.T) {
 	a, b := statusClient(t, interceptor.Funcs{}, home), statusClient(t, interceptor.Funcs{}, remote)
 	log, _ := core.OpenLog("")
 	rec := events.NewFakeRecorder(10)
-	h := hubFor(a, b, log, nil, nil, false)
+	h := hubFor(a, b, log, nil, nil)
 	h.Recorder = rec
 	for range 3 {
 		stepHub(t, h)

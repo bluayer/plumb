@@ -132,7 +132,7 @@ Then compare the outcome lines of those decisions (`readyAfterSeconds`, pressure
 
 ### Evaluating the adaptive path
 
-For policies with `experimental.adaptive`, decision lines carry `adaptive`: every candidate (`source`: `planner`, `rules`, `hold`, `enumerated`), why others were rejected, Jev's probabilities, who picked (`chooser`: `jev`, or `planner` with `planner.only`), the pick (`chosen`) and what ran (`executed`). Planner answers are `proposal` lines. Where Jev's pick differed from the rules':
+For policies with `experimental.adaptive`, decision lines carry `adaptive`: every candidate (`source`: `planner`, `rules`, `hold`, `enumerated`), why others were rejected, Jev's probabilities, who picked (`chooser`: `jev`, or `planner` with `chooser: planner`), the pick (`chosen`) and what ran (`executed`). Planner answers are `proposal` lines. Where Jev's pick differed from the rules':
 
 ```sh
 jq -c 'select(.kind=="decision" and .adaptive.chosen and .adaptive.chosen != "rules") | .adaptive as $a
@@ -140,7 +140,7 @@ jq -c 'select(.kind=="decision" and .adaptive.chosen and .adaptive.chosen != "ru
 jq -c 'select(.kind=="proposal") | {time, policy, seconds, error, plans: [.candidates[]? | {id, actions, hypothesis}]}' decisions.jsonl
 ```
 
-Shadow logs show how the models decide: whether a different intent or a different state changes the pick, whether a slow or failed earlier action is taken into account, and that nothing outside the limits is ever offered. They cannot show that a pick would have done better, since what was not carried out is never observed. For that, run the same load pattern in alternating time blocks with the rules and with `model.mode=apply`, and compare time over the target metric, time to recover, and cost.
+Shadow logs show how the models decide: whether a different intent or a different state changes the pick, whether a slow or failed earlier action is taken into account, and that nothing outside the limits is ever offered. They cannot show that a pick would have done better, since what was not carried out is never observed. For that, run the same load pattern in alternating time blocks with the rules and with the policy's `mode: apply` (and `model.mode=apply` on the agents), and compare time over the target metric, time to recover, and cost.
 
 ## Rolling out auto mode
 

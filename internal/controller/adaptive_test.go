@@ -83,14 +83,19 @@ func (p *planner) Propose(context.Context, string, string, map[string]any) (json
 	return json.RawMessage(`{"plans": [{"actions": [{"kind": "add", "cluster": "b", "replicas": 1}], "hypothesis": "b has idle GPUs"}]}`), nil
 }
 
-// adaptiveFleet: a is short, b has idle static room; each member has its own copy.
-func adaptiveFleet(t *testing.T) (a, b client.WithWatch, key types.NamespacedName) {
+// adaptiveFleet: a is short, b has idle static room; each member has its own copy. The
+// adaptive pick is carried out (mode apply), chosen by chooser.
+func adaptiveFleet(t *testing.T, chooser string) (a, b client.WithWatch, key types.NamespacedName) {
+	return adaptiveFleetWith(t, v1alpha1.Adaptive{Intent: "use idle GPUs first", Mode: v1alpha1.AdaptiveApply, Chooser: chooser})
+}
+
+func adaptiveFleetWith(t *testing.T, x v1alpha1.Adaptive) (a, b client.WithWatch, key types.NamespacedName) {
 	now := time.Now()
 	spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"},
 		Clusters:     []v1alpha1.ClusterSpec{{Name: "a", MaxReplicas: 10}, {Name: "b", MaxReplicas: 10}},
 		Capacity:     v1alpha1.CapacityPolicy{Step: 2},
 		Escalation:   v1alpha1.EscalationPolicy{After: metav1.Duration{Duration: time.Minute}, Cooldown: metav1.Duration{Duration: time.Millisecond}},
-		Experimental: &v1alpha1.Experimental{Adaptive: &v1alpha1.Adaptive{Intent: "use idle GPUs first"}}}
+		Experimental: &v1alpha1.Experimental{Adaptive: &x}}
 	pol := func(cluster string, r v1alpha1.ClusterReport) *v1alpha1.AdaptivePolicy {
 		p := &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: spec}
 		r.Time, r.SpecHash = metav1.Time{Time: now}, ReportHash(p, cluster)
@@ -103,19 +108,32 @@ func adaptiveFleet(t *testing.T) (a, b client.WithWatch, key types.NamespacedNam
 	return a, b, types.NamespacedName{Namespace: "ns", Name: "llm"}
 }
 
-// With Jev, or planner only (no Jev configured at all), in apply and shadow mode.
+// Each policy picks its chooser (Jev, or the planner alone with no Jev configured at all)
+// and its mode; the agents' --model-mode=shadow keeps every policy recorded only.
 func TestHubAdaptive(t *testing.T) {
-	for _, tc := range []struct{ only, shadow bool }{{false, false}, {false, true}, {true, false}, {true, true}} {
+	for _, tc := range []struct {
+		only                bool
+		mode                string
+		agentShadow, shadow bool
+	}{
+		{false, v1alpha1.AdaptiveApply, false, false},
+		{false, v1alpha1.AdaptiveShadow, false, true},
+		{false, v1alpha1.AdaptiveApply, true, true},
+		{true, v1alpha1.AdaptiveApply, false, false},
+		{true, v1alpha1.AdaptiveShadow, false, true},
+		{true, v1alpha1.AdaptiveApply, true, true},
+	} {
 		shadow := tc.shadow
-		a, b, key := adaptiveFleet(t)
+		chooser := map[bool]string{false: v1alpha1.ChooserJev, true: v1alpha1.ChooserPlanner}[tc.only]
+		a, b, key := adaptiveFleetWith(t, v1alpha1.Adaptive{Intent: "use idle GPUs first", Mode: tc.mode, Chooser: chooser})
 		log, _ := core.OpenLog("")
 		pl := &planner{}
 		var jev *core.SystemOne
 		if !tc.only {
 			jev = newJev(t, "p1")
 		}
-		h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: jev, ModelShadow: shadow,
-			Planner: pl, PlannerInterval: time.Hour, PlannerOnly: tc.only,
+		h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: jev, ModelShadow: tc.agentShadow,
+			Planner: pl, PlannerInterval: time.Hour,
 			Fleet: &Fleet{Self: "a", members: map[string]*member{"a": {cl: fakeCluster{c: a}}, "b": {cl: fakeCluster{c: b}}}}})
 		h.floorsWritten = map[string]time.Time{}
 		step := func() {
@@ -188,8 +206,8 @@ func hashOf(t *testing.T, c client.Reader, key types.NamespacedName) string {
 }
 
 // hubFor builds a hub over the adaptive fleet.
-func hubFor(a, b client.WithWatch, log *core.Log, jev *core.SystemOne, pl core.Planner, only bool) *Hub {
-	h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: jev, Planner: pl, PlannerInterval: time.Hour, PlannerOnly: only,
+func hubFor(a, b client.WithWatch, log *core.Log, jev *core.SystemOne, pl core.Planner) *Hub {
+	h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: jev, Planner: pl, PlannerInterval: time.Hour,
 		Fleet: &Fleet{Self: "a", members: map[string]*member{"a": {cl: fakeCluster{c: a}}, "b": {cl: fakeCluster{c: b}}}}})
 	h.floorsWritten = map[string]time.Time{}
 	return h
@@ -227,13 +245,13 @@ func waitProposal(t *testing.T, h *Hub, key, hash string) {
 // the planner is asked again (with Jev or planner only).
 func TestHubCarriesOutAPlannerPlanOnce(t *testing.T) {
 	for _, only := range []bool{false, true} {
-		a, b, key := adaptiveFleet(t)
+		a, b, key := adaptiveFleet(t, map[bool]string{false: v1alpha1.ChooserJev, true: v1alpha1.ChooserPlanner}[only])
 		log, _ := core.OpenLog("")
 		var jev *core.SystemOne
 		if !only {
 			jev = newJev(t, "p1")
 		}
-		h := hubFor(a, b, log, jev, &planner{}, only)
+		h := hubFor(a, b, log, jev, &planner{})
 		stepHub(t, h)
 		waitProposal(t, h, key.String(), hashOf(t, a, key))
 		for range 4 {
@@ -254,9 +272,9 @@ func TestHubCarriesOutAPlannerPlanOnce(t *testing.T) {
 
 // Plans proposed for an earlier version of the policy are not offered for the new one.
 func TestHubDropsPlansForAnEarlierPolicy(t *testing.T) {
-	a, b, key := adaptiveFleet(t)
+	a, b, key := adaptiveFleet(t, v1alpha1.ChooserPlanner)
 	log, _ := core.OpenLog("")
-	h := hubFor(a, b, log, nil, &planner{}, true)
+	h := hubFor(a, b, log, nil, &planner{})
 	stepHub(t, h)
 	old := hashOf(t, a, key)
 	waitProposal(t, h, key.String(), old)
@@ -276,7 +294,7 @@ func TestHubDropsPlansForAnEarlierPolicy(t *testing.T) {
 // A decision taken on a policy that changed while a model was being asked is not carried
 // out: here b's maxReplicas drops to 0 while Jev answers.
 func TestHubDiscardsDecisionOnChangedPolicy(t *testing.T) {
-	a, b, key := adaptiveFleet(t)
+	a, b, key := adaptiveFleet(t, v1alpha1.ChooserJev)
 	log, _ := core.OpenLog("")
 	changed := false
 	jev := newJevHook(t, "rules", func() {
@@ -293,7 +311,7 @@ func TestHubDiscardsDecisionOnChangedPolicy(t *testing.T) {
 			}
 		}
 	})
-	h := hubFor(a, b, log, jev, &planner{}, false)
+	h := hubFor(a, b, log, jev, &planner{})
 	stepHub(t, h)
 	got := &v1alpha1.AdaptivePolicy{}
 	_ = b.Get(context.Background(), key, got)
@@ -305,7 +323,7 @@ func TestHubDiscardsDecisionOnChangedPolicy(t *testing.T) {
 // A new hub picks up the fleet status the previous one wrote to its own copy: phase, and
 // the decisions still being followed.
 func TestHubTakesOverFleetStatus(t *testing.T) {
-	a, b, key := adaptiveFleet(t)
+	a, b, key := adaptiveFleet(t, v1alpha1.ChooserJev)
 	prev := &v1alpha1.AdaptivePolicy{}
 	_ = b.Get(context.Background(), key, prev)
 	prev.Status.Fleet = &v1alpha1.FleetStatus{Hub: "old", Time: metav1.Now(), Phase: v1alpha1.PhaseEscalated,
@@ -314,7 +332,7 @@ func TestHubTakesOverFleetStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	log, _ := core.OpenLog("")
-	stepHub(t, hubFor(a, b, log, nil, nil, false))
+	stepHub(t, hubFor(a, b, log, nil, nil))
 	got := &v1alpha1.AdaptivePolicy{}
 	_ = a.Get(context.Background(), key, got)
 	fs := got.Status.Fleet
@@ -338,7 +356,7 @@ func TestHubComparesOnlyReportInputs(t *testing.T) {
 		}, nil},
 		{"b's entry", func(p *v1alpha1.AdaptivePolicy) { p.Spec.Clusters[1].NodePools = []string{"gpu"} }, []string{"b"}},
 	} {
-		a, b, key := adaptiveFleet(t)
+		a, b, key := adaptiveFleet(t, v1alpha1.ChooserJev)
 		p := &v1alpha1.AdaptivePolicy{}
 		_ = a.Get(context.Background(), key, p)
 		tc.change(p)
@@ -346,7 +364,7 @@ func TestHubComparesOnlyReportInputs(t *testing.T) {
 			t.Fatal(err)
 		}
 		log, _ := core.OpenLog("")
-		stepHub(t, hubFor(a, b, log, nil, nil, false))
+		stepHub(t, hubFor(a, b, log, nil, nil))
 		got := &v1alpha1.AdaptivePolicy{}
 		_ = a.Get(context.Background(), key, got)
 		if fs := got.Status.Fleet; fs == nil || !slices.Equal(fs.OutOfSync, tc.stale) {
@@ -358,6 +376,46 @@ func TestHubComparesOnlyReportInputs(t *testing.T) {
 					t.Errorf("%s: reports %v, out of sync %v", tc.name, r.Reports, r.OutOfSync)
 				}
 			}
+		}
+	}
+}
+
+// One hub, two workloads: one on the adaptive path (planner alone, carried out), the other
+// on the rules. The planner is asked only for the first; the second is decided as before.
+func TestHubHybridPolicies(t *testing.T) {
+	a, b, key := adaptiveFleet(t, v1alpha1.ChooserPlanner)
+	rules := types.NamespacedName{Namespace: "ns", Name: "rules"}
+	for i, c := range []client.WithWatch{a, b} {
+		p := &v1alpha1.AdaptivePolicy{}
+		if err := c.Get(context.Background(), key, p); err != nil {
+			t.Fatal(err)
+		}
+		q := &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: rules.Namespace, Name: rules.Name}, Spec: *p.Spec.DeepCopy()}
+		q.Spec.Experimental = nil
+		if err := c.Create(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+		q.Status = p.Status
+		q.Status.Report.SpecHash = ReportHash(q, []string{"a", "b"}[i])
+		if err := c.Status().Update(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log, _ := core.OpenLog("")
+	pl := &planner{}
+	h := hubFor(a, b, log, nil, pl)
+	for _, k := range []types.NamespacedName{key, rules} {
+		if err := h.step(context.Background(), &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: k.Namespace, Name: k.Name}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitProposal(t, h, key.String(), hashOf(t, a, key))
+	if h.proposed(rules.String(), hashOf(t, a, rules), time.Now()) != nil || pl.calls != 1 {
+		t.Fatalf("planner asked %d times; plans for the rules policy: %v", pl.calls, h.proposed(rules.String(), hashOf(t, a, rules), time.Now()))
+	}
+	for _, r := range log.Records {
+		if r, ok := r.(core.Record); ok && (r.Adaptive != nil) != (r.Policy == key.String()) {
+			t.Errorf("%s decided on the wrong path: adaptive %+v", r.Policy, r.Adaptive)
 		}
 	}
 }
