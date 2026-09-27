@@ -132,7 +132,7 @@ Then compare the outcome lines of those decisions (`readyAfterSeconds`, pressure
 
 ### Evaluating the adaptive path
 
-For policies with `experimental.adaptive`, decision lines carry `adaptive`: every candidate (`source`: `planner`, `rules`, `hold`, `enumerated`), why others were rejected, Jev's probabilities, who picked (`chooser`: `jev`, or `planner` with `chooser: planner`), the pick (`chosen`) and what ran (`executed`). Planner answers are `proposal` lines. Where Jev's pick differed from the rules':
+For policies with `experimental.adaptive`, decision lines carry `adaptive`: every candidate (`source`: `planner`, `rules`, `hold`, `enumerated`), why others were rejected, Jev's probabilities, who picked (`chooser`: `jev`, or `planner` with `chooser: planner`), the pick (`chosen`), what ran (`executed`), and the fleet's load a minute or more ago and now (`load`) with whether it counted as climbing (`loadRising`), which lets a plan act before a shortage. Planner answers are `proposal` lines. Where Jev's pick differed from the rules':
 
 ```sh
 jq -c 'select(.kind=="decision" and .adaptive.chosen and .adaptive.chosen != "rules") | .adaptive as $a

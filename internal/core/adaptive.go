@@ -148,11 +148,19 @@ const RisingBy = 1.25
 
 // Rising reports whether the fleet's load has grown by RisingBy or more between the
 // latest trend point and the newest one at least a minute before it (and at most three).
-// Load is the members' demand where every one reports it, else pressure times ready
-// replicas: moving traffic between members does not change it.
 func Rising(trend []TrendPoint) bool {
+	then, now, ok := loads(trend)
+	return ok && then > 0 && now >= then*RisingBy
+}
+
+// loads is the fleet's load at the latest trend point and at the newest one at least a
+// minute before it (at most three), counted over the members that reported at both: a
+// report missing at one of them is not load coming or going. Load is the members'
+// demand where every one reports it at both points, else pressure times ready replicas:
+// moving traffic between members does not change it.
+func loads(trend []TrendPoint) (then, now float64, ok bool) {
 	if len(trend) < 2 {
-		return false
+		return 0, 0, false
 	}
 	last := trend[len(trend)-1]
 	for i := len(trend) - 2; i >= 0; i-- {
@@ -161,30 +169,35 @@ func Rising(trend []TrendPoint) bool {
 			continue
 		}
 		if age > 3*time.Minute {
-			return false
+			return 0, 0, false
 		}
-		now, then := load(last), load(trend[i])
-		return then > 0 && now >= then*RisingBy
-	}
-	return false
-}
-
-func load(p TrendPoint) float64 {
-	demand, pressure, all := 0.0, 0.0, true
-	for _, v := range p.Clusters {
-		if v.Demand == nil {
-			all = false
-		} else {
-			demand += *v.Demand
+		prev := trend[i]
+		var dThen, dNow, pThen, pNow float64
+		demand, n := true, 0
+		for name, a := range prev.Clusters {
+			b, both := last.Clusters[name]
+			if !both {
+				continue
+			}
+			n++
+			if a.Demand == nil || b.Demand == nil {
+				demand = false
+			} else {
+				dThen, dNow = dThen+*a.Demand, dNow+*b.Demand
+			}
+			if a.Pressure != nil && b.Pressure != nil {
+				pThen, pNow = pThen+*a.Pressure*float64(a.Ready), pNow+*b.Pressure*float64(b.Ready)
+			}
 		}
-		if v.Pressure != nil {
-			pressure += *v.Pressure * float64(v.Ready)
+		if n == 0 {
+			return 0, 0, false
 		}
+		if demand {
+			return dThen, dNow, true
+		}
+		return pThen, pNow, true
 	}
-	if all && len(p.Clusters) > 0 {
-		return demand
-	}
-	return pressure
+	return 0, 0, false
 }
 
 // Due reports whether the adaptive path has something to decide: a member short, the
@@ -203,6 +216,10 @@ type AdaptiveRecord struct {
 	Executed      string             `json:"executed"`
 	Shadow        bool               `json:"shadow,omitempty"`
 	Error         string             `json:"error,omitempty"`
+	// Load is the fleet's load a minute or more ago and now, when the trend has both;
+	// LoadRising, whether it climbed enough to decide ahead of a shortage.
+	Load       []float64 `json:"load,omitempty"`
+	LoadRising bool      `json:"loadRising,omitempty"`
 }
 
 // Adapt is one hub step on the adaptive path.
@@ -228,7 +245,10 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	}
 	rules := Plan(in.Input)
 	held = rules.Held
-	rec := AdaptiveRecord{Rejected: map[string]string{}, Shadow: in.Shadow, Chooser: "jev"}
+	rec := AdaptiveRecord{Rejected: map[string]string{}, Shadow: in.Shadow, Chooser: "jev", LoadRising: Rising(in.Trend)}
+	if then, now, ok := loads(in.Trend); ok {
+		rec.Load = []float64{then, now}
+	}
 	proposals := MaxProposals
 	if in.PlannerOnly {
 		rec.Chooser, proposals = SourcePlanner, 1
@@ -323,17 +343,21 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	// The rules' phase describes shortage and calm; floors or shares still away from Steady
 	// keep the fleet out of Steady whatever plan ran.
 	traffic := in.Config.StepPercent > 0 && !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight < 0 })
+	// Capacity just added is not given back within calmFor: the calm starts over.
+	added := slices.ContainsFunc(run.Actions, func(a Action) bool { return a.Kind == ActionAdd })
 	switch rest := atRest(cs, traffic); {
 	case res.Phase == v1alpha1.PhaseSteady && !rest && hasShortage(in.Clusters):
 		// Acting on a shortage before the rules would escalate.
 		res.Phase, res.PhaseSince = v1alpha1.PhaseEscalated, in.Now
 	case res.Phase == v1alpha1.PhaseSteady && !rest:
 		res.Phase, res.PhaseSince = v1alpha1.PhaseRecovering, in.Now
-		if in.Phase == v1alpha1.PhaseRecovering {
+		if in.Phase == v1alpha1.PhaseRecovering && !added {
 			res.PhaseSince = in.PhaseSince
 		}
 	case res.Phase == v1alpha1.PhaseRecovering && rest:
 		res.Phase, res.PhaseSince = v1alpha1.PhaseSteady, in.Now
+	case res.Phase == v1alpha1.PhaseRecovering && added:
+		res.PhaseSince = in.Now
 	}
 	for _, c := range cs {
 		res.Plans = append(res.Plans, PlanOf(c, traffic))
@@ -474,6 +498,10 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: also released in this plan", a)
 			case a.Replicas < 1 || added[a.Cluster]+a.Replicas > addStep:
 				return nil, fmt.Errorf("%s: more than step %d", a, addStep)
+			case shortBy(in.Clusters[i]) > 0:
+				return nil, fmt.Errorf("%s: it is short itself; its autoscaler already wants those replicas", a)
+			case !troubled && steadyWeight(cs[i]) > 0 && cs[i].Weight >= steadyWeight(cs[i]):
+				return nil, fmt.Errorf("%s: it carries its own traffic; its autoscaler grows it", a)
 			}
 			x := &cs[i]
 			if a.Replicas > headroom(*x) {
@@ -493,6 +521,9 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 			x.Static = x.Static && onStatic == a.Replicas
 			if onStatic < a.Replicas {
 				x.Tier = TierDynamic
+			}
+			if traffic && steadyWeight(*x) > 0 && x.Weight < steadyWeight(*x) {
+				x.Tier = TierReturn // raised to take traffic back, released last
 			}
 			x.Floor += a.Replicas
 			x.Added += a.Replicas
