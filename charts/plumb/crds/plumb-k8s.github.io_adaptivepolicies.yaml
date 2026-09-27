@@ -238,6 +238,29 @@ spec:
                       proposes plans, Plumb validates them, Jev picks one. Needs --planner-provider and
                       --model-provider on the agents; without them the rules decide.
                     properties:
+                      burst:
+                        description: |-
+                          Burst lets the adaptive path grow faster than the rules while a member is short or
+                          over its SLO, or while the fleet's load is climbing. Giving capacity or traffic back
+                          keeps the rules' limits and pace. Empty: the rules' limits throughout.
+                        properties:
+                          step:
+                            description: |-
+                              Step is the most replicas a plan may add to one cluster per step (at least
+                              spec.capacity.step is always allowed).
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          stepPercent:
+                            description: |-
+                              StepPercent is the most traffic a plan may move per cluster per step away from a
+                              member that is short or over its SLO (at least spec.traffic.stepPercent is always
+                              allowed). Traffic coming back keeps spec.traffic.stepPercent.
+                            format: int32
+                            maximum: 100
+                            minimum: 1
+                            type: integer
+                        type: object
                       chooser:
                         default: jev
                         description: |-

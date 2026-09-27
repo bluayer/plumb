@@ -289,3 +289,129 @@ func TestAdaptPlannerOnly(t *testing.T) {
 		t.Fatalf("invalid plan: %+v", rec)
 	}
 }
+
+func trendOf(now time.Time, loads ...float64) []TrendPoint {
+	var out []TrendPoint
+	for i, l := range loads {
+		p, w := l/2, int32(50)
+		out = append(out, TrendPoint{Time: now.Add(time.Duration(i-len(loads)+1) * time.Minute), Clusters: map[string]TrendValue{
+			"a": {Pressure: &p, Ready: 1, Weight: w}, "b": {Pressure: &p, Ready: 1, Weight: w}}})
+	}
+	return out
+}
+
+// The fleet's load is climbing when it grew by RisingBy within one to three minutes;
+// demand counts where every member reports it; traffic moving between members does not.
+func TestRising(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		trend []TrendPoint
+		want  bool
+	}{
+		{"flat", trendOf(t0, 10, 10, 10), false},
+		{"up a quarter in a minute", trendOf(t0, 10, 10, 12.5), true},
+		{"slow climb", trendOf(t0, 10, 11, 12), false},
+		{"one point", trendOf(t0, 10), false},
+	} {
+		if got := Rising(tc.trend); got != tc.want {
+			t.Errorf("%s: rising %t", tc.name, got)
+		}
+	}
+	// Traffic moved from a to b: pressure per replica changes, the load does not.
+	shifted := trendOf(t0, 10, 10)
+	pa, pb := 1.0, 9.0
+	shifted[1].Clusters = map[string]TrendValue{"a": {Pressure: &pa, Ready: 1}, "b": {Pressure: &pb, Ready: 1}}
+	if Rising(shifted) {
+		t.Error("a traffic shift counted as rising load")
+	}
+	d1, d2 := 10.0, 20.0
+	demand := []TrendPoint{{Time: t0.Add(-time.Minute), Clusters: map[string]TrendValue{"a": {Demand: &d1}}},
+		{Time: t0, Clusters: map[string]TrendValue{"a": {Demand: &d2}}}}
+	if !Rising(demand) {
+		t.Error("doubled demand not rising")
+	}
+}
+
+// Burst limits apply to growing: adding while a member is short or the load climbs, and
+// moving traffic away from a member in trouble, never beyond where both are even.
+// Releasing, and adding in calm, keep the rules' step.
+func TestAdaptBurst(t *testing.T) {
+	add := func(n int32) Candidate {
+		return Candidate{Actions: []Action{{Kind: ActionAdd, Cluster: "b", Replicas: n}}}
+	}
+	in := adaptiveInput() // a short 6, step 4
+	if _, err := execute(in, add(6)); err == nil || !strings.Contains(err.Error(), "more than step 4") {
+		t.Fatalf("without burst: %v", err)
+	}
+	in.Config.BurstStep, in.Config.BurstStepPercent = 8, 30
+	if _, err := execute(in, add(6)); err != nil {
+		t.Fatalf("burst while short: %v", err)
+	}
+
+	calm := adaptiveInput()
+	calm.Config.BurstStep = 8
+	calm.Clusters[0].Report.NeededReplicas, calm.Clusters[0].Report.ShortSince = 0, nil
+	calm.Clusters[1].Floor, calm.Clusters[1].Added = 6, 6
+	if _, err := execute(calm, add(6)); err == nil {
+		t.Fatal("burst add in calm")
+	}
+	if _, err := execute(calm, Candidate{Actions: []Action{{Kind: ActionRelease, Cluster: "b", Replicas: 6}}}); err == nil || !strings.Contains(err.Error(), "more than step 4") {
+		t.Fatalf("release beyond step: %v", err)
+	}
+	calm.Trend = trendOf(t0, 10, 10, 14)
+	if _, err := execute(calm, add(6)); err != nil {
+		t.Fatalf("burst add while the load climbs: %v", err)
+	}
+
+	// Traffic: a (short) 60, c 40; away from a up to the burst limit, from c the rules'.
+	in.Clusters[0].Weight, in.Clusters[2].Weight = 60, 40
+	shift := func(from, to string, pct int32) Candidate {
+		return Candidate{Actions: []Action{{Kind: ActionShift, From: from, To: to, Percent: pct}}}
+	}
+	if _, err := execute(in, shift("a", "b", 25)); err != nil {
+		t.Fatalf("burst relief: %v", err)
+	}
+	if _, err := execute(in, shift("c", "b", 25)); err == nil || !strings.Contains(err.Error(), "stepPercent 10") {
+		t.Fatalf("burst from a cluster not in trouble: %v", err)
+	}
+	pa, pb := resource.MustParse("12"), resource.MustParse("8")
+	in.Clusters[0].Report.Pressure, in.Clusters[1].Report.Pressure = &pa, &pb // even after 10 points
+	if _, err := execute(in, shift("a", "b", 25)); err == nil || !strings.Contains(err.Error(), "busier") {
+		t.Fatalf("relief past the even point: %v", err)
+	}
+}
+
+// While the load climbs, the adaptive path decides even in Steady: a plan can add capacity
+// before anyone is short. Traffic still stays.
+func TestAdaptPreemptsWhenRising(t *testing.T) {
+	in := adaptiveInput()
+	in.Clusters[0].Report.NeededReplicas, in.Clusters[0].Report.ShortSince = 0, nil
+	in.Config.BurstStep, in.PlannerOnly = 8, true
+	in.Proposed = []Candidate{{Actions: []Action{{Kind: ActionAdd, Cluster: "b", Replicas: 6}}, Hypothesis: "load doubles within minutes"}}
+	if res, _ := Adapt(in); res.Action != "none" {
+		t.Fatalf("acted on a flat load: %s", res.Message)
+	}
+	in.Trend = trendOf(t0, 10, 10, 14)
+	res, rec := Adapt(in)
+	if f := floors(res); f["b"] != 10 || rec.Executed != "p1" || res.Phase != v1alpha1.PhaseRecovering {
+		t.Fatalf("floors %v executed %s phase %s", f, rec.Executed, res.Phase)
+	}
+	in.Proposed = []Candidate{{Actions: []Action{{Kind: ActionShift, From: "a", To: "c", Percent: 10}}}}
+	if _, rec := Adapt(in); rec.Executed == "p1" {
+		t.Fatal("traffic moved before a shortage")
+	}
+	var state map[string]any
+	in.PlannerOnly, in.Choose = false, func(s any, _ string, _ map[string]string) (map[string]float64, error) {
+		b, _ := json.Marshal(s)
+		_ = json.Unmarshal(b, &state)
+		return nil, nil
+	}
+	in.Clusters[0].Report.Pressure = resource.NewQuantity(7, resource.DecimalSI)
+	Adapt(in)
+	b, _ := json.Marshal(state)
+	for _, want := range []string{`"loadRising":true`, `"trend":[`, `"minutesAgo":2`, `"pressure":7`, `"growth":{`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("state lacks %s: %s", want, b)
+		}
+	}
+}

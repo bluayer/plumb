@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -417,5 +418,41 @@ func TestHubHybridPolicies(t *testing.T) {
 		if r, ok := r.(core.Record); ok && (r.Adaptive != nil) != (r.Policy == key.String()) {
 			t.Errorf("%s decided on the wrong path: adaptive %+v", r.Policy, r.Adaptive)
 		}
+	}
+}
+
+// The hub keeps one trend point a minute per policy, the latest replaced until a minute
+// has passed, over TrendWindow; the caller gets a copy.
+func TestHubRemembersTrend(t *testing.T) {
+	h := NewHub(Hub{})
+	now := time.Now()
+	q := resource.MustParse("3")
+	cs := []core.Cluster{{Spec: v1alpha1.ClusterSpec{Name: "a"}, Weight: 100, Report: &v1alpha1.ClusterReport{ReadyReplicas: 2, Pressure: &q}},
+		{Spec: v1alpha1.ClusterSpec{Name: "b"}, Weight: 0}} // no report: not in the point
+	var got []core.TrendPoint
+	for s := 0; s <= 15*60; s += 10 {
+		got = h.remember("ns/llm", cs, now.Add(time.Duration(s)*time.Second))
+	}
+	if len(got) < 10 || len(got) > 12 {
+		t.Fatalf("%d points over %s", len(got), TrendWindow)
+	}
+	for i := 1; i < len(got)-1; i++ {
+		if d := got[i].Time.Sub(got[i-1].Time); d < time.Minute {
+			t.Fatalf("points %s apart", d)
+		}
+	}
+	last := got[len(got)-1]
+	if !last.Time.Equal(now.Add(15*time.Minute)) || now.Add(15*time.Minute).Sub(got[0].Time) > TrendWindow {
+		t.Fatalf("window %s to %s", got[0].Time, last.Time)
+	}
+	if v, ok := last.Clusters["a"]; !ok || *v.Pressure != 3 || v.Ready != 2 || v.Weight != 100 {
+		t.Fatalf("point %+v", last.Clusters)
+	}
+	if _, ok := last.Clusters["b"]; ok {
+		t.Fatal("a member without a report in the trend")
+	}
+	got[0].Time = time.Time{}
+	if h.trends["ns/llm"][0].Time.IsZero() {
+		t.Fatal("the trend was not copied")
 	}
 }

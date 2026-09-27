@@ -226,6 +226,27 @@ type Adaptive struct {
 	// +kubebuilder:default=jev
 	// +optional
 	Chooser string `json:"chooser,omitempty"`
+	// Burst lets the adaptive path grow faster than the rules while a member is short or
+	// over its SLO, or while the fleet's load is climbing. Giving capacity or traffic back
+	// keeps the rules' limits and pace. Empty: the rules' limits throughout.
+	// +optional
+	Burst *Burst `json:"burst,omitempty"`
+}
+
+// Burst raises the limits of the adaptive path for growing, never for giving back.
+type Burst struct {
+	// Step is the most replicas a plan may add to one cluster per step (at least
+	// spec.capacity.step is always allowed).
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Step int32 `json:"step,omitempty"`
+	// StepPercent is the most traffic a plan may move per cluster per step away from a
+	// member that is short or over its SLO (at least spec.traffic.stepPercent is always
+	// allowed). Traffic coming back keeps spec.traffic.stepPercent.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	StepPercent int32 `json:"stepPercent,omitempty"`
 }
 
 // Adaptive modes and choosers.

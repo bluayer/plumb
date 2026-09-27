@@ -47,4 +47,4 @@ Any cluster running Karpenter v1: NodePools, NodeClaims and their events are the
 
 ## What do the models cost?
 
-Nothing unless configured. When configured, the ranking model and Jev are called only while a member is short or the fleet is not Steady, and the planner at most once per `planner.interval` per policy under the same condition.
+Nothing unless configured. When configured, the ranking model and Jev are called only while a member is short or the fleet is not Steady, and the planner at most once per `planner.interval` per policy under the same condition, or while the load is climbing.

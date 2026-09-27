@@ -31,6 +31,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -93,7 +94,13 @@ type Hub struct {
 	// usable report; the hub records and raises an Event when it changes.
 	held     map[string][]string
 	planning *planning
+	// trends is, per adaptive policy, what the members reported over the last
+	// TrendWindow, one point a minute. Memory only: a new hub starts without.
+	trends map[string][]core.TrendPoint
 }
+
+// TrendWindow is how far back the adaptive path sees the members' reports.
+const TrendWindow = 10 * time.Minute
 
 // planning is the planner's state per policy, shared with its background calls.
 type planning struct {
@@ -161,6 +168,7 @@ func (h *Hub) Lead(ctx context.Context) {
 // NewHub makes a Hub ready to be woken.
 func NewHub(h Hub) *Hub {
 	h.wake, h.leading, h.planning = make(chan struct{}, 1), &sync.Mutex{}, &planning{proposals: map[string]proposal{}}
+	h.trends = map[string][]core.TrendPoint{}
 	return &h
 }
 
@@ -185,6 +193,9 @@ func configFor(p *v1alpha1.AdaptivePolicy) core.Config {
 		cfg.StepPercent = cmp.Or(p.Spec.Traffic.StepPercent, 10)
 	}
 	cfg.StaticFirst = p.Spec.Placement == v1alpha1.PlacementStaticFirst
+	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && x.Adaptive.Burst != nil {
+		cfg.BurstStep, cfg.BurstStepPercent = x.Adaptive.Burst.Step, x.Adaptive.Burst.StepPercent
+	}
 	return cfg
 }
 
@@ -284,7 +295,7 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && h.Planner != nil && (h.Model != nil || x.Adaptive.Chooser == v1alpha1.ChooserPlanner) {
 		plannerOnly := x.Adaptive.Chooser == v1alpha1.ChooserPlanner
 		ain := core.AdaptiveInput{Input: in, Policy: *x.Adaptive, Metrics: p.Spec.Signals.Metrics, Placement: p.Spec.Placement,
-			Recent: fs.Recent, Proposed: h.proposed(key, hash, now), PlannerOnly: plannerOnly,
+			Recent: fs.Recent, Proposed: h.proposed(key, hash, now), PlannerOnly: plannerOnly, Trend: h.remember(key, cs, now),
 			Shadow: h.ModelShadow || x.Adaptive.Mode != v1alpha1.AdaptiveApply}
 		if !plannerOnly {
 			ain.Choose = func(state any, instructions string, options map[string]string) (map[string]float64, error) {
@@ -442,11 +453,41 @@ func recentOf(o core.Outcome, tracked []v1alpha1.TrackedDecision) v1alpha1.Recen
 	return d
 }
 
+// remember adds the members' reports to the policy's trend, keeping one point a minute
+// (the latest one replaced until a minute has passed) over the last TrendWindow, and
+// returns a copy.
+func (h *Hub) remember(key string, cs []core.Cluster, now time.Time) []core.TrendPoint {
+	f := func(q *resource.Quantity) *float64 {
+		if q == nil {
+			return nil
+		}
+		v := q.AsApproximateFloat64()
+		return &v
+	}
+	p := core.TrendPoint{Time: now, Clusters: map[string]core.TrendValue{}}
+	for _, c := range cs {
+		if r := c.Report; r != nil {
+			p.Clusters[c.Spec.Name] = core.TrendValue{Pressure: f(r.Pressure), Latency: f(r.Latency), Demand: f(r.Demand),
+				Ready: r.ReadyReplicas, Desired: r.DesiredReplicas, Weight: c.Weight}
+		}
+	}
+	t := h.trends[key]
+	if n := len(t); n >= 2 && t[n-1].Time.Sub(t[n-2].Time) < time.Minute {
+		t[n-1] = p
+	} else {
+		t = append(t, p)
+	}
+	t = slices.DeleteFunc(t, func(x core.TrendPoint) bool { return now.Sub(x.Time) > TrendWindow })
+	h.trends[key] = t
+	return slices.Clone(t)
+}
+
 // plan asks the planner in the background for plans for this policy, at most once per
-// PlannerInterval and only while a member is short or the fleet is not Steady. The answer
+// PlannerInterval and only while a member is short, the fleet is not Steady or its load
+// is climbing (core.Due). The answer
 // joins the candidates of the steps after it arrives, each validating it again.
 func (h *Hub) plan(key, hash string, in core.AdaptiveInput, res core.Result) {
-	busy := core.Busy(in.Clusters, res.Phase)
+	busy := core.Due(in, res.Phase)
 	pl := h.planning
 	pl.mu.Lock()
 	pr := pl.proposals[key]
