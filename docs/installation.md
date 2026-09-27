@@ -124,7 +124,9 @@ triggers:
       policyNamespace: inference
 ```
 
-KEDA takes the maximum across triggers, so Plumb can only raise replicas. The trigger reports 0 in shadow mode or when no valid floor exists. For TLS, set `scaler.tlsSecretName` and give KEDA the CA as `caCert` in a `TriggerAuthentication` referenced by the trigger (KEDA reads it from auth parameters).
+KEDA takes the maximum across triggers, so Plumb can only raise replicas. The trigger reports 0 in shadow mode or when no valid floor exists.
+
+When the hub lowers a floor or takes one back, the replicas do not go at once. The HPA that KEDA creates scales in only to the highest recommendation of the last `scaleDown.stabilizationWindowSeconds` (300 by default), across all of its triggers. So the replicas the floor asked for stay that long. One that never got a node stays pending and is reported as a shortage, and the hub may escalate or move traffic once more before it goes. Plumb leaves the window as it is: it keeps your own triggers from flapping. Where this matters for a workload, you can set a shorter window in the ScaledObject (`spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown`). It then applies to every trigger, yours included, so limit the rate with `policies` if you shorten it. (Fields: KEDA v2.21.0 `apis/keda/v1alpha1/scaledobject_types.go`; default: Kubernetes `autoscaling/v2`.) For TLS, set `scaler.tlsSecretName` and give KEDA the CA as `caCert` in a `TriggerAuthentication` referenced by the trigger (KEDA reads it from auth parameters).
 
 ## 5. Traffic (optional)
 

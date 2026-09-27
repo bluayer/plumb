@@ -114,7 +114,7 @@ Several policies can draw on the same nodes without being offered the same GPUs.
 
 The hub follows every floor it raised until the cluster has that many ready replicas. Past `spec.escalation.readyTimeout`:
 
-- **Replicas not on a node** (not created yet, or unschedulable) are taken back, the shortage is placed elsewhere in the same step, and that member takes no floor, and no traffic back, for another `readyTimeout`. Until its next report, the taken-back replicas it still shows as pending are not counted as its shortage.
+- **Replicas not on a node** (not created yet, or unschedulable) are taken back, the shortage is placed elsewhere in the same step, and that member takes no floor, and no traffic back, for another `readyTimeout`. Until its next report, the taken-back replicas it still shows as pending are not counted as its shortage. After that, the HPA may keep them for its scale-down window, and they read as a shortage until they go ([why](installation.md#4-add-the-plumb-trigger-to-keda)).
 - **Replicas on nodes but not ready** stay: a large model may still be loading. The hub records a warning in the decision log and a `ReplicasNotReady` Event, and checks again after another `readyTimeout`.
 
 The clock lives in `status.fleet`, so a new hub picks it up. Shadow mode does not follow floors, which never become replicas there.
