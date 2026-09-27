@@ -25,10 +25,12 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
@@ -64,6 +66,51 @@ func (o *DeploymentObserver) Observe(ctx context.Context, namespace, name string
 		}
 	}
 	return w, nil
+}
+
+// ScaleDownStabilized is the reason the HPA gives its AbleToScale condition while its
+// scale-down stabilization window holds replicas its metrics no longer ask for.
+// Source: kubernetes pkg/controller/podautoscaler/horizontal.go (checked at v1.26.0, v1.30.0,
+// v1.34.0 and v1.36.1),
+// normalizeDesiredReplicas and stabilizeRecommendationWithBehaviors.
+const ScaleDownStabilized = "ScaleDownStabilized"
+
+// ScaleDownHeld says whether the one HPA that scales Deployment namespace/name (KEDA's
+// or anyone's) holds replicas its metrics no longer ask for: it says so in AbleToScale,
+// and only on a sync that computed a recommendation (ScalingActive) and set the replicas
+// the Deployment has now; otherwise the condition may be left from an earlier sync. The
+// ReplicaSet scales in unscheduled pods first, so while it holds, pending pods are the
+// replicas that are about to go, not missing ones. No HPA, several, or any doubt: false.
+func (o *DeploymentObserver) ScaleDownHeld(ctx context.Context, namespace, name string, replicas int32) (bool, error) {
+	list := &autoscalingv2.HorizontalPodAutoscalerList{}
+	if err := o.Client.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return false, err
+	}
+	var h *autoscalingv2.HorizontalPodAutoscaler
+	for i := range list.Items {
+		ref := list.Items[i].Spec.ScaleTargetRef
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err != nil || gv.Group != appsv1.GroupName || ref.Kind != "Deployment" || ref.Name != name {
+			continue
+		}
+		if h != nil {
+			return false, nil
+		}
+		h = &list.Items[i]
+	}
+	if h == nil || h.Status.DesiredReplicas != replicas {
+		return false, nil
+	}
+	cond := func(t autoscalingv2.HorizontalPodAutoscalerConditionType) *autoscalingv2.HorizontalPodAutoscalerCondition {
+		i := slices.IndexFunc(h.Status.Conditions, func(c autoscalingv2.HorizontalPodAutoscalerCondition) bool { return c.Type == t })
+		if i < 0 {
+			return nil
+		}
+		return &h.Status.Conditions[i]
+	}
+	active, able := cond(autoscalingv2.ScalingActive), cond(autoscalingv2.AbleToScale)
+	return active != nil && active.Status == corev1.ConditionTrue && able != nil && able.Status == corev1.ConditionTrue &&
+		able.Reason == ScaleDownStabilized, nil
 }
 
 // PodRequests follows the scheduler: max(sum(containers), max(initContainers)) + overhead.

@@ -19,13 +19,17 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -34,6 +38,7 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -381,5 +386,55 @@ func TestMemberSafePressure(t *testing.T) {
 	}
 	if got, _ := safePressure(nil, rep("9", 1), true, now); got != nil {
 		t.Errorf("a cluster only seen short has a safe pressure: %v", got)
+	}
+}
+
+// While the workload's HPA holds replicas for its scale-down window, the member still
+// reports its pending pods but does not count them as needed; once the HPA stops
+// holding, they are a shortage again.
+func TestMemberLeavesOutHeldPending(t *testing.T) {
+	labels := map[string]string{"app": "llm"}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: appsv1.DeploymentSpec{
+		Replicas: ptr.To[int32](4), Selector: &metav1.LabelSelector{MatchLabels: labels},
+		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}}}}
+	objs := []client.Object{dep, &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: v1alpha1.AdaptivePolicySpec{
+		Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"}, Clusters: []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 10}}}}}
+	for i := range 4 {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: fmt.Sprint("llm-", i), Labels: labels},
+			Status: corev1.PodStatus{Phase: corev1.PodPending}}
+		if i == 0 {
+			pod.Spec.NodeName, pod.Status.Phase = "n", corev1.PodRunning
+		}
+		objs = append(objs, pod)
+	}
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "keda-hpa-llm"},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MaxReplicas: 10,
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "llm"}},
+		Status: autoscalingv2.HorizontalPodAutoscalerStatus{DesiredReplicas: 4, Conditions: []autoscalingv2.HorizontalPodAutoscalerCondition{
+			{Type: autoscalingv2.ScalingActive, Status: corev1.ConditionTrue, Reason: "ValidMetricFound"},
+			{Type: autoscalingv2.AbleToScale, Status: corev1.ConditionTrue, Reason: adapters.ScaleDownStabilized}}}}
+	c := statusClient(t, interceptor.Funcs{}, append(objs, hpa)...)
+	m := &Member{Client: c, Name: "home", Adapters: adapters.Cluster{Workloads: &adapters.DeploymentObserver{Client: c}}, Interval: time.Minute}
+	key := types.NamespacedName{Namespace: "ns", Name: "llm"}
+	report := func() *v1alpha1.ClusterReport {
+		t.Helper()
+		if _, err := m.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		got := &v1alpha1.AdaptivePolicy{}
+		if err := c.Get(context.Background(), key, got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Status.Report
+	}
+	if r := report(); !r.ScaleDownHeld || r.PendingReplicas != 3 || r.NeededReplicas != 0 || r.ShortSince != nil || r.Error != "" {
+		t.Fatalf("held pending replicas read as missing: %+v", r)
+	}
+	hpa.Status.Conditions[1].Reason = "ReadyForNewScale"
+	if err := c.Update(context.Background(), hpa); err != nil {
+		t.Fatal(err)
+	}
+	if r := report(); r.ScaleDownHeld || r.NeededReplicas != 3 || r.ShortSince == nil {
+		t.Fatalf("pending replicas no longer held are not a shortage: %+v", r)
 	}
 }

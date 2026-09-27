@@ -344,6 +344,7 @@ type env struct {
 	cl       *cluster
 	ns       string
 	scenario string
+	hpa      bool // keda writes the status of the HPA made by autoscaler
 }
 
 func newEnv(t *testing.T, cl *cluster) *env {

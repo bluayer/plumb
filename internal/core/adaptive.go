@@ -686,6 +686,9 @@ func observed(in AdaptiveInput) map[string]any {
 		}
 		v["desiredReplicas"], v["readyReplicas"], v["pendingReplicas"] = r.DesiredReplicas, r.ReadyReplicas, r.PendingReplicas
 		v["shortBy"], v["staticRoom"], v["recentLaunchFailures"] = r.NeededReplicas, r.StaticRoom, r.RecentICE
+		if r.ScaleDownHeld {
+			v["scaleDownHeld"] = true // its pending replicas are about to go, not missing
+		}
 		v["dynamicRoom"] = any(r.DynamicRoom)
 		if r.DynamicUnbounded {
 			v["dynamicRoom"] = "unbounded"

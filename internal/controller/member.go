@@ -83,6 +83,7 @@ type Member struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;update;patch
 
@@ -240,6 +241,13 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 		errs = append(errs, fmt.Errorf("workload: %w", err))
 	}
 	rep.DesiredReplicas, rep.ReadyReplicas, rep.PendingReplicas = wl.Replicas, wl.Ready, wl.PendingPods
+	if wl.PendingPods > 0 {
+		held, err := m.Adapters.Workloads.ScaleDownHeld(ctx, p.WorkloadNamespace(), p.Spec.Workload.Name, wl.Replicas)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("autoscaler: %w", err))
+		}
+		rep.ScaleDownHeld = held
+	}
 	if len(wl.PodRequests) > 0 {
 		reserved, err := m.reservations(ctx, now)
 		if err != nil {
@@ -288,7 +296,12 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 	}
 	// Saturated, or slower than the latency objective: short by at least a step.
 	short := above(rep.Saturation, sig.SaturationThreshold) || above(rep.Latency, sig.LatencySLO)
-	rep.NeededReplicas = core.Needed(wl.Replicas, wl.PendingPods, demand, short, cmp.Or(p.Spec.Capacity.Step, 2))
+	// Pending replicas its HPA holds only for its scale-down window are not missing.
+	pending := wl.PendingPods
+	if rep.ScaleDownHeld {
+		pending = 0
+	}
+	rep.NeededReplicas = core.Needed(wl.Replicas, pending, demand, short, cmp.Or(p.Spec.Capacity.Step, 2))
 	return rep, errs
 }
 
