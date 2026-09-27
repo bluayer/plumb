@@ -86,6 +86,20 @@ type Candidate struct {
 	Actions []Action `json:"actions"`
 	// Hypothesis is the planner's own reasoning: a claim, never checked or given as fact.
 	Hypothesis string `json:"hypothesis,omitempty"`
+	// Base is the StateKey of the clusters the plan was proposed for. Its actions are
+	// relative to it (add, release or shift so much): on any other state they mean
+	// something else, and the plan is not offered.
+	Base string `json:"-"`
+}
+
+// StateKey is what the hub has set for each cluster: its floor, added replicas, tier and
+// traffic share.
+func StateKey(cs []Cluster) string {
+	var b strings.Builder
+	for _, c := range cs {
+		fmt.Fprintf(&b, "%s:%d/%d/%d/%d;", c.Spec.Name, c.Floor, c.Added, c.Tier, c.Weight)
+	}
+	return b.String()
 }
 
 func (c Candidate) String() string {
@@ -270,7 +284,12 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	}
 	seen := map[string]string{}
 	var valid []Candidate
+	state := StateKey(in.Clusters)
 	for _, c := range offered {
+		if c.Base != "" && c.Base != state {
+			rec.Rejected[c.ID] = "proposed when floors or traffic shares were different; its steps would mean something else now"
+			continue
+		}
 		if _, err := execute(in, c); err != nil {
 			rec.Rejected[c.ID] = err.Error()
 			continue
@@ -557,6 +576,9 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 			released[a.Cluster] += a.Replicas
 		case ActionShift:
 			f, t := index(a.From), index(a.To)
+			// Relief: from a member that cannot carry its share, measured on the reports,
+			// before this plan moved anything. Any other move is traffic coming back.
+			relief := f >= 0 && needsRelief(in.Clusters[f], cfg) && !keepsGained(in.Clusters[f], cfg, in.Now)
 			switch {
 			case !traffic:
 				return nil, fmt.Errorf("%s: traffic is not managed or a share is unknown", a)
@@ -574,25 +596,30 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: %s below minWeight %d", a, a.From, cs[f].Spec.MinWeight)
 			case cs[t].Weight+a.Percent > cs[t].Spec.MaxWeight:
 				return nil, fmt.Errorf("%s: %s above maxWeight %d", a, a.To, cs[t].Spec.MaxWeight)
-			case !troubled && cs[t].Weight+a.Percent > steadyWeight(cs[t]):
-				return nil, fmt.Errorf("%s: no member is short or over its SLO, so traffic only comes back toward the Steady weights", a)
-			case !troubled && !calm:
+			case relief && ownShort(in.Clusters[t]) > 0:
+				return nil, fmt.Errorf("%s: %s cannot carry its own traffic either", a, a.To)
+			case relief && moved[a.From]+a.Percent > reliefShare(in.Clusters[f], cfg):
+				return nil, fmt.Errorf("%s: more than the %d points %s's missing replicas would carry", a, reliefShare(in.Clusters[f], cfg), a.From)
+			case !relief && cs[t].Weight+a.Percent > steadyWeight(cs[t]):
+				return nil, fmt.Errorf("%s: %s carries its share, so traffic only leaves it toward the Steady weights", a, a.From)
+			case !relief && !calm:
 				return nil, fmt.Errorf("%s: traffic comes back at most once per calmFor of calm", a)
 			}
 			// Relief stops where both are even, as the rules' balancing does: further, the
 			// receiver is the busier one and the traffic would bounce back.
 			// Measured on the reports, before this plan moved anything.
 			pair[[2]int{f, t}] += a.Percent
-			if even, ok := evenShare(in.Clusters[f], in.Clusters[t], cfg); troubled && ok && pair[[2]int{f, t}] > even {
+			if even, ok := evenShare(in.Clusters[f], in.Clusters[t], cfg); relief && ok && pair[[2]int{f, t}] > even {
 				return nil, fmt.Errorf("%s: %s would end up busier than %s; %d points even them out", a, a.To, a.From, even)
 			}
-			if !troubled {
+			if !relief {
 				if _, err := canReturn(cs, cfg, cs[f], cs[t], a.Percent, in.LastStep); err != nil {
 					return nil, fmt.Errorf("%s: %w", a, err)
 				}
 			}
 			cs[f].Weight -= a.Percent
 			cs[t].Weight += a.Percent
+			cs[t].GainedAt = in.Now
 			moved[a.From] += a.Percent
 			moved[a.To] += a.Percent
 		default:
@@ -606,7 +633,7 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 // burst limit when the donor is short for its own traffic or over its SLO, else the rules'
 // stepPercent. Replicas the hub raised there and still waiting are not its shortage.
 func shiftLimit(cfg Config, donor Cluster) int32 {
-	if shortBy(donor) > 0 || violates(donor, cfg) {
+	if ownShort(donor) > 0 || violates(donor, cfg) {
 		return max(cfg.StepPercent, cfg.BurstStepPercent)
 	}
 	return cfg.StepPercent
@@ -669,11 +696,17 @@ func observed(in AdaptiveInput) map[string]any {
 	clusters := map[string]any{}
 	for _, c := range in.Clusters {
 		v := map[string]any{"floor": c.Floor, "maxReplicas": c.Spec.MaxReplicas, "costRank": c.Spec.CostRank}
+		if c.Added > 0 {
+			v["addedByFleet"] = c.Added // for another cluster's shortage, or to take traffic back
+		}
 		if c.Weight >= 0 {
 			v["trafficPercent"] = c.Weight
 		}
 		if r := RegionOf(c); r != "" {
 			v["region"] = r
+		}
+		if !c.GainedAt.IsZero() && in.Now.Sub(c.GainedAt) < in.Config.CalmFor {
+			v["gainedSecondsAgo"] = in.Now.Sub(c.GainedAt).Round(time.Second).Seconds() // keeps it for the calm interval
 		}
 		if in.Now.Before(c.SkippedUntil) {
 			v["skippedSeconds"] = c.SkippedUntil.Sub(in.Now).Round(time.Second).Seconds() // added replicas never reached a node
@@ -735,7 +768,7 @@ func observed(in AdaptiveInput) map[string]any {
 	limits := map[string]any{"step": in.Config.Step, "stepPercent": in.Config.StepPercent, "cooldownSeconds": in.Config.Cooldown.Seconds()}
 	if in.Config.BurstStep > in.Config.Step || in.Config.BurstStepPercent > in.Config.StepPercent {
 		limits["growth"] = map[string]any{"step": max(in.Config.Step, in.Config.BurstStep), "stepPercent": max(in.Config.StepPercent, in.Config.BurstStepPercent),
-			"when": "adding replicas while a member is short or over its SLO or loadRising is true; moving traffic away from a member that is short or over its SLO. " +
+			"when": "adding replicas while a member is short or over its SLO or loadRising is true; moving traffic away from a member that cannot carry it. " +
 				"Releasing replicas and bringing traffic back always use step and stepPercent, once per calm interval."}
 	}
 	out := map[string]any{"clusters": clusters, "limits": limits, "loadRising": Rising(in.Trend)}

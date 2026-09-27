@@ -28,7 +28,7 @@ Test a change at the cheapest level that can show it:
 | Layer | Where | What it is for |
 |---|---|---|
 | Planning | `internal/core/*_test.go` | One `Plan` step on hand-made inputs: a rule, a limit, a bug's exact input |
-| Simulations | `internal/core/sim_test.go` | `Plan` against a crude fleet over hours of simulated time: KEDA (with the HPA's 5-minute scale-in window), node launches, model loading, latency from load. Every step of every run is checked against invariants (limits, no release while short, no traffic to a cluster over its SLO or to borrowed capacity without cause, no traffic bouncing between the same two clusters, no borrowing again right after giving back). A table of named scenarios adds what each is about; 500 seeded random fleets run the invariants over shapes nobody wrote down |
+| Simulations | `internal/core/sim_test.go` | `Plan` against a crude fleet over hours of simulated time: KEDA (with the HPA's 5-minute scale-in window), node launches, model loading, latency from load. Every step of every run is checked against invariants (limits, no release while short, no traffic to a cluster over its SLO or to borrowed capacity without cause, no traffic taken from a member that serves its share, no traffic bouncing between the same two clusters, no borrowing again right after giving back). A table of named scenarios adds what each is about; 500 seeded random fleets run the invariants over shapes nobody wrote down, also with members that leave out pending replicas their HPA holds, and with pressure read 30% off either way (there only a member failing its users may send back traffic it just took) |
 | Members and hub | `internal/controller/*_test.go` | Reconcilers against fake clients: what is read, written and recorded |
 | End to end | `test/e2e/` | Everything against real API servers and the real scheduler, below |
 
@@ -64,6 +64,7 @@ make e2e-down
 | `TestFleetThreeWayTrafficStep` | In a three-member fleet, the first traffic step moves at most `stepPercent` away from home and the backend weights sum to 100 |
 | `TestFleetFailover` | The hub stops mid-escalation: the other member takes the lease, carries on from `status.fleet`, re-issues the floor under its name, and the split holds |
 | `TestScalerFencing` | The scaler serves a floor only from the lease holder, unexpired, in `auto` mode, cut to the cluster's `maxReplicas`, against a real Lease |
+| `TestPolicyRejectsBadDurations` | A policy with a duration the agents could not read (`instant`, `-1s`, `90`) is refused by the API server; `0s` is accepted |
 | `TestFleetHeldReplicasAreNotShort` | Traffic leaves a member whose replicas wait for a node; while its HPA holds them for its scale-down window (the harness writes the HPA status, so it needs `PROVIDER=kwok`, which turns the HPA controller off), they are not its shortage, and the hub neither adds capacity nor moves more traffic for them |
 | `TestFleetReadyTimeoutTakesBack` | Floor replicas that never reach a node (no KEDA on the member) are taken back after `readyTimeout` and the member is skipped |
 | `TestFleetOutOfSyncHoldsRelease` | A member whose copy of the policy drifts is listed in `status.fleet.outOfSync` and its floor is kept, not given back blind; fixed, the floor goes |

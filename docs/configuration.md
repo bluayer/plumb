@@ -49,11 +49,11 @@ Each member evaluates these against its own Prometheus (`--prometheus-url`). Eac
 | `demand` | Current demand, in the unit of `replicaCapacity` (e.g. requests/s). The member needs `ceil(demand / replicaCapacity) − desiredReplicas` more replicas |
 | `saturation` | A value compared with `saturationThreshold` (e.g. queued requests). While above it, the member needs at least `capacity.step` more replicas |
 | `saturationThreshold` | Quantity, e.g. `"50"` |
-| `pressure` | How loaded the cluster's replicas are; higher is busier. E.g. `avg(vllm:num_requests_waiting{model_name="llama"})` or `avg(vllm:kv_cache_usage_perc{...})`. With it, traffic balances pressure across clusters instead of following ready replicas alone |
+| `pressure` | How loaded the cluster's replicas are; higher is busier. E.g. `avg(vllm:num_requests_waiting{model_name="llama"})` or `avg(vllm:kv_cache_usage_perc{...})`. With it, relief goes to the least busy member that carries its own share, no further than where both are equally busy, instead of following ready replicas alone |
 | `latency` | The latency the service is held to, e.g. TTFT p95 in seconds: `histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[2m])))` |
 | `latencySLO` | Above it, the member needs at least `capacity.step` more replicas and receives no more traffic |
 | `errorRate` | Fraction of failed requests, usually from your gateway's metrics |
-| `errorRateSLO` | Above it, the member receives no more traffic, and gives some away when balancing pressure |
+| `errorRateSLO` | Above it, the member receives no more traffic, and gives traffic away |
 | `metrics[]` | **Experimental**, for `experimental.adaptive`: `{name, query, unit, meaning, window, maxAge}`, up to 16. Each member reports the values with the time Prometheus sampled them; the models are told the unit and meaning, and a value older than `maxAge` (default `2m`) is marked stale. The rules do not read them |
 
 Unschedulable replicas always count, with or without signals. Signals are read, never acted on directly: Plumb turns them into floors and cluster weights only. A query returning NaN or ±Inf is an error, not a value. vLLM metric names above are from vLLM's `vllm/v1/metrics/loggers.py`.
@@ -85,8 +85,10 @@ Experimental; its fields may change between releases. Each policy chooses on its
 | `after` | `2m` | The most a short member tries on its own (its existing nodes and NodePools) before the fleet steps in |
 | `earlyAfter` | `30s` | Used instead of `after` when the short member's NodePools cannot add nodes (none listed, at their limits, or launches keep failing) and it has no replicas on its nodes still becoming ready. With `StaticFirst`, also while another member has idle static capacity; then only that capacity is used before `after` |
 | `readyTimeout` | `10m` | How long replicas the hub adds may take to become ready (node launch, image pull, model load). Past it, replicas not on a node are taken back and placed elsewhere, and that member is skipped for another `readyTimeout`; replicas on nodes but not ready only raise a `ReplicasNotReady` warning. Outcomes are followed at least this long |
-| `calmFor` | `10m` | How long no member may be short before the hub starts giving back, and the pace of the return: one `stepPercent` of traffic per `calmFor` |
+| `calmFor` | `10m` | How long no member may be short before the hub starts giving back, and the pace of the return: one `stepPercent` of traffic per `calmFor`. Also how long a member keeps traffic it gained before giving any away for its own shortage |
 | `cooldown` | `1m` | Minimum time between two hub steps. Keep it longer than your signals' lag (scrape interval plus query window) |
+
+Durations use Go's format (`0s`, `30s`, `2m`, `1h30m`; also `metrics[].window` and `maxAge`); anything else, or a negative one, is refused when the policy is written.
 
 Every policy is one workload, usually one model, so each gets its own timing. Set them from what that model takes, not from the defaults:
 
@@ -109,7 +111,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 |---|---|---|
 | `report` | member | Desired, ready and unschedulable replicas; `scaleDownHeld` (the workload's HPA holds replicas for its scale-down window, so its unschedulable ones are not counted as needed); static and dynamic room; recent launch failures; `region` (most common `topology.kubernetes.io/region` on its nodes); demand, saturation, pressure, latency, error rate; `metrics`; `neededReplicas`; `shortSince`; `safePressure` (the highest pressure it served without being short, with every replica it wanted ready and every signal read, since `safeSince`; tracked for a day, then started over; the limit for returning traffic to it); `specHash` (of the spec fields the report is computed from: workload, signals, capacity, this member's `clusters[]` entry); `error` |
 | `intent` | hub | `replicas` floor, how many of them were `added` for a shortage elsewhere (or so this cluster can take traffic back), the placement `tier` it was taken in (`0` existing nodes, `1` new nodes, `-1` raised for the return and released last), `hub` identity, `expires`, `decisionId` |
-| `fleet` | hub (own copy) | `phase` (`Steady`, `Escalated`, `Recovering`), `phaseSince`, `lastStep`, per-cluster `clusters[]` plan (`floor`, `static`, `added`, `tier`, `weight`, `waitingSince`: since when the floor is above ready replicas, `skippedUntil`: no floor is added there before then), `lastDecision`, `tracking`: decisions whose outcome is still being recorded, `recent`: the last 5 complete ones (action, time to ready per cluster, how many decisions followed), and `outOfSync`: members whose report is ignored because their copy differs |
+| `fleet` | hub (own copy) | `phase` (`Steady`, `Escalated`, `Recovering`), `phaseSince`, `lastStep`, per-cluster `clusters[]` plan (`floor`, `static`, `added`, `tier`, `weight`, `waitingSince`: since when the floor is above ready replicas, `skippedUntil`: no floor is added there before then, `gainedAt`: when it last gained traffic, which it keeps for `calmFor` unless it is over its SLO), `lastDecision`, `tracking`: decisions whose outcome is still being recorded, `recent`: the last 5 complete ones (action, time to ready per cluster, how many decisions followed), and `outOfSync`: members whose report is ignored because their copy differs |
 | `conditions` | member | `Ready`: the member observed the cluster without errors |
 
 `kubectl get adaptivepolicies` shows MODE, NEEDED, FLOOR and PHASE.

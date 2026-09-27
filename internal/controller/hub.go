@@ -268,6 +268,9 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 		if t := prev[spec.Name].SkippedUntil; t != nil {
 			c.SkippedUntil = t.Time
 		}
+		if t := prev[spec.Name].GainedAt; t != nil {
+			c.GainedAt = t.Time
+		}
 		reports[spec.Name] = c.Report
 		cs = append(cs, c)
 		before = append(before, core.PlanOf(c, true))
@@ -510,6 +513,19 @@ func (h *Hub) plan(key, hash string, in core.AdaptiveInput, res core.Result) {
 		parent = context.Background()
 	}
 	in.Choose, in.Proposed = nil, nil
+	// Ask on the state this step leaves (whether it is written or, in shadow, carried
+	// forward): the plan is relative to it, and is offered only while it holds.
+	in.Clusters = slices.Clone(in.Clusters)
+	for i, p := range res.Plans {
+		c := &in.Clusters[i]
+		c.Floor, c.Added, c.Tier, c.Static = p.Floor, p.Added, p.Tier, p.Static
+		if p.Weight >= 0 {
+			c.Weight = p.Weight
+		}
+		c.WaitingSince, c.SkippedUntil, c.GainedAt = timeOf(p.WaitingSince), timeOf(p.SkippedUntil), timeOf(p.GainedAt)
+	}
+	in.Phase, in.PhaseSince, in.LastStep = res.Phase, res.PhaseSince, res.LastStep
+	base := core.StateKey(in.Clusters)
 	go func() {
 		ctx, cancel := context.WithTimeout(parent, cmp.Or(h.PlannerTimeout, time.Minute))
 		defer cancel()
@@ -529,6 +545,9 @@ func (h *Hub) plan(key, hash string, in core.AdaptiveInput, res core.Result) {
 		pr := pl.proposals[key]
 		pr.running = false
 		if err == nil {
+			for i := range cands {
+				cands[i].Base = base
+			}
 			pr.candidates, pr.at, pr.hash = cands, time.Now(), hash
 		}
 		pl.proposals[key] = pr
@@ -741,4 +760,11 @@ func replicas(in *v1alpha1.Intent) int32 {
 		return 0
 	}
 	return in.Replicas
+}
+
+func timeOf(t *metav1.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return t.Time
 }

@@ -83,6 +83,7 @@ A plan for the next step only is a list of actions:
   New replicas are not immediately ready; the autoscaler may need to launch nodes and load the model.
 - release: lower a cluster's floor by "replicas"
 - shift: move "percent" percentage points of traffic from cluster "from" to cluster "to"
+  Traffic moves only to relieve a cluster that cannot carry it (short for its own traffic: shortBy beyond those of addedByFleet not ready yet; over its SLO; or no ready replicas), no further than the share its missing replicas would carry, and only to a cluster that carries its own share; a cluster that gained traffic within the calm interval (gainedSecondsAgo) keeps it unless it is over its SLO. Otherwise traffic only comes back toward the Steady weights, once per calm interval. Two clusters that both serve their share keep it, however different their pressure.
 An empty action list means holding. Stay within the limits given; plans that break them are discarded.` + capacitySemantics
 
 const (

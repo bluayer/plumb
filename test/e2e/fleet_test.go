@@ -983,3 +983,34 @@ func TestFleetLateRouteCatchesUp(t *testing.T) {
 		t.Fatalf("the first route moved: %v", w)
 	}
 }
+
+// A duration the agents could not read is refused when the policy is written. From the
+// AWS run: a metric window "instant" was stored, and then every member's list of
+// policies failed to decode, so none of them reported.
+func TestPolicyRejectsBadDurations(t *testing.T) {
+	e := newEnv(t, home)
+	for i, tc := range []struct {
+		window, after string
+		ok            bool
+	}{
+		{"0s", "2m", true},
+		{"instant", "2m", false},
+		{"30s", "-1s", false},
+		{"1h30m", "90", false},
+	} {
+		p := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": v1alpha1.GroupVersion.String(), "kind": "AdaptivePolicy",
+			"metadata": map[string]any{"name": fmt.Sprintf("durations-%d", i), "namespace": e.ns},
+			"spec": map[string]any{
+				"workload":   map[string]any{"name": "llm"},
+				"clusters":   []any{map[string]any{"name": "home", "maxReplicas": int64(1)}},
+				"signals":    map[string]any{"metrics": []any{map[string]any{"name": "ttft", "query": "q", "window": tc.window}}},
+				"escalation": map[string]any{"after": tc.after},
+			},
+		}}
+		err := e.cl.c.Create(context.Background(), p)
+		if (err == nil) != tc.ok {
+			t.Errorf("window %q, after %q: created %t, want %t (%v)", tc.window, tc.after, err == nil, tc.ok, err)
+		}
+	}
+}

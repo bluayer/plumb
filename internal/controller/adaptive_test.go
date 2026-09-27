@@ -71,16 +71,18 @@ func newJevHook(t *testing.T, prefer string, hook func()) *core.SystemOne {
 	return &core.SystemOne{Provider: jevServer{url: srv.URL, prefer: prefer}, Timeout: time.Second}
 }
 
-// planner answers with one plan, and counts calls.
+// planner answers with one plan, counts calls and keeps the state it was last asked on.
 type planner struct {
 	mu    sync.Mutex
 	calls int
+	asked string // the last user message: the state it was asked on
 }
 
-func (p *planner) Propose(context.Context, string, string, map[string]any) (json.RawMessage, error) {
+func (p *planner) Propose(_ context.Context, _, user string, _ map[string]any) (json.RawMessage, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
+	p.asked = user
 	return json.RawMessage(`{"plans": [{"actions": [{"kind": "add", "cluster": "b", "replicas": 1}], "hypothesis": "b has idle GPUs"}]}`), nil
 }
 
@@ -454,5 +456,29 @@ func TestHubRemembersTrend(t *testing.T) {
 	got[0].Time = time.Time{}
 	if h.trends["ns/llm"][0].Time.IsZero() {
 		t.Fatal("the trend was not copied")
+	}
+}
+
+// The planner is asked on the state the step that asked it leaves: from the AWS run, a
+// shift planned on 40:60 was carried out after the same step had moved the split to
+// 20:80, and ended at 0:100.
+func TestHubAsksPlannerOnTheStateAfterTheStep(t *testing.T) {
+	a, b, key := adaptiveFleet(t, v1alpha1.ChooserPlanner)
+	log, _ := core.OpenLog("")
+	pl := &planner{}
+	h := hubFor(a, b, log, nil, pl)
+	stepHub(t, h) // the rules raise b's floor by the step (2) over its desired 1
+	waitProposal(t, h, key.String(), hashOf(t, a, key))
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	var asked struct {
+		Observed struct {
+			Clusters map[string]struct {
+				Floor int32 `json:"floor"`
+			} `json:"clusters"`
+		} `json:"observed"`
+	}
+	if err := json.Unmarshal([]byte(pl.asked), &asked); err != nil || asked.Observed.Clusters["b"].Floor != 3 {
+		t.Fatalf("planner asked on the state before the step (b's floor %d): %v", asked.Observed.Clusters["b"].Floor, err)
 	}
 }
