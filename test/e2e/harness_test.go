@@ -352,20 +352,6 @@ func (f *fleet) keda() {
 	f.r.keda(f.tr, "llm-remote", 0, 10, 3*time.Second)
 }
 
-// hub is the member leading the fleet now, and the other one.
-func (f *fleet) hub() (hub, other *memberProc) {
-	f.t.Helper()
-	var s *v1alpha1.FleetStatus
-	eventually(f.t, 30*time.Second, "a hub", func() bool { s = hubStatus(f.h, f.r); return s != nil })
-	for _, m := range []*memberProc{f.mh, f.mr} {
-		if s.Hub == m.identity {
-			return m, map[*memberProc]*memberProc{f.mh: f.mr, f.mr: f.mh}[m]
-		}
-	}
-	f.t.Fatalf("hub %s is not a member of this test", s.Hub)
-	return nil, nil
-}
-
 // records is this policy's decision records from both members' logs, in order per member.
 func (f *fleet) records() []core.Record {
 	var out []core.Record
