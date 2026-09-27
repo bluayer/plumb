@@ -324,6 +324,12 @@ func TestRising(t *testing.T) {
 	if Rising(shifted) {
 		t.Error("a traffic shift counted as rising load")
 	}
+	// b's report missing at the middle point, then back: no load came.
+	gap := trendOf(t0, 10, 10, 10)
+	delete(gap[1].Clusters, "b")
+	if Rising(gap) {
+		t.Error("a report coming back counted as rising load")
+	}
 	d1, d2 := 10.0, 20.0
 	demand := []TrendPoint{{Time: t0.Add(-time.Minute), Clusters: map[string]TrendValue{"a": {Demand: &d1}}},
 		{Time: t0, Clusters: map[string]TrendValue{"a": {Demand: &d2}}}}
@@ -413,5 +419,50 @@ func TestAdaptPreemptsWhenRising(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("state lacks %s: %s", want, b)
 		}
+	}
+}
+
+// A floor is raised on a member for another's shortage or to take traffic back, never
+// for its own growth: not on a member short itself, not on a home at its Steady share
+// while nothing is in trouble. On a home that lent traffic out, it is raised to take the
+// traffic back (tier -1, not a shortage while it waits, released last).
+func TestAdaptAddTargets(t *testing.T) {
+	add := func(cluster string, n int32) Candidate {
+		return Candidate{Actions: []Action{{Kind: ActionAdd, Cluster: cluster, Replicas: n}}}
+	}
+	in := adaptiveInput() // a short
+	in.Clusters[0].Report.StaticRoom = 4
+	if _, err := execute(in, add("a", 1)); err == nil || !strings.Contains(err.Error(), "short itself") {
+		t.Fatalf("add on the short member: %v", err)
+	}
+	calm := adaptiveInput()
+	calm.Clusters[0].Report.NeededReplicas, calm.Clusters[0].Report.ShortSince = 0, nil
+	calm.Clusters[0].Report.StaticRoom = 4
+	calm.Config.BurstStep, calm.Trend = 8, trendOf(t0, 10, 10, 14)
+	if _, err := execute(calm, add("a", 3)); err == nil || !strings.Contains(err.Error(), "its own traffic") {
+		t.Fatalf("add on home for its own growth: %v", err)
+	}
+	calm.Clusters[0].Weight, calm.Clusters[1].Weight = 70, 30 // a lent 30 points to b
+	cs, err := execute(calm, add("a", 2))
+	if err != nil || cs[0].Tier != TierReturn || shortBy(Cluster{Report: &v1alpha1.ClusterReport{NeededReplicas: 2, ReadyReplicas: 4}, Floor: 6, Added: 2, Tier: cs[0].Tier}) != 0 {
+		t.Fatalf("add on a home that lent traffic out: %v, tier %d", err, cs[0].Tier)
+	}
+}
+
+// Capacity the adaptive path adds in Recovering restarts the calm, so the rules do not
+// give it back before calmFor; the decision log shows the load that made it decide early.
+func TestAdaptAddRestartsCalm(t *testing.T) {
+	in := adaptiveInput()
+	in.Clusters[0].Report.NeededReplicas, in.Clusters[0].Report.ShortSince = 0, nil
+	in.Clusters[1].Floor, in.Clusters[1].Added = 2, 2
+	in.Phase, in.PhaseSince = v1alpha1.PhaseRecovering, t0.Add(-time.Hour)
+	in.Config.BurstStep, in.PlannerOnly, in.Trend = 8, true, trendOf(t0, 10, 10, 14)
+	in.Proposed = []Candidate{{Actions: []Action{{Kind: ActionAdd, Cluster: "b", Replicas: 3}}}}
+	res, rec := Adapt(in)
+	if rec.Executed != "p1" || !res.PhaseSince.Equal(t0) {
+		t.Fatalf("executed %s, calm since %s", rec.Executed, res.PhaseSince)
+	}
+	if !rec.LoadRising || len(rec.Load) != 2 || rec.Load[1] <= rec.Load[0] {
+		t.Fatalf("load in the record: %v rising %t", rec.Load, rec.LoadRising)
 	}
 }

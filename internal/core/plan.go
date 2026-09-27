@@ -512,7 +512,8 @@ func hasShortage(cs []Cluster) bool {
 
 // shortBy is what a member still misses: its report, less the replicas the hub raised there
 // for traffic coming back that are not ready yet. Those wait for a node by design; they
-// are not a shortage.
+// are not a shortage. (Replicas raised for another member count until they are ready or
+// taken back: calling them no shortage would give their floor back before they ever ran.)
 func shortBy(c Cluster) int32 {
 	if c.Report == nil {
 		return 0

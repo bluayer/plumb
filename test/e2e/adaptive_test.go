@@ -169,3 +169,65 @@ func TestAdaptivePlannerAndJev(t *testing.T) {
 		t.Error("planner never called")
 	}
 }
+
+// earlyPlanner asks for 3 replicas on remote once the load is climbing, and holds
+// otherwise.
+type earlyPlanner struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *earlyPlanner) Propose(_ context.Context, _, request string, _ map[string]any) (json.RawMessage, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if strings.Contains(request, `"loadRising":true`) {
+		return json.RawMessage(`{"plans": [{"actions": [{"kind": "add", "cluster": "remote", "replicas": 3}], "hypothesis": "load climbing"}]}`), nil
+	}
+	return json.RawMessage(`{"plans": [{"actions": [], "hypothesis": "nothing to do"}]}`), nil
+}
+
+// The adaptive path acts on a climbing load before anyone is short: the hub's trend of
+// the members' reports shows the load rising, the planner is asked, and its plan puts 3
+// replicas on remote at once (burst.step 4, capacity.step 1). Traffic stays: nobody is
+// short. Once the load stops climbing, the capacity goes back at the rules' pace.
+func TestAdaptiveEarlyCapacity(t *testing.T) {
+	f := newFleet(t, 4, 6, 2, 10, 10) // home serves up to 40, carries 10 on 2 replicas
+	spec := f.spec()
+	spec.Capacity.Step = 1
+	spec.Escalation.CalmFor = seconds(5)
+	spec.Experimental = &v1alpha1.Experimental{Adaptive: &v1alpha1.Adaptive{Intent: "Get ahead of load that climbs.",
+		Mode: v1alpha1.AdaptiveApply, Chooser: v1alpha1.ChooserPlanner, Burst: &v1alpha1.Burst{Step: 4}}}
+	planner := &earlyPlanner{}
+	f.start(spec, func(o *controller.Options) {
+		o.Planner, o.PlannerInterval, o.PlannerTimeout = planner, time.Second, 5*time.Second
+	})
+	f.keda()
+	// A trend point needs a minute behind it before a rise can show.
+	time.Sleep(70 * time.Second)
+	if n := intent(f.r); n != 0 {
+		t.Fatalf("capacity added on a flat load: %d", n)
+	}
+	f.tr.demand.Store(18) // +80%, still within home's 4 GPUs
+	eventually(t, 60*time.Second, "early capacity on remote", func() bool { return intent(f.r) == 3 })
+	if w := f.h.routeWeights("llm"); w["remote"] != 0 {
+		t.Fatalf("traffic moved ahead of a shortage: %v", w)
+	}
+	var rec *core.Record
+	for _, d := range f.records() {
+		if d.Adaptive != nil && d.Adaptive.Executed == "p1" && d.Adaptive.LoadRising {
+			rec = &d
+		}
+	}
+	if rec == nil || len(rec.Adaptive.Load) != 2 || rec.Adaptive.Load[1] <= rec.Adaptive.Load[0] {
+		t.Fatalf("the decision log does not show the climbing load: %+v", rec)
+	}
+	eventually(t, 90*time.Second, "the early capacity given back", func() bool { return intent(f.r) == 0 })
+	for _, d := range f.records() {
+		for i, b := range d.Before {
+			if a := d.After[i]; b.Name == "remote" && b.Floor-a.Floor > 1 {
+				t.Fatalf("gave back %d at once, capacity.step is 1: %s", b.Floor-a.Floor, d.Message)
+			}
+		}
+	}
+}

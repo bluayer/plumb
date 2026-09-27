@@ -132,7 +132,7 @@ func (h *Hub) Lead(ctx context.Context) {
 		return // lost again while the previous term was finishing
 	}
 	log.FromContext(ctx).Info("leading the fleet", "identity", h.Identity)
-	h.floorsWritten, h.since = map[string]time.Time{}, time.Now()
+	h.floorsWritten, h.since, h.trends = map[string]time.Time{}, time.Now(), map[string][]core.TrendPoint{}
 	h.planning.mu.Lock()
 	h.planning.ctx, h.planning.proposals = ctx, map[string]proposal{}
 	h.planning.mu.Unlock()
@@ -146,6 +146,13 @@ func (h *Hub) Lead(ctx context.Context) {
 		list := &v1alpha1.AdaptivePolicyList{}
 		if err := h.Client.List(ctx, list); err != nil {
 			log.FromContext(ctx).Error(err, "listing policies")
+		} else {
+			// Forget the trends of policies that are gone.
+			for key := range h.trends {
+				if !slices.ContainsFunc(list.Items, func(p v1alpha1.AdaptivePolicy) bool { return client.ObjectKeyFromObject(&p).String() == key }) {
+					delete(h.trends, key)
+				}
+			}
 		}
 		for i := range list.Items {
 			p := &list.Items[i]

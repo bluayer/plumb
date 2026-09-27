@@ -651,9 +651,14 @@ func simAdaptive() func(in Input, _ []float64) Result {
 			trend = append(trend, p)
 		}
 		ain := AdaptiveInput{Input: in, PlannerOnly: true, Trend: slices.Clone(trend)}
-		demand := load(trend[len(trend)-1])
-		if Rising(ain.Trend) && len(trend) >= 2 {
-			demand += 2 * (demand - load(trend[len(trend)-2]))
+		demand := 0.0
+		for _, v := range p.Clusters {
+			if v.Pressure != nil {
+				demand += *v.Pressure * float64(v.Ready)
+			}
+		}
+		if then, now, ok := loads(ain.Trend); ok && Rising(ain.Trend) {
+			demand += 2 * (now - then)
 		}
 		need := int32(math.Ceil(demand / simPer))
 		for _, c := range in.Clusters {
