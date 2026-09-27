@@ -806,6 +806,10 @@ func prepareReturn(cs []Cluster, cfg Config, in Input) string {
 		return ""
 	case r.Added > 0 && r.Report.ReadyReplicas < r.Floor:
 		return "" // still waiting for the replicas already raised
+	case r.Report.PendingReplicas > 0:
+		// Replicas its HPA still holds without a node are not a shortage, but not capacity
+		// either: a floor on top of them would wait for them too.
+		return ""
 	}
 	limit := returnLimit(cfg, d, r)
 	if limit <= 0 {
