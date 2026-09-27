@@ -55,10 +55,13 @@ type Config struct {
 	ReadyTimeout                         time.Duration // 0: added replicas are not followed
 	Step                                 int32
 	StepPercent                          int32 // 0: traffic is not managed
-	Confidence                           float64
-	ReplicaCapacity                      float64 // default capacity of one replica
-	LatencySLO, ErrorRateSLO             float64 // 0: none
-	StaticFirst                          bool    // placement: other clusters' static before own dynamic
+	// BurstStep and BurstStepPercent raise Step and StepPercent on the adaptive path while
+	// growing (a member short or over its SLO, or load climbing); 0: no raise.
+	BurstStep, BurstStepPercent int32
+	Confidence                  float64
+	ReplicaCapacity             float64 // default capacity of one replica
+	LatencySLO, ErrorRateSLO    float64 // 0: none
+	StaticFirst                 bool    // placement: other clusters' static before own dynamic
 }
 
 // BalanceMargin is how much busier the busiest cluster must be than the least busy one
@@ -695,7 +698,10 @@ func balance(cs []Cluster, cfg Config, lastStep time.Time) string {
 		return ""
 	}
 	n := min(cfg.StepPercent, cs[donor].Weight-cs[donor].Spec.MinWeight, cs[receiver].Spec.MaxWeight-cs[receiver].Weight)
-	if overshoots(cs[donor], cs[receiver], n) {
+	if even, ok := evenShare(cs[donor], cs[receiver], cfg); ok {
+		n = min(n, even)
+	}
+	if n <= 0 {
 		return ""
 	}
 	cs[donor].Weight -= n
@@ -704,14 +710,15 @@ func balance(cs []Cluster, cfg Config, lastStep time.Time) string {
 		cs[receiver].Spec.Name, cs[receiver].Weight-n, cs[receiver].Weight, fmtLoad(d), fmtLoad(r))
 }
 
-// overshoots reports whether moving n percent from a donor over its SLO because of its
-// load (busier than the receiver) would leave the receiver busier than the donor: both
-// are out of room, and the move would only bounce back next step. A donor over its SLO
-// while less busy, with no ready replicas, or with no pressure reading gives way anyway.
-func overshoots(donor, receiver Cluster, n int32) bool {
+// evenShare is the most percent a donor can give without leaving the receiver busier
+// than itself: both would be out of room, and more would only bounce back next step (0
+// when the donor is not the busier one). ok is false when there is no such bound: the
+// donor has no ready replicas or no pressure reading, or it is over its SLO while less
+// busy (not for its load: errors, say), and gives way anyway.
+func evenShare(donor, receiver Cluster, cfg Config) (int32, bool) {
 	d, r := donor.Report, receiver.Report
 	if d.Pressure == nil || d.ReadyReplicas == 0 || donor.Weight == 0 || r.ReadyReplicas == 0 {
-		return false
+		return 0, false
 	}
 	pd := d.Pressure.AsApproximateFloat64()
 	var pr float64
@@ -719,11 +726,14 @@ func overshoots(donor, receiver Cluster, n int32) bool {
 		pr = r.Pressure.AsApproximateFloat64()
 	}
 	if pd <= pr {
-		return false
+		return 0, !violates(donor, cfg)
 	}
-	perPercent := pd * float64(d.ReadyReplicas) / float64(donor.Weight) // load one percent carries
-	after := pr + float64(n)*perPercent/float64(r.ReadyReplicas)
-	return after > pd*float64(donor.Weight-n)/float64(donor.Weight)
+	// Moving n percent takes n*pd/weight off each donor replica's share and adds
+	// n*pd*readyD/(weight*readyR) to each receiver replica's: even at
+	// n = (pd-pr) / (pd/weight * (1 + readyD/readyR)).
+	w := float64(donor.Weight)
+	n := (pd - pr) / (pd / w * (1 + float64(d.ReadyReplicas)/float64(r.ReadyReplicas)))
+	return int32(math.Floor(n + 1e-9)), true
 }
 
 func fmtLoad(v float64) string {
@@ -880,7 +890,8 @@ func canReturn(cs []Cluster, cfg Config, d, r Cluster, n int32, lastStep time.Ti
 	}
 	after := (loadOf(r) + loadOf(d)*float64(n)/float64(d.Weight)) / float64(keep)
 	limit := returnLimit(cfg, d, r)
-	if limit < 0 || after > limit {
+	// Pressures are milli-quantities: reaching the limit exactly is within it.
+	if limit < 0 || after > limit*(1+1e-9) {
 		return "", fmt.Errorf("%s would reach pressure %s, above what a replica has served safely (%s)", r.Spec.Name, fmtLoad(after), fmtLoad(max(limit, 0)))
 	}
 	return fmt.Sprintf(" (%s pressure about %s, served safely up to %s)", r.Spec.Name, fmtLoad(after), fmtLoad(limit)), nil

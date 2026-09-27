@@ -462,8 +462,9 @@ func TestPlanRegionWithLaunchFailures(t *testing.T) {
 	}
 }
 
-// When both clusters are out of room, traffic does not move from the one over its SLO
-// to one that would then be as busy: it would only bounce back.
+// When both clusters are out of room, traffic moves from the one over its SLO only up to
+// where both are even, never so far that the receiver ends up busier: that would only
+// bounce back. With room on the receiver, a full step moves.
 func TestPlanNoOvershoot(t *testing.T) {
 	conf := cfg
 	conf.LatencySLO = 2
@@ -473,8 +474,9 @@ func TestPlanNoOvershoot(t *testing.T) {
 	home.Weight, remote.Weight, remote.Floor, remote.Added = 40, 60, 2, 2
 	remote.Report.Latency = &slow
 	in := Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0, Clusters: []Cluster{home, remote}}
-	if res := Plan(in); strings.Contains(res.Action, "shift_traffic") {
-		t.Fatalf("moved traffic onto a cluster that would be as busy: %s", res.Message)
+	// remote 10.5 on 2 replicas at 60%, home 9 on 1 at 40%: even after 2 points.
+	if res := Plan(in); res.Plans[0].Weight != 42 {
+		t.Fatalf("moved past the even point: %+v %s", res.Plans, res.Message)
 	}
 	in.Clusters[0] = withPressure(in.Clusters[0], "4") // home has room: remote gives
 	if res := Plan(in); res.Plans[0].Weight != 50 {

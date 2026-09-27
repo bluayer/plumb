@@ -189,6 +189,9 @@ spec:
       intent: Interactive service. Protect TTFT first; reduce cost when there is slack.
       chooser: jev   # or planner: the planner's one plan, without Jev
       mode: shadow   # the default; apply carries out the pick (needs model.mode=apply on the agents)
+      burst:         # optional: grow faster than the rules while short or while the load climbs
+        step: 6
+        stepPercent: 30
   signals:
     metrics:
       - {name: ttft_p95, unit: seconds, meaning: time to first token p95, window: 2m,

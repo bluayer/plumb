@@ -38,8 +38,8 @@ model:
 # plans, Plumb validates them, and the model above (Jev) picks one; a policy with
 # adaptive.chooser=planner has the planner propose one plan, carried out once validated,
 # without Jev. Without the models a policy needs, it follows the rules. Called in the
-# background, at most once per interval per policy, only while a member is short or the
-# fleet is not Steady. Each policy is recorded only (adaptive.mode=shadow, its default) or
+# background, at most once per interval per policy, only while a member is short, the
+# fleet is not Steady, or its load is climbing. Each policy is recorded only (adaptive.mode=shadow, its default) or
 # carried out (adaptive.mode=apply); model.mode=shadow keeps every policy recorded only.
 #   provider    "" (none, default), bedrock (Amazon Bedrock Converse; credentials from IRSA
 #               or EKS Pod Identity), or openai (OpenAI-compatible /v1/chat/completions)

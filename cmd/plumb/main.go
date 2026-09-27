@@ -191,7 +191,7 @@ func runAgent(ctx context.Context, args []string) error {
 	plannerRegion := fs.String("planner-region", "", "planner region; empty: the provider's default (for Bedrock, the AWS SDK's)")
 	plannerEndpoint := fs.String("planner-endpoint", "", "planner endpoint: Bedrock override or OpenAI-compatible base URL ending in /v1")
 	plannerResponseFormat := fs.String("planner-response-format", "", "OpenAI-compatible planner response format: text (default) or json_schema")
-	plannerInterval := fs.Duration("planner-interval", 2*time.Minute, "at most one planner call per policy per interval, only while a member is short or the fleet is not Steady")
+	plannerInterval := fs.Duration("planner-interval", 2*time.Minute, "at most one planner call per policy per interval, only while a member is short, the fleet is not Steady, or its load is climbing")
 	plannerTimeout := fs.Duration("planner-timeout", time.Minute, "per-call planner timeout; the call runs in the background")
 	interval := fs.Duration("interval", 30*time.Second, "member report interval")
 	hubInterval := fs.Duration("hub-interval", 10*time.Second, "hub planning interval")

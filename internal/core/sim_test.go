@@ -64,6 +64,9 @@ type simScenario struct {
 	demand   func(time.Duration) float64
 	length   time.Duration
 	check    func(t *testing.T, run *simRun)
+	// conf adjusts the limits; decide replaces Plan (demand is every step's so far).
+	conf   func(*Config)
+	decide func(in Input, demand []float64) Result
 }
 
 // simState is one step, after the hub decided.
@@ -76,6 +79,7 @@ type simState struct {
 	added, ready   []int32
 	want, launched []int32
 	short          bool
+	slow           float64 // share of the demand served over the latency objective
 }
 
 type simRun struct {
@@ -123,6 +127,14 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 	conf := Config{After: 120 * time.Second, EarlyAfter: 30 * time.Second, CalmFor: 120 * time.Second,
 		Cooldown: 15 * time.Second, Step: 1, StepPercent: 10, ReplicaCapacity: simPer, LatencySLO: simSLO,
 		Confidence: 0.9, ReadyTimeout: 10 * time.Minute}
+	if sc.conf != nil {
+		sc.conf(&conf)
+	}
+	decide := sc.decide
+	if decide == nil {
+		decide = func(in Input, _ []float64) Result { return Plan(in) }
+	}
+	var demands []float64
 	n := len(sc.clusters)
 	cs := make([]Cluster, n)
 	sides := make([]*simSide, n)
@@ -164,6 +176,8 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 	for at := time.Duration(0); at < length; at += simTick {
 		now := t0.Add(at)
 		demand := sc.demand(at)
+		demands = append(demands, demand)
+		slow := 0.0
 		for i, s := range sides {
 			c := sc.clusters[i]
 			load := demand * float64(cs[i].Weight) / 100
@@ -204,6 +218,9 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 				lat = 30
 			}
 			latency = resource.NewMilliQuantity(int64(lat*1000), resource.DecimalSI)
+			if lat > simSLO {
+				slow += load
+			}
 			need := Needed(s.want, pending, -1, lat > simSLO, conf.Step)
 			if need == 0 {
 				s.short = nil
@@ -219,8 +236,11 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 				Pressure: pressure, Latency: latency, SafePressure: s.safe}
 		}
 		in := Input{Now: now, Config: conf, Clusters: slices.Clone(cs), Phase: phase, PhaseSince: since, LastStep: last}
-		res := Plan(in)
+		res := decide(in, demands)
 		st := simState{at: at, phase: res.Phase, action: res.Action, message: res.Message, demand: demand, short: hasShortage(in.Clusters)}
+		if demand > 0 {
+			st.slow = slow / demand
+		}
 		for i, p := range res.Plans {
 			st.weight = append(st.weight, p.Weight)
 			st.floor = append(st.floor, p.Floor)
@@ -235,6 +255,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 		}
 		// Giving back and borrowing again with demand unchanged in between is a flap. (A dip
 		// lets KEDA scale home in; borrowing when it comes back is a new shortage.)
+		maxSinceRelease, minSinceRelease = max(maxSinceRelease, demand), min(minSinceRelease, demand)
 		if strings.Contains(res.Action, "add_capacity") && releasedAt >= 0 && maxSinceRelease <= releasedDemand && minSinceRelease >= releasedDemand &&
 			!strings.Contains(res.Message, "to take traffic back") {
 			t.Fatalf("%s at %s: borrowed again after giving back at %s, demand not higher since\n%s", sc.name, at, releasedAt, run.trace(20))
@@ -308,14 +329,18 @@ func invariants(conf Config, in Input, res Result, prevPhase string) error {
 		switch {
 		case p.Floor > c.Spec.MaxReplicas:
 			return fmt.Errorf("%s: floor %d above maxReplicas %d", c.Spec.Name, p.Floor, c.Spec.MaxReplicas)
-		case p.Added-c.Added > conf.Step:
-			return fmt.Errorf("%s: added %d in one step, step is %d", c.Spec.Name, p.Added-c.Added, conf.Step)
+		case p.Added-c.Added > max(conf.Step, conf.BurstStep):
+			return fmt.Errorf("%s: added %d in one step, step is %d", c.Spec.Name, p.Added-c.Added, max(conf.Step, conf.BurstStep))
+		case c.Added-p.Added > conf.Step && !reclaimed:
+			return fmt.Errorf("%s: released %d in one step, step is %d", c.Spec.Name, c.Added-p.Added, conf.Step)
 		case p.Added > c.Added && p.Added-c.Added > c.Report.StaticRoom+dynamicRoom(c):
 			return fmt.Errorf("%s: added %d with room for %d", c.Spec.Name, p.Added-c.Added, c.Report.StaticRoom+dynamicRoom(c))
 		case p.Weight < c.Spec.MinWeight || p.Weight > c.Spec.MaxWeight:
 			return fmt.Errorf("%s: weight %d outside [%d, %d]", c.Spec.Name, p.Weight, c.Spec.MinWeight, c.Spec.MaxWeight)
-		case abs(p.Weight-c.Weight) > conf.StepPercent:
-			return fmt.Errorf("%s: weight moved %d→%d, stepPercent is %d", c.Spec.Name, c.Weight, p.Weight, conf.StepPercent)
+		case abs(p.Weight-c.Weight) > max(conf.StepPercent, conf.BurstStepPercent):
+			return fmt.Errorf("%s: weight moved %d→%d, stepPercent is %d", c.Spec.Name, c.Weight, p.Weight, max(conf.StepPercent, conf.BurstStepPercent))
+		case p.Weight > c.Weight && !troubled && p.Weight-c.Weight > conf.StepPercent:
+			return fmt.Errorf("%s: traffic came back %d points in one step, stepPercent is %d", c.Spec.Name, p.Weight-c.Weight, conf.StepPercent)
 		case p.Floor < c.Floor && hasShortage(in.Clusters) && !reclaimed:
 			return fmt.Errorf("%s: floor released %d→%d while a member is short", c.Spec.Name, c.Floor, p.Floor)
 		case p.Weight > c.Weight && violates(c, conf):
@@ -327,7 +352,9 @@ func invariants(conf Config, in Input, res Result, prevPhase string) error {
 	if sum != 100 {
 		return fmt.Errorf("weights sum to %d", sum)
 	}
-	if cmpOr(prevPhase) == v1alpha1.PhaseSteady && res.Phase == v1alpha1.PhaseRecovering {
+	// Only capacity added ahead of a shortage (the adaptive path, while the load climbs)
+	// takes Steady straight to Recovering, so that it is given back.
+	if cmpOr(prevPhase) == v1alpha1.PhaseSteady && res.Phase == v1alpha1.PhaseRecovering && !strings.Contains(res.Action, "add_capacity") {
 		return fmt.Errorf("Steady went to Recovering without escalating")
 	}
 	return nil
@@ -568,10 +595,15 @@ func TestSimulations(t *testing.T) {
 }
 
 // Random fleets and demand, seeded: only the invariants and the flap check, over many
-// shapes nobody wrote down.
+// shapes nobody wrote down, on the rules and on the adaptive path.
 func TestSimulationsRandom(t *testing.T) {
 	for seed := range uint64(500) {
 		sc := randomScenario(seed)
+		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
+		// The same fleet on the adaptive path with a burst budget and a scripted planner.
+		sc = randomScenario(seed)
+		sc.name += " adaptive"
+		sc.conf, sc.decide = func(c *Config) { c.BurstStep, c.BurstStepPercent = 4, 25 }, simAdaptive()
 		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
 	}
 }
@@ -597,4 +629,133 @@ func randomScenario(seed uint64) simScenario {
 		changes = append(changes, time.Duration(m)*time.Minute, float64(2+rng.IntN(35)))
 	}
 	return simScenario{name: fmt.Sprintf("seed %d", seed), clusters: clusters, demand: steps(float64(2+rng.IntN(20)), changes...), length: 2 * time.Hour}
+}
+
+// simAdaptive runs the adaptive path, planner only, with a scripted planner standing in
+// for the model: it sizes the fleet for its load (while the load climbs, for what the
+// last minute's growth would add over the next two), asks the members that have room for
+// the difference from what is ready or on its way, and moves traffic away from a member
+// in trouble. Every plan goes through Adapt's validation like a model's would.
+func simAdaptive() func(in Input, _ []float64) Result {
+	var trend []TrendPoint
+	return func(in Input, _ []float64) Result {
+		p := TrendPoint{Time: in.Now, Clusters: map[string]TrendValue{}}
+		for _, c := range in.Clusters {
+			if r := c.Report; r != nil {
+				p.Clusters[c.Spec.Name] = TrendValue{Pressure: float(r.Pressure), Latency: float(r.Latency), Ready: r.ReadyReplicas, Desired: r.DesiredReplicas, Weight: c.Weight}
+			}
+		}
+		if n := len(trend); n >= 2 && trend[n-1].Time.Sub(trend[n-2].Time) < time.Minute {
+			trend[n-1] = p
+		} else {
+			trend = append(trend, p)
+		}
+		ain := AdaptiveInput{Input: in, PlannerOnly: true, Trend: slices.Clone(trend)}
+		demand := load(trend[len(trend)-1])
+		if Rising(ain.Trend) && len(trend) >= 2 {
+			demand += 2 * (demand - load(trend[len(trend)-2]))
+		}
+		need := int32(math.Ceil(demand / simPer))
+		for _, c := range in.Clusters {
+			if c.Report != nil { // ready, and added but on its way
+				need -= c.Report.ReadyReplicas + max(min(c.Added, c.Floor-c.Report.ReadyReplicas), 0)
+			}
+		}
+		var acts []Action
+		for _, c := range in.Clusters {
+			if need <= 0 || c.Report == nil || shortBy(c) > 0 || violates(c, in.Config) || steadyWeight(c) > 0 {
+				continue // home grows by itself
+			}
+			n := min(need, max(in.Config.Step, in.Config.BurstStep), c.Report.StaticRoom+dynamicRoom(c), headroom(c))
+			if n > 0 {
+				acts = append(acts, Action{Kind: ActionAdd, Cluster: c.Spec.Name, Replicas: n})
+				need -= n
+			}
+		}
+		for _, d := range in.Clusters {
+			if d.Report == nil || d.Weight <= 0 || (shortBy(d) == 0 && !violates(d, in.Config)) {
+				continue
+			}
+			for _, r := range in.Clusters {
+				if r.Spec.Name == d.Spec.Name || r.Report == nil || r.Report.ReadyReplicas == 0 || violates(r, in.Config) || shortBy(r) > 0 {
+					continue
+				}
+				pct := min(shiftLimit(in.Config, d), d.Weight, r.Spec.MaxWeight-r.Weight)
+				if even, ok := evenShare(d, r, in.Config); ok {
+					pct = min(pct, even)
+				}
+				if pct > 0 {
+					acts = append(acts, Action{Kind: ActionShift, From: d.Spec.Name, To: r.Spec.Name, Percent: pct})
+				}
+				break
+			}
+			break
+		}
+		if len(acts) > 0 {
+			ain.Proposed = []Candidate{{Actions: acts}}
+		}
+		res, _ := Adapt(ain)
+		return res
+	}
+}
+
+// slowShare is the share of all requests served over the latency objective.
+func slowShare(r *simRun) float64 {
+	var slow, total float64
+	for _, s := range r.steps {
+		slow += s.slow * s.demand
+		total += s.demand
+	}
+	return slow / total
+}
+
+// With a burst budget, the adaptive path meets a jump or a ramp in demand with more
+// capacity sooner than the rules, and serves fewer requests over the objective; giving
+// back stays at the rules' pace (the invariants), so it takes longer for what it took
+// more of, but it all goes back; and a noisy load does not make it swing.
+func TestSimulationsAdaptiveBurst(t *testing.T) {
+	burst := func(c *Config) { c.BurstStep, c.BurstStepPercent = 4, 25 }
+	fleet := func() []simCluster {
+		return []simCluster{{name: "home", weight: 100, nodes: 2, min: 1, initReplica: 2}, {name: "remote", nodes: 10}}
+	}
+	ramp := func(t time.Duration) float64 {
+		switch {
+		case t < 10*time.Minute || t >= 45*time.Minute:
+			return 10
+		case t < 15*time.Minute:
+			return 10 + 50*float64(t-10*time.Minute)/float64(5*time.Minute)
+		}
+		return 60
+	}
+	for _, tc := range []struct {
+		name   string
+		demand func(time.Duration) float64
+		better float64 // the adaptive path's slow share is at most this share of the rules'
+	}{
+		{"jump 10→50", steps(10, 10*time.Minute, 50.0, 40*time.Minute, 10.0), 0.8},
+		{"ramp 10→60 in 5m", ramp, 0.7},
+	} {
+		rules := simulate(t, simScenario{name: tc.name + " rules", clusters: fleet(), demand: tc.demand, length: 100 * time.Minute})
+		adaptive := simulate(t, simScenario{name: tc.name + " adaptive", clusters: fleet(), demand: tc.demand, length: 100 * time.Minute, conf: burst, decide: simAdaptive()})
+		r, a := slowShare(rules), slowShare(adaptive)
+		t.Logf("%s: requests over the objective %.1f%% with the rules, %.1f%% adaptive", tc.name, 100*r, 100*a)
+		if a > r*tc.better {
+			t.Errorf("%s: adaptive %.3f, rules %.3f", tc.name, a, r)
+		}
+		if e := adaptive.end(); e.floor[1] != 0 || e.weight[0] != 100 {
+			t.Errorf("%s: adaptive did not give everything back: %+v", tc.name, e)
+		}
+	}
+	// A noisy load around home's capacity: no bounce (checked every step), no slower.
+	rng := rand.New(rand.NewPCG(3, 1))
+	var vals []float64
+	for range 40 {
+		vals = append(vals, 8+float64(rng.IntN(13)))
+	}
+	noise := func(t time.Duration) float64 { return vals[int(t/(2*time.Minute))%len(vals)] }
+	rules := simulate(t, simScenario{name: "noise rules", clusters: fleet(), demand: noise, length: time.Hour})
+	adaptive := simulate(t, simScenario{name: "noise adaptive", clusters: fleet(), demand: noise, length: time.Hour, conf: burst, decide: simAdaptive()})
+	if a, r := slowShare(adaptive), slowShare(rules); a > r+0.005 {
+		t.Errorf("noise: adaptive %.3f, rules %.3f", a, r)
+	}
 }

@@ -66,9 +66,10 @@ Experimental; its fields may change between releases. Each policy chooses on its
 |---|---|---|
 | `intent` | required | What matters for this workload and which trade-offs are acceptable, in plain words (up to 1,000 characters). Sent to both models |
 | `mode` | `shadow` | `shadow` records the adaptive pick in the decision log while the rules decide; `apply` carries it out. Agents run with `--model-mode=shadow` (Helm `model.mode`, the default) keep every policy in `shadow`, whatever it sets |
+| `burst.step`, `burst.stepPercent` | the rules' | Raised limits for growing, never for giving back: a plan may add up to `burst.step` replicas to a cluster while a member is short, over its SLO or the fleet's load is climbing, and move up to `burst.stepPercent` of traffic per step away from a member that is short or over its SLO (never past where both are equally busy). Releasing replicas and bringing traffic back keep `capacity.step`, `traffic.stepPercent` and `calmFor`. Below the rules' values, the rules' apply |
 | `chooser` | `jev` | `jev` picks among the planner's plans, the rules' plan and one-step changes; `planner` has the planner propose one plan, carried out once validated, without Jev ([planner only](architecture.md#the-adaptive-path)) |
 
-`maxReplicas`, `capacity.step`, `traffic.stepPercent`, `minWeight`/`maxWeight` and `escalation.cooldown` are enforced on every plan, whoever proposed it. To keep capacity or traffic out of a cluster, bound it there (`maxReplicas`, `maxWeight`). `placement` becomes a preference the models are told, not a fixed order.
+`maxReplicas`, `capacity.step` and `traffic.stepPercent` (or `burst` while growing), `minWeight`/`maxWeight` and `escalation.cooldown` are enforced on every plan, whoever proposed it. While the load is climbing, a plan may add capacity before any member is short (not move traffic); what it added goes back after `calmFor`, like any floor. To keep capacity or traffic out of a cluster, bound it there (`maxReplicas`, `maxWeight`). `placement` becomes a preference the models are told, not a fixed order.
 
 ### `spec.capacity`
 
@@ -130,7 +131,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `planner.region`, `planner.endpoint` | `""` | Region and endpoint override for Bedrock. `openai` requires an explicit `/v1` base URL; plain HTTP is allowed only for local or in-cluster hosts |
 | `planner.responseFormat` | `""` | For `openai`: `""`/`text` uses the common Chat Completions fields; `json_schema` requests schema-constrained output if the server supports it |
 | `planner.apiKeySecret.{name,key}` | `""`, `api-key` | Optional Bearer token for `openai`, exposed as `PLUMB_PLANNER_API_KEY`; in-cluster endpoints may omit it |
-| `planner.interval` | `2m` | At most one planner call per policy per interval, only while a member is short or the fleet is not Steady. Calls run in the background |
+| `planner.interval` | `2m` | At most one planner call per policy per interval, only while a member is short, the fleet is not Steady, or its load is climbing. Calls run in the background |
 | `planner.timeout` | `1m` | Per-call timeout |
 | `accessProviders` | `[]` | KEP-5339 providers used to reach other members |
 | `agent.replicas` | `2` | One is elected per cluster |

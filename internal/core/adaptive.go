@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	"github.com/bluayer/plumb/api/v1alpha1"
 )
 
@@ -122,6 +124,73 @@ type AdaptiveInput struct {
 	// PlannerOnly: the planner proposes one plan, carried out once validated; Jev is not
 	// asked.
 	PlannerOnly bool
+	// Trend is what the members reported over the last minutes, oldest first, one point a
+	// minute (the hub's memory: empty after a failover).
+	Trend []TrendPoint
+}
+
+// TrendPoint is the fleet at one time.
+type TrendPoint struct {
+	Time     time.Time
+	Clusters map[string]TrendValue
+}
+
+// TrendValue is one member's report at a trend point.
+type TrendValue struct {
+	Pressure, Latency, Demand *float64
+	Ready, Desired            int32
+	Weight                    int32 // -1: traffic not managed
+}
+
+// RisingBy is how much the fleet's load must grow over about a minute or two to count as
+// climbing.
+const RisingBy = 1.25
+
+// Rising reports whether the fleet's load has grown by RisingBy or more between the
+// latest trend point and the newest one at least a minute before it (and at most three).
+// Load is the members' demand where every one reports it, else pressure times ready
+// replicas: moving traffic between members does not change it.
+func Rising(trend []TrendPoint) bool {
+	if len(trend) < 2 {
+		return false
+	}
+	last := trend[len(trend)-1]
+	for i := len(trend) - 2; i >= 0; i-- {
+		age := last.Time.Sub(trend[i].Time)
+		if age < time.Minute {
+			continue
+		}
+		if age > 3*time.Minute {
+			return false
+		}
+		now, then := load(last), load(trend[i])
+		return then > 0 && now >= then*RisingBy
+	}
+	return false
+}
+
+func load(p TrendPoint) float64 {
+	demand, pressure, all := 0.0, 0.0, true
+	for _, v := range p.Clusters {
+		if v.Demand == nil {
+			all = false
+		} else {
+			demand += *v.Demand
+		}
+		if v.Pressure != nil {
+			pressure += *v.Pressure * float64(v.Ready)
+		}
+	}
+	if all && len(p.Clusters) > 0 {
+		return demand
+	}
+	return pressure
+}
+
+// Due reports whether the adaptive path has something to decide: a member short, the
+// fleet not Steady, or the load climbing (to act before a shortage).
+func Due(in AdaptiveInput, phase string) bool {
+	return Busy(in.Clusters, phase) || Rising(in.Trend)
 }
 
 // AdaptiveRecord is what the decision log keeps of an adaptive step.
@@ -166,7 +235,7 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	}
 	// Nothing to decide while no member is short and the fleet is Steady: the models are
 	// asked only when a decision is due, like the planner.
-	if !Busy(in.Clusters, rules.Phase) {
+	if !Due(in, rules.Phase) {
 		rec.Executed = SourceRules
 		return withReady(rules), rec
 	}
@@ -227,6 +296,11 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 		}
 	}
 	rec.Executed = run.ID
+	// The rules' plan runs as the rules made it: re-played as actions it would lose what
+	// the actions do not carry (a floor raised to take traffic back, tier -1).
+	if run.Source == SourceRules {
+		return withReady(rules), rec
+	}
 
 	cs, _ := execute(in, run)
 	res := Result{Phase: rules.Phase, PhaseSince: rules.PhaseSince, LastStep: in.LastStep, Source: run.Source, Message: run.String()}
@@ -250,6 +324,9 @@ func Adapt(in AdaptiveInput) (Result, AdaptiveRecord) {
 	// keep the fleet out of Steady whatever plan ran.
 	traffic := in.Config.StepPercent > 0 && !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight < 0 })
 	switch rest := atRest(cs, traffic); {
+	case res.Phase == v1alpha1.PhaseSteady && !rest && hasShortage(in.Clusters):
+		// Acting on a shortage before the rules would escalate.
+		res.Phase, res.PhaseSince = v1alpha1.PhaseEscalated, in.Now
 	case res.Phase == v1alpha1.PhaseSteady && !rest:
 		res.Phase, res.PhaseSince = v1alpha1.PhaseRecovering, in.Now
 		if in.Phase == v1alpha1.PhaseRecovering {
@@ -369,10 +446,17 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 	// weights, as the rules return it: once per CalmFor of calm, within what the receiver
 	// has served safely.
 	troubled := hasShortage(cs) || slices.ContainsFunc(cs, func(c Cluster) bool { return violates(c, cfg) })
+	// Growing (a member in trouble, or the load climbing) may use the burst limits; giving
+	// back never does.
+	addStep := cfg.Step
+	if troubled || Rising(in.Trend) {
+		addStep = max(cfg.Step, cfg.BurstStep)
+	}
 	calm := in.Phase == v1alpha1.PhaseRecovering && in.Now.Sub(in.PhaseSince) >= cfg.CalmFor &&
 		(in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.CalmFor)
 	traffic := cfg.StepPercent > 0 && !slices.ContainsFunc(cs, func(c Cluster) bool { return c.Weight < 0 })
 	added, released, moved, static := map[string]int32{}, map[string]int32{}, map[string]int32{}, map[string]int32{}
+	pair := map[[2]int]int32{} // traffic moved from one cluster to another
 	for _, a := range c.Actions {
 		switch a.Kind {
 		case ActionAdd:
@@ -388,8 +472,8 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: replicas added there never reached a node; skipped until %s", a, cs[i].SkippedUntil.Format(time.RFC3339))
 			case released[a.Cluster] > 0:
 				return nil, fmt.Errorf("%s: also released in this plan", a)
-			case a.Replicas < 1 || added[a.Cluster]+a.Replicas > cfg.Step:
-				return nil, fmt.Errorf("%s: more than step %d", a, cfg.Step)
+			case a.Replicas < 1 || added[a.Cluster]+a.Replicas > addStep:
+				return nil, fmt.Errorf("%s: more than step %d", a, addStep)
 			}
 			x := &cs[i]
 			if a.Replicas > headroom(*x) {
@@ -453,8 +537,8 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: %s is over its SLO", a, a.To)
 			case a.Percent < 1:
 				return nil, fmt.Errorf("%s: no traffic moved", a)
-			case moved[a.From]+a.Percent > cfg.StepPercent || moved[a.To]+a.Percent > cfg.StepPercent:
-				return nil, fmt.Errorf("%s: more than stepPercent %d for a cluster", a, cfg.StepPercent)
+			case moved[a.From]+a.Percent > shiftLimit(cfg, cs[f]) || moved[a.To]+a.Percent > shiftLimit(cfg, cs[f]):
+				return nil, fmt.Errorf("%s: more than stepPercent %d for a cluster", a, shiftLimit(cfg, cs[f]))
 			case cs[f].Weight-a.Percent < cs[f].Spec.MinWeight:
 				return nil, fmt.Errorf("%s: %s below minWeight %d", a, a.From, cs[f].Spec.MinWeight)
 			case cs[t].Weight+a.Percent > cs[t].Spec.MaxWeight:
@@ -463,6 +547,13 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 				return nil, fmt.Errorf("%s: no member is short or over its SLO, so traffic only comes back toward the Steady weights", a)
 			case !troubled && !calm:
 				return nil, fmt.Errorf("%s: traffic comes back at most once per calmFor of calm", a)
+			}
+			// Relief stops where both are even, as the rules' balancing does: further, the
+			// receiver is the busier one and the traffic would bounce back.
+			// Measured on the reports, before this plan moved anything.
+			pair[[2]int{f, t}] += a.Percent
+			if even, ok := evenShare(in.Clusters[f], in.Clusters[t], cfg); troubled && ok && pair[[2]int{f, t}] > even {
+				return nil, fmt.Errorf("%s: %s would end up busier than %s; %d points even them out", a, a.To, a.From, even)
 			}
 			if !troubled {
 				if _, err := canReturn(cs, cfg, cs[f], cs[t], a.Percent, in.LastStep); err != nil {
@@ -478,6 +569,16 @@ func execute(in AdaptiveInput, c Candidate) ([]Cluster, error) {
 		}
 	}
 	return cs, nil
+}
+
+// shiftLimit is how much traffic may move per cluster in one step away from donor: the
+// burst limit when the donor is short for its own traffic or over its SLO, else the rules'
+// stepPercent. Replicas the hub raised there and still waiting are not its shortage.
+func shiftLimit(cfg Config, donor Cluster) int32 {
+	if shortBy(donor) > 0 || violates(donor, cfg) {
+		return max(cfg.StepPercent, cfg.BurstStepPercent)
+	}
+	return cfg.StepPercent
 }
 
 // placementPreference tells the models what spec.placement means; with the adaptive path
@@ -558,6 +659,15 @@ func observed(in AdaptiveInput) map[string]any {
 		if r.DynamicUnbounded {
 			v["dynamicRoom"] = "unbounded"
 		}
+		for name, q := range map[string]*resource.Quantity{"pressure": r.Pressure, "latencySeconds": r.Latency, "errorRate": r.ErrorRate,
+			"demand": r.Demand, "safePressure": r.SafePressure} {
+			if q != nil {
+				v[name] = q.AsApproximateFloat64()
+			}
+		}
+		if in.Config.LatencySLO > 0 {
+			v["latencySLOSeconds"] = in.Config.LatencySLO
+		}
 		ms := map[string]any{}
 		for _, s := range r.Metrics {
 			age := in.Now.Sub(s.Time.Time).Round(time.Second)
@@ -588,10 +698,40 @@ func observed(in AdaptiveInput) map[string]any {
 		recent = append(recent, map[string]any{"minutesAgo": int(in.Now.Sub(d.Time.Time).Minutes()), "action": d.Action,
 			"message": d.Message, "applied": d.Applied, "readyAfterSeconds": d.ReadyAfterSeconds, "followedBy": d.FollowedBy})
 	}
-	out := map[string]any{"clusters": clusters, "limits": map[string]any{"step": in.Config.Step, "stepPercent": in.Config.StepPercent,
-		"cooldownSeconds": in.Config.Cooldown.Seconds()}}
+	limits := map[string]any{"step": in.Config.Step, "stepPercent": in.Config.StepPercent, "cooldownSeconds": in.Config.Cooldown.Seconds()}
+	if in.Config.BurstStep > in.Config.Step || in.Config.BurstStepPercent > in.Config.StepPercent {
+		limits["growth"] = map[string]any{"step": max(in.Config.Step, in.Config.BurstStep), "stepPercent": max(in.Config.StepPercent, in.Config.BurstStepPercent),
+			"when": "adding replicas while a member is short or over its SLO or loadRising is true; moving traffic away from a member that is short or over its SLO. " +
+				"Releasing replicas and bringing traffic back always use step and stepPercent, once per calm interval."}
+	}
+	out := map[string]any{"clusters": clusters, "limits": limits, "loadRising": Rising(in.Trend)}
+	if t := trendView(in); len(t) > 0 {
+		out["trend"] = t
+	}
 	if len(recent) > 0 {
 		out["recentDecisions"] = recent
+	}
+	return out
+}
+
+// trendView is the trend oldest first, per cluster, as the models see it.
+func trendView(in AdaptiveInput) []map[string]any {
+	var out []map[string]any
+	for _, p := range in.Trend {
+		cs := map[string]any{}
+		for name, v := range p.Clusters {
+			c := map[string]any{"readyReplicas": v.Ready, "desiredReplicas": v.Desired}
+			if v.Weight >= 0 {
+				c["trafficPercent"] = v.Weight
+			}
+			for k, x := range map[string]*float64{"pressure": v.Pressure, "latencySeconds": v.Latency, "demand": v.Demand} {
+				if x != nil {
+					c[k] = *x
+				}
+			}
+			cs[name] = c
+		}
+		out = append(out, map[string]any{"minutesAgo": int(in.Now.Sub(p.Time).Round(time.Minute).Minutes()), "clusters": cs})
 	}
 	return out
 }
