@@ -466,3 +466,49 @@ func TestAdaptAddRestartsCalm(t *testing.T) {
 		t.Fatalf("load in the record: %v rising %t", rec.Load, rec.LoadRising)
 	}
 }
+
+// A plan moves traffic only away from a member that cannot carry it, no further than its
+// missing replicas' share, and only to one that carries its own; any other move is
+// traffic coming back, with its checks.
+func TestAdaptShiftOnlyForRelief(t *testing.T) {
+	shift := func(from, to string, pct int32) Candidate {
+		return Candidate{Actions: []Action{{Kind: ActionShift, From: from, To: to, Percent: pct}}}
+	}
+	in := adaptiveInput() // a short 6 with 4 ready
+	in.Config.StepPercent = 100
+	in.Clusters[0].Weight, in.Clusters[2].Weight = 60, 40
+	if _, err := execute(in, shift("c", "b", 10)); err == nil || !strings.Contains(err.Error(), "carries its share") {
+		t.Fatalf("moved traffic away from a member that serves it: %v", err)
+	}
+	// a misses 6 of 10: 36 of its 60 points.
+	if _, err := execute(in, shift("a", "b", 37)); err == nil || !strings.Contains(err.Error(), "missing replicas") {
+		t.Fatalf("relief past the missing replicas' share: %v", err)
+	}
+	cs, err := execute(in, shift("a", "b", 36))
+	if err != nil || cs[1].GainedAt != t0 {
+		t.Fatalf("relief: %v %+v", err, cs[1])
+	}
+	in.Clusters[1] = short(in.Clusters[1], 1, 0)
+	if _, err := execute(in, shift("a", "b", 10)); err == nil || !strings.Contains(err.Error(), "either") {
+		t.Fatalf("relieved onto a member short itself: %v", err)
+	}
+}
+
+// A planner plan is relative to the floors and shares it was proposed for. From the AWS
+// run: "release 1" proposed at floor 2 was rejected while a member was short; the ready
+// wait then took the floor to 1, and the same plan would have taken it to 0.
+func TestAdaptDropsPlansForAnotherState(t *testing.T) {
+	in := adaptiveInput()
+	in.PlannerOnly = true
+	in.Clusters[1].Floor, in.Clusters[1].Added = 2, 2
+	base := StateKey(in.Clusters)
+	in.Clusters[1].Floor, in.Clusters[1].Added = 1, 1 // taken back meanwhile
+	in.Proposed = []Candidate{{Actions: []Action{{Kind: ActionRelease, Cluster: "b", Replicas: 1}}, Base: base}}
+	if _, rec := Adapt(in); !strings.Contains(rec.Rejected["p1"], "different") || rec.Executed == "p1" {
+		t.Fatalf("a plan for floor 2 offered at floor 1: executed %s, rejected %v", rec.Executed, rec.Rejected)
+	}
+	in.Proposed[0].Base = StateKey(in.Clusters) // judged on its merits: a is still short
+	if _, rec := Adapt(in); !strings.Contains(rec.Rejected["p1"], "shortage") {
+		t.Fatalf("a plan for this state: %v", rec.Rejected)
+	}
+}

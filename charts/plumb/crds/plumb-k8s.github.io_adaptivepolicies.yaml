@@ -201,16 +201,25 @@ spec:
                       After is how long a short cluster may keep trying to add nodes of its own before
                       the fleet steps in anyway.
                     type: string
+                    x-kubernetes-validations:
+                    - message: a duration such as 0s, 30s, 2m or 1h30m
+                      rule: duration(self) >= duration('0s')
                   calmFor:
                     default: 10m
                     description: CalmFor is how long no cluster may be short before
                       the hub starts giving back.
                     type: string
+                    x-kubernetes-validations:
+                    - message: a duration such as 0s, 30s, 2m or 1h30m
+                      rule: duration(self) >= duration('0s')
                   cooldown:
                     default: 1m
                     description: Cooldown is the minimum time between two hub steps
                       (capacity or traffic).
                     type: string
+                    x-kubernetes-validations:
+                    - message: a duration such as 0s, 30s, 2m or 1h30m
+                      rule: duration(self) >= duration('0s')
                   earlyAfter:
                     default: 30s
                     description: |-
@@ -219,6 +228,9 @@ spec:
                       launches keep failing), or, with StaticFirst, another cluster has idle static room
                       (then only that static room is used early).
                     type: string
+                    x-kubernetes-validations:
+                    - message: a duration such as 0s, 30s, 2m or 1h30m
+                      rule: duration(self) >= duration('0s')
                   readyTimeout:
                     default: 10m
                     description: |-
@@ -228,6 +240,9 @@ spec:
                       ReadyTimeout; replicas on a node but not ready (a model still loading) only raise a
                       warning. Outcomes are also followed at least this long.
                     type: string
+                    x-kubernetes-validations:
+                    - message: a duration such as 0s, 30s, 2m or 1h30m
+                      rule: duration(self) >= duration('0s')
                 type: object
               experimental:
                 description: Experimental features, off unless set.
@@ -361,6 +376,9 @@ spec:
                           description: 'MaxAge: a sample older than this is marked
                             stale for the models.'
                           type: string
+                          x-kubernetes-validations:
+                          - message: a duration such as 0s, 30s, 2m or 1h30m
+                            rule: duration(self) >= duration('0s')
                         meaning:
                           description: Meaning of the value in plain words, e.g. "time
                             to first token, p95".
@@ -382,6 +400,9 @@ spec:
                           description: Window is the range the query aggregates over,
                             e.g. its rate() window.
                           type: string
+                          x-kubernetes-validations:
+                          - message: a duration such as 0s, 30s, 2m or 1h30m
+                            rule: duration(self) >= duration('0s')
                       required:
                       - name
                       - query
@@ -550,6 +571,14 @@ spec:
                         floor:
                           format: int32
                           type: integer
+                        gainedAt:
+                          description: |-
+                            GainedAt is when this cluster last gained traffic: relief from a member that could
+                            not carry it, or traffic coming back. For calmFor after that it gives none away for
+                            its own shortage; only being over its SLO or without ready replicas moves traffic
+                            away from it.
+                          format: date-time
+                          type: string
                         name:
                           type: string
                         skippedUntil:

@@ -211,9 +211,9 @@ func withPressure(c Cluster, p string) Cluster {
 	return c
 }
 
-// With pressure reported, traffic moves from the busiest cluster to the least busy one,
-// one step at a time, and stops once they are within BalanceMargin; a cluster over its
-// SLO never receives and is drained first.
+// With pressure reported, traffic moves from a member that cannot carry it (short, over
+// its SLO) to the least busy one that can, one step at a time; a member that serves its
+// share keeps it, and one over its SLO never receives.
 func TestPlanBalancesPressure(t *testing.T) {
 	a := withPressure(short(member("a", 10, 0, 0, 100), 2, time.Hour), "8") // 8 waiting per replica
 	b := withPressure(member("b", 4, 0, 0, 0), "0")
@@ -224,11 +224,11 @@ func TestPlanBalancesPressure(t *testing.T) {
 		t.Fatalf("first step: %+v %s", res.Plans, res.Message)
 	}
 
-	// Balanced within the margin: nothing moves.
-	in.Clusters[0] = withPressure(in.Clusters[0], "5")
-	in.Clusters[1] = withPressure(in.Clusters[1], "4.5")
-	if res := Plan(in); strings.Contains(res.Action, "shift_traffic") {
-		t.Fatalf("moved inside the margin: %s", res.Message)
+	// a no longer short: however much busier than b, it keeps the traffic it serves.
+	busy := withPressure(member("a", 10, 0, 0, 100), "8")
+	other := short(member("c", 1, 0, 0, 0), 1, time.Hour) // the fleet is short elsewhere
+	if res := Plan(Input{Now: t0, Config: cfg, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0, Clusters: []Cluster{busy, in.Clusters[1], other}}); strings.Contains(res.Action, "shift_traffic") {
+		t.Fatalf("moved traffic from a member that serves it: %s", res.Message)
 	}
 
 	// b is less busy but over its latency SLO: it receives nothing; a over SLO gives.
@@ -285,8 +285,8 @@ func TestPlanDoesNotAddTwice(t *testing.T) {
 
 // Traffic moves only on reports observed after the previous step.
 func TestPlanBalancesOnFreshReportsOnly(t *testing.T) {
-	a := withPressure(short(member("a", 10, 0, 0, 75), 2, time.Hour), "0.5") // observed before the last shift
-	b := withPressure(member("b", 2, 0, 0, 25), "12")
+	a := withPressure(short(member("a", 10, 0, 0, 75), 2, time.Hour), "12") // observed before the last shift
+	b := withPressure(member("b", 2, 0, 0, 25), "0.5")
 	b.Floor = 2
 	a.Report.Time, b.Report.Time = metav1.Time{Time: t0.Add(-2 * time.Minute)}, metav1.Time{Time: t0}
 	in := Input{Now: t0, Config: cfg, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0.Add(-time.Hour),
@@ -300,7 +300,7 @@ func TestPlanBalancesOnFreshReportsOnly(t *testing.T) {
 		t.Fatalf("shifted on reports from the step's own second: %s", res.Message)
 	}
 	in.LastStep, in.Now = t0.Add(-time.Second), t0.Add(time.Minute) // a cooldown later
-	if res := Plan(in); !strings.Contains(res.Action, "shift_traffic") || res.Plans[1].Weight != 15 {
+	if res := Plan(in); !strings.Contains(res.Action, "shift_traffic") || res.Plans[1].Weight != 35 {
 		t.Fatalf("fresh reports: %+v %s", res.Plans, res.Message)
 	}
 }
@@ -474,11 +474,17 @@ func TestPlanNoOvershoot(t *testing.T) {
 	home.Weight, remote.Weight, remote.Floor, remote.Added = 40, 60, 2, 2
 	remote.Report.Latency = &slow
 	in := Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0, Clusters: []Cluster{home, remote}}
-	// remote 10.5 on 2 replicas at 60%, home 9 on 1 at 40%: even after 2 points.
+	// home is short too: moving traffic would only move the failure.
+	if res := Plan(in); res.Plans[0].Weight != 40 {
+		t.Fatalf("relieved remote onto a member short itself: %+v %s", res.Plans, res.Message)
+	}
+	// home no longer short and less busy: remote gives, no further than the even point
+	// (remote 10.5 on 2 replicas at 60%, home 9 on 1 at 40%: even after 2 points).
+	in.Clusters[0].Report.NeededReplicas, in.Clusters[0].Report.ShortSince = 0, nil
 	if res := Plan(in); res.Plans[0].Weight != 42 {
 		t.Fatalf("moved past the even point: %+v %s", res.Plans, res.Message)
 	}
-	in.Clusters[0] = withPressure(in.Clusters[0], "4") // home has room: remote gives
+	in.Clusters[0] = withPressure(in.Clusters[0], "4") // home has room: remote gives a step
 	if res := Plan(in); res.Plans[0].Weight != 50 {
 		t.Fatalf("a cluster over its SLO kept its traffic though home has room: %+v %s", res.Plans, res.Message)
 	}
@@ -514,5 +520,79 @@ func TestPlanRenewedShortageKeepsRelief(t *testing.T) {
 	res := Plan(Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseRecovering, PhaseSince: t0.Add(-time.Hour), Clusters: []Cluster{home, remote}})
 	if res.Plans[0].Weight > 40 {
 		t.Fatalf("traffic pulled back to a short cluster over its SLO: %+v %s", res.Plans, res.Message)
+	}
+}
+
+// From the AWS run (serving-ready, t=366s): both members serve within the objective,
+// home is not short, and its pressure is a hair above remote's idle one. The old
+// balancing moved 20 points on that; nothing moves.
+func TestPlanLeavesServingMembersAlone(t *testing.T) {
+	conf := cfg
+	conf.LatencySLO, conf.StepPercent = 2, 20
+	fast := resource.MustParse("0.059")
+	home := withPressure(member("home", 1, 0, 0, 60), "0.125")
+	remote := withPressure(member("remote", 1, 0, 0, 40), "0")
+	remote.Floor, remote.Added, remote.Tier = 2, 1, TierDynamic
+	remote.Report.DesiredReplicas, remote.Report.PendingReplicas = 2, 1
+	remote.Report.NeededReplicas = 1 // the replica the hub raised, not its own shortage
+	remote.Report.ShortSince = &metav1.Time{Time: t0.Add(-time.Minute)}
+	home.Report.Latency, remote.Report.Latency = &fast, &fast
+	in := Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0.Add(-5 * time.Minute), Clusters: []Cluster{home, remote}}
+	if res := Plan(in); strings.Contains(res.Action, "shift_traffic") {
+		t.Fatalf("moved traffic between members that serve it: %s", res.Message)
+	}
+}
+
+// A member short for its own traffic gives no more than its missing replicas would carry,
+// and a member that just gained traffic gives none of it back for its own shortage
+// within calmFor, unless it is over its SLO.
+func TestPlanReliefLimits(t *testing.T) {
+	conf := cfg
+	conf.LatencySLO, conf.StepPercent, conf.CalmFor = 2, 50, 2*time.Minute
+	home := withPressure(short(member("home", 3, 0, 0, 100), 1, time.Hour), "9")
+	remote := withPressure(member("remote", 4, 0, 0, 0), "0")
+	remote.Floor, remote.Added = 4, 4
+	in := Input{Now: t0, Config: conf, Phase: v1alpha1.PhaseEscalated, PhaseSince: t0, Clusters: []Cluster{home, remote}}
+	res := Plan(in)
+	if res.Plans[0].Weight != 75 || res.Plans[1].GainedAt == nil { // 1 missing of 4: a quarter
+		t.Fatalf("relief past the missing replicas' share: %+v %s", res.Plans, res.Message)
+	}
+
+	// remote took it 30s ago and is now short itself: it keeps it.
+	home = withPressure(member("home", 3, 0, 0, 75), "1")
+	remote = withPressure(short(member("remote", 4, 0, 0, 25), 1, 0), "9")
+	remote.Floor, remote.Added, remote.GainedAt = 4, 4, t0.Add(-30*time.Second)
+	in.Clusters = []Cluster{home, remote}
+	if res := Plan(in); strings.Contains(res.Action, "shift_traffic") {
+		t.Fatalf("gave back traffic just taken: %s", res.Message)
+	}
+	// Over its SLO it gives at once; past calmFor, short is enough.
+	slow := resource.MustParse("3")
+	in.Clusters[1].Report.Latency = &slow
+	if res := Plan(in); res.Plans[1].Weight >= 25 {
+		t.Fatalf("a member failing its users kept traffic it just took: %+v %s", res.Plans, res.Message)
+	}
+	in.Clusters[1].Report.Latency = nil
+	in.Now = t0.Add(3 * time.Minute)
+	in.Clusters[0].Report.Time, in.Clusters[1].Report.Time = metav1.Time{Time: in.Now}, metav1.Time{Time: in.Now}
+	if res := Plan(in); res.Plans[1].Weight >= 25 {
+		t.Fatalf("still kept after calmFor: %+v %s", res.Plans, res.Message)
+	}
+}
+
+// Traffic does not come back to a member with replicas waiting for a node: more traffic
+// makes them wanted (an HPA holding them lets go), and they have none.
+func TestReturnWaitsForPending(t *testing.T) {
+	home := withPressure(member("home", 2, 0, 0, 80), "1")
+	remote := withPressure(member("remote", 2, 0, 0, 20), "1")
+	home.Report.PendingReplicas = 1
+	safe := resource.MustParse("8")
+	home.Report.SafePressure = &safe
+	if _, err := canReturn([]Cluster{home, remote}, cfg, remote, home, 10, time.Time{}); err == nil {
+		t.Fatal("traffic came back to a member with a replica waiting for a node")
+	}
+	home.Report.PendingReplicas = 0
+	if _, err := canReturn([]Cluster{home, remote}, cfg, remote, home, 10, time.Time{}); err != nil {
+		t.Fatal(err)
 	}
 }

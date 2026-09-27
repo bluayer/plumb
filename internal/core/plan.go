@@ -64,10 +64,6 @@ type Config struct {
 	StaticFirst                 bool    // placement: other clusters' static before own dynamic
 }
 
-// BalanceMargin is how much busier the busiest cluster must be than the least busy one
-// before traffic moves between them, so shares do not flap around an even split.
-const BalanceMargin = 0.2
-
 // Cluster is one member as the hub sees it.
 type Cluster struct {
 	Spec   v1alpha1.ClusterSpec
@@ -81,6 +77,8 @@ type Cluster struct {
 	WaitingSince time.Time
 	// SkippedUntil: floors taken back here never reached a node; add none before then.
 	SkippedUntil time.Time
+	// GainedAt: it last gained traffic then (relief, or traffic coming back).
+	GainedAt time.Time
 }
 
 // PlanOf is c as the hub's plan for it; weight -1 when traffic is not managed.
@@ -94,6 +92,9 @@ func PlanOf(c Cluster, traffic bool) v1alpha1.ClusterPlan {
 	}
 	if !c.SkippedUntil.IsZero() {
 		p.SkippedUntil = &metav1.Time{Time: c.SkippedUntil}
+	}
+	if !c.GainedAt.IsZero() {
+		p.GainedAt = &metav1.Time{Time: c.GainedAt}
 	}
 	return p
 }
@@ -215,10 +216,10 @@ func Plan(in Input) Result {
 	switch {
 	case !traffic || res.Phase == v1alpha1.PhaseSteady || !due:
 	case res.Phase == v1alpha1.PhaseEscalated || slices.ContainsFunc(cs, func(c Cluster) bool { return violates(c, cfg) }):
-		moved = shiftTraffic(cs, cfg, escalated, in.LastStep)
+		moved = shiftTraffic(cs, cfg, escalated, in.LastStep, in.Now)
 	case calm:
 		if in.LastStep.IsZero() || in.Now.Sub(in.LastStep) >= cfg.CalmFor {
-			moved = returnTraffic(cs, cfg, in.LastStep)
+			moved = returnTraffic(cs, cfg, in.LastStep, in.Now)
 		}
 		if moved == "" {
 			if n := prepareReturn(cs, cfg, in); n != "" {
@@ -569,10 +570,10 @@ func releaseCapacity(cs []Cluster, step int32, hold map[string]bool, traffic boo
 // pressure; otherwise shares follow ready capacity. Either way a share moves at most
 // StepPercent per step, a cluster over its SLO never gains traffic, and members without a
 // report keep their share.
-func shiftTraffic(cs []Cluster, cfg Config, escalated bool, lastStep time.Time) string {
+func shiftTraffic(cs []Cluster, cfg Config, escalated bool, lastStep, now time.Time) string {
 	follow := escalated || slices.ContainsFunc(cs, func(c Cluster) bool { return c.Floor > 0 || over(c) != 0 })
 	if follow && pressured(cs) >= 2 {
-		return balance(cs, cfg, lastStep)
+		return balance(cs, cfg, lastStep, now)
 	}
 	target := map[string]float64{}
 	var fixed, total float64
@@ -659,32 +660,43 @@ func pressured(cs []Cluster) int {
 	return n
 }
 
-// balance moves up to StepPercent from the busiest cluster to the least busy one. A
-// cluster over its SLO, or with traffic but no ready replicas, counts as busiest; it
-// never receives. Nothing moves while the two are within BalanceMargin of each other, or
-// while either was last observed before the previous step: comparing a cluster that
-// already feels the last shift with one that does not yet would bounce traffic back.
-func balance(cs []Cluster, cfg Config, lastStep time.Time) string {
+// balance relieves a member that cannot carry its share (needsRelief): it moves up to
+// StepPercent from it to the least busy member that carries its own share and reports
+// pressure. A member short for its own traffic gives no more than the share its missing
+// replicas would carry (reliefShare), and no member gives past the point where the
+// receiver would be the busier one (evenShare). Members that serve their share keep it,
+// however much busier one is than another: moving traffic between them follows noise in
+// the signal, and moves it back the next step. Nothing moves while either was last
+// observed before the previous step: comparing a cluster that already feels the last
+// shift with one that does not yet would bounce traffic back.
+func balance(cs []Cluster, cfg Config, lastStep, now time.Time) string {
 	donor, receiver := -1, -1
 	load := func(c Cluster) float64 {
-		if violates(c, cfg) || c.Report.ReadyReplicas == 0 {
+		switch {
+		case violates(c, cfg) || c.Report.ReadyReplicas == 0:
 			return math.Inf(1)
+		case c.Report.Pressure == nil:
+			return 0
 		}
 		return c.Report.Pressure.AsApproximateFloat64()
 	}
 	for i, c := range cs {
-		if c.Report == nil || (c.Report.Pressure == nil && c.Report.ReadyReplicas > 0 && !violates(c, cfg)) {
-			continue // held: nothing known about how busy it is
-		}
-		l := load(c)
-		if c.Weight > c.Spec.MinWeight && (donor < 0 || l > load(cs[donor])) {
+		if needsRelief(c, cfg) && !keepsGained(c, cfg, now) && c.Weight > c.Spec.MinWeight && (donor < 0 || load(c) > load(cs[donor])) {
 			donor = i
 		}
-		if !math.IsInf(l, 1) && c.Weight < c.Spec.MaxWeight && (receiver < 0 || l < load(cs[receiver])) {
+	}
+	if donor < 0 {
+		return ""
+	}
+	// Only a member that carries its own share takes more: when every member is short or
+	// failing, moving traffic between them moves the failure, and capacity is the answer.
+	for i, c := range cs {
+		if i != donor && c.Report != nil && c.Report.Pressure != nil && c.Report.ReadyReplicas > 0 && !violates(c, cfg) && ownShort(c) == 0 &&
+			c.Weight < c.Spec.MaxWeight && (receiver < 0 || load(c) < load(cs[receiver])) {
 			receiver = i
 		}
 	}
-	if donor < 0 || receiver < 0 || donor == receiver {
+	if receiver < 0 {
 		return ""
 	}
 	for _, i := range []int{donor, receiver} {
@@ -694,19 +706,17 @@ func balance(cs []Cluster, cfg Config, lastStep time.Time) string {
 			return ""
 		}
 	}
-	d, r := load(cs[donor]), load(cs[receiver])
-	if !math.IsInf(d, 1) && d <= r*(1+BalanceMargin) {
-		return ""
-	}
-	n := min(cfg.StepPercent, cs[donor].Weight-cs[donor].Spec.MinWeight, cs[receiver].Spec.MaxWeight-cs[receiver].Weight)
+	n := min(cfg.StepPercent, reliefShare(cs[donor], cfg), cs[donor].Weight-cs[donor].Spec.MinWeight, cs[receiver].Spec.MaxWeight-cs[receiver].Weight)
 	if even, ok := evenShare(cs[donor], cs[receiver], cfg); ok {
 		n = min(n, even)
 	}
 	if n <= 0 {
 		return ""
 	}
+	d, r := load(cs[donor]), load(cs[receiver])
 	cs[donor].Weight -= n
 	cs[receiver].Weight += n
+	cs[receiver].GainedAt = now
 	return fmt.Sprintf("%s %d→%d%%, %s %d→%d%% (pressure %s vs %s)", cs[donor].Spec.Name, cs[donor].Weight+n, cs[donor].Weight,
 		cs[receiver].Spec.Name, cs[receiver].Weight-n, cs[receiver].Weight, fmtLoad(d), fmtLoad(r))
 }
@@ -857,7 +867,7 @@ func returnLimit(cfg Config, d, r Cluster) float64 {
 // returnTraffic moves one step of traffic back toward the Steady weights: from the
 // cluster furthest above its Steady weight (the tier taken last first, as floors are
 // released) to the one furthest below. Plan calls it at most once per CalmFor.
-func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
+func returnTraffic(cs []Cluster, cfg Config, lastStep, now time.Time) string {
 	donor, receiver := returnPair(cs)
 	if donor < 0 || receiver < 0 {
 		return ""
@@ -869,6 +879,7 @@ func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
 	}
 	cs[donor].Weight -= n
 	cs[receiver].Weight += n
+	cs[receiver].GainedAt = now
 	return fmt.Sprintf("%s %d→%d%%, %s %d→%d%% back%s", cs[donor].Spec.Name, cs[donor].Weight+n, cs[donor].Weight,
 		cs[receiver].Spec.Name, cs[receiver].Weight-n, cs[receiver].Weight, note)
 }
@@ -880,6 +891,10 @@ func returnTraffic(cs []Cluster, cfg Config, lastStep time.Time) string {
 // reports taken after the last step. Without pressure nothing tells, and a step at a time,
 // a CalmFor apart, is the only caution.
 func canReturn(cs []Cluster, cfg Config, d, r Cluster, n int32, lastStep time.Time) (string, error) {
+	if r.Report != nil && r.Report.PendingReplicas > 0 {
+		// Held by its HPA or not: more traffic makes them wanted, and they have no node.
+		return "", fmt.Errorf("%s has replicas waiting for a node", r.Spec.Name)
+	}
 	if pressured(cs) == 0 {
 		return "", nil
 	}
@@ -910,4 +925,39 @@ func atRest(cs []Cluster, traffic bool) bool {
 		}
 	}
 	return true
+}
+
+// needsRelief: the member cannot carry its share of traffic. It is over its SLO, has
+// traffic but no ready replicas, or is short for its own traffic.
+func needsRelief(c Cluster, cfg Config) bool {
+	r := c.Report
+	return r != nil && c.Weight > 0 && (violates(c, cfg) || r.ReadyReplicas == 0 || ownShort(c) > 0)
+}
+
+// keepsGained: c gained traffic less than CalmFor ago and can still serve it (within its
+// SLO, with ready replicas). It gives none of it away for its own shortage: at the edge
+// of two clusters' capacity, or on a noisy signal, the shortage would only follow the
+// traffic back and forth.
+func keepsGained(c Cluster, cfg Config, now time.Time) bool {
+	return !c.GainedAt.IsZero() && now.Sub(c.GainedAt) < cfg.CalmFor && !violates(c, cfg) && c.Report.ReadyReplicas > 0
+}
+
+// reliefShare is the most percent a member that needs relief gives away: all of it when
+// it is over its SLO or not ready, else the share its missing replicas would carry (short
+// by s with r ready: s/(r+s) of its traffic).
+func reliefShare(c Cluster, cfg Config) int32 {
+	r, s := c.Report.ReadyReplicas, ownShort(c)
+	if violates(c, cfg) || r == 0 || s == 0 {
+		return c.Weight
+	}
+	return int32(math.Ceil(float64(c.Weight) * float64(s) / float64(r+s)))
+}
+
+// ownShort is what a member misses for its own traffic: its shortage less the replicas
+// the hub raised there that are not ready yet, which are for traffic it does not carry yet.
+func ownShort(c Cluster) int32 {
+	if c.Report == nil {
+		return 0
+	}
+	return max(c.Report.NeededReplicas-max(min(c.Added, c.Floor-c.Report.ReadyReplicas), 0), 0)
 }

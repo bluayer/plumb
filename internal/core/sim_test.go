@@ -70,6 +70,9 @@ type simScenario struct {
 	// held: members do not count pending replicas while their HPA holds replicas the
 	// metrics no longer ask for (AbleToScale ScaleDownStabilized).
 	held bool
+	// noise: reported pressure is off by up to this share of the true one, either way, as
+	// a real queue-length signal sampled between bursts of requests is.
+	noise float64
 }
 
 // simState is one step, after the hub decided.
@@ -138,6 +141,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 		decide = func(in Input, _ []float64) Result { return Plan(in) }
 	}
 	var demands []float64
+	jitter := rand.New(rand.NewPCG(uint64(len(sc.name)), 11))
 	n := len(sc.clusters)
 	cs := make([]Cluster, n)
 	sides := make([]*simSide, n)
@@ -215,7 +219,8 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			lat := 0.5
 			if s.ready > 0 {
 				p := load / float64(s.ready)
-				pressure = resource.NewMilliQuantity(int64(p*1000), resource.DecimalSI)
+				seen := p * (1 + sc.noise*(2*jitter.Float64()-1))
+				pressure = resource.NewMilliQuantity(int64(seen*1000), resource.DecimalSI)
 				lat += max(0, p-simPer)
 			} else if load > 0 {
 				lat = 30
@@ -265,7 +270,10 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 		maxSinceRelease, minSinceRelease = max(maxSinceRelease, demand), min(minSinceRelease, demand)
 		if strings.Contains(res.Action, "add_capacity") && releasedAt >= 0 && maxSinceRelease <= releasedDemand && minSinceRelease >= releasedDemand &&
 			!strings.Contains(res.Message, "to take traffic back") {
-			t.Fatalf("%s at %s: borrowed again after giving back at %s, demand not higher since\n%s", sc.name, at, releasedAt, run.trace(20))
+			// A noisy signal can read as a new peak; the scripted planner follows it.
+			if sc.noise == 0 {
+				t.Fatalf("%s at %s: borrowed again after giving back at %s, demand not higher since\n%s", sc.name, at, releasedAt, run.trace(20))
+			}
 		}
 		// Traffic that goes back between the same two clusters within a minute, with
 		// demand and every cluster's ready replicas unchanged, bounces between clusters
@@ -284,6 +292,11 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 				for _, i := range lost {
 					for _, j := range gained {
 						if slices.Contains(moved.gained, i) && slices.Contains(moved.lost, j) {
+							// On a noisy signal, only a member failing its users gives back
+							// what it just took.
+							if sc.noise > 0 && (violates(in.Clusters[i], conf) || in.Clusters[i].Report.ReadyReplicas == 0) {
+								continue
+							}
 							t.Fatalf("%s at %s: traffic went %s→%s and back within %s\n%s", sc.name, at, sc.clusters[j].name, sc.clusters[i].name, at-moved.at, run.trace(10))
 						}
 					}
@@ -298,7 +311,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 		phase, since, last = res.Phase, res.PhaseSince, res.LastStep
 		for i, p := range res.Plans {
 			cs[i].Floor, cs[i].Added, cs[i].Tier, cs[i].Static, cs[i].Weight = p.Floor, p.Added, p.Tier, p.Static, p.Weight
-			cs[i].WaitingSince, cs[i].SkippedUntil = timeOf(p.WaitingSince), timeOf(p.SkippedUntil)
+			cs[i].WaitingSince, cs[i].SkippedUntil, cs[i].GainedAt = timeOf(p.WaitingSince), timeOf(p.SkippedUntil), timeOf(p.GainedAt)
 		}
 	}
 	return run
@@ -358,6 +371,24 @@ func invariants(conf Config, in Input, res Result, prevPhase string) error {
 	}
 	if sum != 100 {
 		return fmt.Errorf("weights sum to %d", sum)
+	}
+	// Traffic leaves a member only when it cannot carry it (over its SLO, not ready, short
+	// for its own traffic), or on its way back to the Steady weights from borrowed
+	// capacity to members that serve theirs.
+	for i, p := range res.Plans {
+		c := in.Clusters[i]
+		if p.Weight >= c.Weight || needsRelief(c, conf) {
+			continue
+		}
+		back := over(c) > 0
+		for j, q := range res.Plans {
+			if g := in.Clusters[j]; q.Weight > g.Weight && (over(g) >= 0 || needsRelief(g, conf)) {
+				back = false
+			}
+		}
+		if !back {
+			return fmt.Errorf("%s: traffic moved away from it while it served its share (%d→%d)", c.Spec.Name, c.Weight, p.Weight)
+		}
 	}
 	// Only capacity added ahead of a shortage (the adaptive path, while the load climbs)
 	// takes Steady straight to Recovering, so that it is given back.
@@ -614,9 +645,18 @@ func TestSimulationsRandom(t *testing.T) {
 		sc = randomScenario(seed)
 		sc.name, sc.held = sc.name+" held", true
 		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
+		// Pressure read with 30% noise either way: traffic still leaves only a member that
+		// cannot carry it, and comes back only from a failing one.
+		sc = randomScenario(seed)
+		sc.name, sc.noise = sc.name+" noisy", 0.3
+		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
 		// The same fleet on the adaptive path with a burst budget and a scripted planner.
 		sc = randomScenario(seed)
 		sc.name += " adaptive"
+		sc.conf, sc.decide = func(c *Config) { c.BurstStep, c.BurstStepPercent = 4, 25 }, simAdaptive()
+		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
+		sc = randomScenario(seed)
+		sc.name, sc.noise = sc.name+" adaptive noisy", 0.3
 		sc.conf, sc.decide = func(c *Config) { c.BurstStep, c.BurstStepPercent = 4, 25 }, simAdaptive()
 		t.Run(sc.name, func(t *testing.T) { simulate(t, sc) })
 	}

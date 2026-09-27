@@ -123,17 +123,19 @@ The clock lives in `status.fleet`, so a new hub picks it up. Shadow mode does no
 
 Traffic moves for two reasons only, and otherwise stays where it is: a split that serves well is left alone.
 
-**Relief**, while a member is short (Escalated) or any cluster is over its SLO. Once relief has moved shares off the Steady weights, relief never moves them back: that is the return's, with its checks.
+**Relief**, away from a member that cannot carry its traffic: one short for its own traffic (its autoscaler wants replicas it does not have, not counting ones the hub raised there for someone else that are not ready yet), over its SLO, or with traffic but no ready replicas. Two members that both serve their share keep it, however much busier one reads than the other: moving traffic between them only follows noise in the signal, and moves it back the next step.
 
-- **With `signals.pressure`** (e.g. waiting requests per replica, KV-cache usage), it balances pressure: each step moves up to `stepPercent` from the busiest cluster to the least busy one. Nothing moves while the two are within 20% of each other, or until both have reported after the previous shift. A step never moves past the point where both are equally busy: further, the receiver would be the busier one, and the traffic would bounce back. A cluster over its SLO while less busy than the receiver (from errors, say) still gives traffic. Ready replicas are only a prior; measured pressure corrects it, whatever the GPU type, request lengths or cache state.
-- **Without pressure**, each cluster's share is proportional to `readyReplicas × replicaCapacity`.
-- **Always:** a cluster over its `latencySLO` or `errorRateSLO` never gains traffic (in pressure mode it is drained first), and shares stay within `[minWeight, maxWeight]`.
+- **With `signals.pressure`** (e.g. waiting requests per replica, KV-cache usage), each step moves up to `stepPercent` from the member that needs relief (the busiest, if several) to the least busy member that carries its own share. A member only short gives no more than the share its missing replicas would carry (short by 2 with 6 ready: a quarter of its traffic). No step moves past the point where both are equally busy: further, the receiver would be the busier one. Both must have reported after the previous shift. When every member is short or failing, nothing moves: moving traffic would only move the failure, and capacity is the answer.
+- **Without pressure**, while floors are held, each cluster's share is proportional to `readyReplicas × replicaCapacity`: it changes only as replicas become ready.
+- **What a member gained, it keeps.** A member that gained traffic (relief, or traffic coming back) gives none of it away for its own shortage for `calmFor`: at the edge of two clusters' capacity, or on a noisy signal, the shortage would otherwise follow the traffic back and forth. Over its SLO or without ready replicas, it gives at once. The time is kept in `status.fleet.clusters[].gainedAt`.
+- **Always:** a cluster over its `latencySLO` or `errorRateSLO` never gains traffic, and shares stay within `[minWeight, maxWeight]`.
 
 **Return**, once no member has been short for `calmFor` (Recovering): traffic comes back toward the Steady `weight`s, never toward borrowed capacity.
 
 - One `stepPercent` step per `calmFor`, from the cluster furthest above its Steady weight (the tier taken last first) to the one furthest below.
 - With pressure, a step is taken only if the receiver's pressure afterwards stays within what a replica of the workload has been seen to serve without a shortage, with every replica its autoscaler wanted ready (a pressure seen while replicas were still loading is above where the autoscaler settles, and returning to it would make home short again). Only the receiver's ready replicas its autoscaler keeps count (not ones being scaled in). The limit is the receiver's own `status.report.safePressure` (the highest in the last day), or the donor's, converted by the clusters' `replicaCapacity`. Otherwise the split holds, and the borrowed capacity keeps serving. So if home can't take the traffic back, nothing moves back and forth.
 - Without pressure there is nothing to judge by: steps are simply a `calmFor` apart.
+- No step goes to a member with replicas waiting for a node (held by its HPA or not): more traffic makes them wanted, and they have no node.
 - A shortage stops the return at once.
 
 **Home first.** When the next step can't come back because the receiver's replicas would be too busy, but the receiver has room to grow (existing nodes or NodePool headroom), the hub raises its floor to the replicas that would carry all the borrowed traffic within that limit, `step` at a time. Its pending replicas are not counted as a shortage. Once they are ready, the return proceeds; if they never reach a node within `readyTimeout`, they are taken back and the borrowed capacity keeps serving. This needs pressure, which sizes the floor.
@@ -192,7 +194,7 @@ A hub that lost its lease may keep acting until its renew deadline passes. Plumb
 | Model down, slow or unsure | The rules decide in the same step. After 3 consecutive failures the model is skipped for a minute |
 | Planner down or slow (adaptive path) | Steps never wait for it: Jev picks among the rules' plan, holding and the one-step changes. The failure is logged as a `proposal` line |
 | Prometheus down | The report omits the metric signals and the `Ready` condition turns false. Unschedulable replicas still count. Without pressure, traffic follows ready capacity |
-| Metrics lag | Pressure balancing waits for reports taken after the last step. Set `cooldown` longer than the signal's lag (scrape interval plus query window) |
+| Metrics lag | Relief waits for reports taken after the last step. Set `cooldown` longer than the signal's lag (scrape interval plus query window) |
 | Policy copies differ | The hub ignores a member's report when the fields it is computed from differ from its own copy, and lists the member in `status.fleet.outOfSync` (metric `plumb_fleet_members_out_of_sync`, Event `MembersOutOfSync`) |
 | Two running fleets merged | Both hubs may act until one fails to renew (≤ 10s). Fencing voids the deposed hub's floors and route writes |
 

@@ -185,10 +185,12 @@ type Metric struct {
 	// +optional
 	Meaning string `json:"meaning,omitempty"`
 	// Window is the range the query aggregates over, e.g. its rate() window.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	Window *metav1.Duration `json:"window,omitempty"`
 	// MaxAge: a sample older than this is marked stale for the models.
 	// +kubebuilder:default="2m"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
 }
@@ -275,6 +277,7 @@ type EscalationPolicy struct {
 	// After is how long a short cluster may keep trying to add nodes of its own before
 	// the fleet steps in anyway.
 	// +kubebuilder:default="2m"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	After metav1.Duration `json:"after,omitempty"`
 	// EarlyAfter replaces After when waiting cannot help or is not wanted: the short
@@ -282,6 +285,7 @@ type EscalationPolicy struct {
 	// launches keep failing), or, with StaticFirst, another cluster has idle static room
 	// (then only that static room is used early).
 	// +kubebuilder:default="30s"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	EarlyAfter metav1.Duration `json:"earlyAfter,omitempty"`
 	// ReadyTimeout is how long replicas the hub adds in a cluster may take to become
@@ -290,14 +294,17 @@ type EscalationPolicy struct {
 	// ReadyTimeout; replicas on a node but not ready (a model still loading) only raise a
 	// warning. Outcomes are also followed at least this long.
 	// +kubebuilder:default="10m"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	ReadyTimeout metav1.Duration `json:"readyTimeout,omitempty"`
 	// CalmFor is how long no cluster may be short before the hub starts giving back.
 	// +kubebuilder:default="10m"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	CalmFor metav1.Duration `json:"calmFor,omitempty"`
 	// Cooldown is the minimum time between two hub steps (capacity or traffic).
 	// +kubebuilder:default="1m"
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
 	// +optional
 	Cooldown metav1.Duration `json:"cooldown,omitempty"`
 }
@@ -478,6 +485,12 @@ type ClusterPlan struct {
 	// here before then.
 	// +optional
 	SkippedUntil *metav1.Time `json:"skippedUntil,omitempty"`
+	// GainedAt is when this cluster last gained traffic: relief from a member that could
+	// not carry it, or traffic coming back. For calmFor after that it gives none away for
+	// its own shortage; only being over its SLO or without ready replicas moves traffic
+	// away from it.
+	// +optional
+	GainedAt *metav1.Time `json:"gainedAt,omitempty"`
 	// Weight is the traffic share in percent; -1 when traffic is not managed.
 	Weight int32 `json:"weight"`
 }
