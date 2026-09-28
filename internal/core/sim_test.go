@@ -215,6 +215,14 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 				s.ready, s.since = target, -1
 			}
 			pending := max(s.want-c.nodes-s.launched, 0)
+			// The member's pending replicas take up its pools' room first (nodes being
+			// launched count as used, as Karpenter counts them); while launches succeed,
+			// those replicas are arriving.
+			covered := min(pending, max(room, 0))
+			arriving := covered
+			if c.ice(at) >= RecurringLaunchFailures {
+				arriving = 0
+			}
 			var pressure, latency *resource.Quantity
 			lat := 0.5
 			if s.ready > 0 {
@@ -243,7 +251,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 				s.safe = pressure
 			}
 			cs[i].Report = &v1alpha1.ClusterReport{Time: metav1.Time{Time: now}, DesiredReplicas: s.want, ReadyReplicas: s.ready,
-				PendingReplicas: pending, StaticRoom: max(c.nodes+s.launched-s.want, 0), DynamicRoom: max(room, 0),
+				PendingReplicas: pending, ArrivingReplicas: arriving, StaticRoom: max(c.nodes+s.launched-s.want, 0), DynamicRoom: max(room-covered, 0),
 				RecentLaunchFailures: c.ice(at), Region: c.region, NeededReplicas: need, ShortSince: s.short,
 				Pressure: pressure, Latency: latency, SafePressure: s.safe}
 		}
@@ -453,6 +461,23 @@ var simScenarios = []simScenario{
 			}
 			if e := r.end(); e.floor[remote] != 0 || e.phase != v1alpha1.PhaseSteady {
 				t.Errorf("did not settle at home: %+v", e)
+			}
+		},
+	},
+	{
+		// Home's NodePools have exactly the room it needs: the nodes being launched use it
+		// all up, so it reports none left. It is still growing: the fleet waits `after`,
+		// not `earlyAfter`, before borrowing.
+		name: "home grows to its pool's limit", clusters: homeAndRemote(constant(2)), demand: flat(20),
+		check: func(t *testing.T, r *simRun) {
+			shortAt := time.Duration(-1)
+			for _, s := range r.steps {
+				if s.short && shortAt < 0 {
+					shortAt = s.at
+				}
+				if strings.Contains(s.action, "add_capacity") && s.at-shortAt < 120*time.Second {
+					t.Fatalf("borrowed %s after the shortage while home's nodes were launching: %+v", s.at-shortAt, s)
+				}
 			}
 		},
 	},

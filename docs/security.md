@@ -13,7 +13,7 @@
 | `events` (core) | get, list, watch | Karpenter launch-failure events |
 | `events` (`events.k8s.io`) | create, patch | Decision Events |
 | `nodepools` (`karpenter.sh`) | get, list, watch | Dynamic room (limits minus usage) |
-| `nodeclaims` (`karpenter.sh`) | get, list, watch | Launch failures |
+| `nodeclaims` (`karpenter.sh`) | get, list, watch | Launch failures, and nodes being launched |
 | `leases` | get, list, watch, create, update, patch, delete | Per-cluster and fleet leader election |
 | `clusterprofiles` | get, list, watch | Fleet membership |
 | `httproutes` | get, update, patch | Traffic weights |

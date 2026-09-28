@@ -397,6 +397,13 @@ type ClusterReport struct {
 	// not counted in NeededReplicas.
 	// +optional
 	NominatedReplicas int32 `json:"nominatedReplicas,omitempty"`
+	// ArrivingReplicas are pending replicas that will get a node without the fleet: they
+	// fit on its existing nodes (waiting for the scheduler), on nodes its node pools are
+	// launching, or in the room its node pools have left, unless its launches keep
+	// failing. While they cover what it needs, the member is helping itself, like with
+	// replicas loading on its nodes: the hub gives it escalation.after, not earlyAfter.
+	// +optional
+	ArrivingReplicas int32 `json:"arrivingReplicas,omitempty"`
 	// StaticRoom is how many more replicas fit on existing nodes.
 	StaticRoom int32 `json:"staticRoom"`
 	// DynamicRoom is how many more replicas the NodePools may add, unless DynamicUnbounded.

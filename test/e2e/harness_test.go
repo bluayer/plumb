@@ -231,8 +231,11 @@ func (e *env) hpaStatus(ctx context.Context, desired int32, held bool) error {
 // fakeKarpenter plays Karpenter for one NodePool of e's scenario: for this scenario's pods
 // the scheduler can't place, it launches KWOK nodes of gpusPerNode GPUs, each ready to
 // register after `delay`, while spec.limits allows; status.resources counts them, and a
-// node left empty for `consolidate` is removed. While failing is set, launches fail the
-// way Karpenter reports insufficient capacity instead.
+// node left empty for `consolidate` is removed. Each launch is a NodeClaim, as in
+// Karpenter v1.14.1: created with Launched Unknown (AwaitingReconciliation), then
+// Launched with its capacity (from then on its pool counts it), then given its node's
+// name when the node registers. While failing is set, launches fail the way Karpenter
+// reports insufficient capacity instead.
 type fakeKarpenter struct {
 	failing  atomic.Bool
 	mu       sync.Mutex
@@ -243,7 +246,39 @@ func (e *env) karpenter(pool, capacityType string, gpuLimit, gpusPerNode int64, 
 	e.t.Helper()
 	e.nodePool(pool, capacityType, gpuLimit)
 	k := &fakeKarpenter{}
-	var inflight []time.Time // launches not yet registered
+	type claim struct {
+		name     string
+		at       time.Time
+		launched bool
+	}
+	var inflight []claim // launches not yet registered
+	claims := 0
+	claimOf := map[string]string{} // node → its NodeClaim
+	e.t.Cleanup(func() {
+		nc := &unstructured.Unstructured{}
+		nc.SetGroupVersionKind(karpenter.NodeClaimGVK)
+		_ = e.cl.c.DeleteAllOf(context.Background(), nc, client.MatchingLabels{scenarioLabel: e.scenario, karpenter.NodePoolLabelKey: pool})
+	})
+	claimStatus := func(ctx context.Context, name string, status map[string]any) error {
+		nc := &unstructured.Unstructured{}
+		nc.SetGroupVersionKind(karpenter.NodeClaimGVK)
+		if err := e.cl.c.Get(ctx, client.ObjectKey{Name: name}, nc); err != nil {
+			return err
+		}
+		st, _, _ := unstructured.NestedMap(nc.Object, "status")
+		if st == nil {
+			st = map[string]any{}
+		}
+		for k, v := range status {
+			st[k] = v
+		}
+		nc.Object["status"] = st
+		return e.cl.c.Status().Update(ctx, nc)
+	}
+	launchedCond := func(status, reason string) []any {
+		return []any{map[string]any{"type": karpenter.ConditionTypeLaunched, "status": status, "reason": reason,
+			"message": "", "lastTransitionTime": time.Now().UTC().Format(time.RFC3339)}}
+	}
 	var lastICE time.Time
 	empty := map[string]time.Time{}
 	loop(e.t, 500*time.Millisecond, func(ctx context.Context) error {
@@ -269,14 +304,30 @@ func (e *env) karpenter(pool, capacityType string, gpuLimit, gpusPerNode int64, 
 			}
 		}
 		now := time.Now()
+		// A launch call returns within a round: the claim gets its capacity.
+		for i := range inflight {
+			if !inflight[i].launched {
+				alloc := map[string]any{string(gpu): fmt.Sprint(gpusPerNode), "cpu": "64", "memory": "512Gi", "pods": "110"}
+				if err := claimStatus(ctx, inflight[i].name, map[string]any{"conditions": launchedCond("True", "Launched"),
+					"capacity": alloc, "allocatable": alloc}); err != nil {
+					return fmt.Errorf("karpenter %s: %w", pool, err)
+				}
+				inflight[i].launched = true
+			}
+		}
 		// Launches that are done register as nodes.
-		for len(inflight) > 0 && now.Sub(inflight[0]) >= delay {
+		for len(inflight) > 0 && inflight[0].launched && now.Sub(inflight[0].at) >= delay {
 			k.mu.Lock()
 			name := fmt.Sprintf("%s-%d", pool, k.launched+1)
 			k.mu.Unlock()
-			if _, err := e.nodeCtx(ctx, name, gpusPerNode, withLabels(karpenter.NodePoolLabelKey, pool, karpenter.CapacityTypeLabelKey, capacityType)); err != nil {
+			node, err := e.nodeCtx(ctx, name, gpusPerNode, withLabels(karpenter.NodePoolLabelKey, pool, karpenter.CapacityTypeLabelKey, capacityType))
+			if err != nil {
 				return fmt.Errorf("karpenter %s: %w", pool, err) // retried next round
 			}
+			if err := claimStatus(ctx, inflight[0].name, map[string]any{"nodeName": node}); err != nil {
+				return fmt.Errorf("karpenter %s: %w", pool, err)
+			}
+			claimOf[node] = inflight[0].name
 			inflight = inflight[1:]
 			k.mu.Lock()
 			k.launched++
@@ -293,6 +344,15 @@ func (e *env) karpenter(pool, capacityType string, gpuLimit, gpusPerNode int64, 
 				delete(empty, n.Name)
 				if err := client.IgnoreNotFound(e.cl.c.Delete(ctx, &n)); err != nil {
 					return err
+				}
+				if name, ok := claimOf[n.Name]; ok {
+					nc := &unstructured.Unstructured{}
+					nc.SetGroupVersionKind(karpenter.NodeClaimGVK)
+					nc.SetName(name)
+					if err := client.IgnoreNotFound(e.cl.c.Delete(ctx, nc)); err != nil {
+						return err
+					}
+					delete(claimOf, n.Name)
 				}
 				continue
 			}
@@ -315,10 +375,33 @@ func (e *env) karpenter(pool, capacityType string, gpuLimit, gpusPerNode int64, 
 				}
 				break
 			}
-			inflight = append(inflight, now)
+			nc := &unstructured.Unstructured{}
+			nc.SetGroupVersionKind(karpenter.NodeClaimGVK)
+			claims++
+			nc.SetName(fmt.Sprintf("%s-%s-%d", pool, e.scenario, claims))
+			nc.SetLabels(map[string]string{karpenter.NodePoolLabelKey: pool, scenarioLabel: e.scenario, "type": "kwok"})
+			nc.Object["spec"] = map[string]any{
+				"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"},
+				"requirements": []any{map[string]any{"key": karpenter.CapacityTypeLabelKey, "operator": "In", "values": []any{capacityType}}},
+			}
+			if err := e.cl.c.Create(ctx, nc); err != nil {
+				return fmt.Errorf("karpenter %s: %w", pool, err)
+			}
+			if err := claimStatus(ctx, nc.GetName(), map[string]any{"conditions": launchedCond("Unknown", "AwaitingReconciliation")}); err != nil {
+				return fmt.Errorf("karpenter %s: %w", pool, err)
+			}
+			inflight = append(inflight, claim{name: nc.GetName(), at: now})
 			used += gpusPerNode
 		}
-		want := map[string]any{string(gpu): resource.NewQuantity(used, resource.DecimalSI).String()}
+		// status.resources counts a claim once launched, with its capacity (statenode.go
+		// Capacity); the limit check above also holds back for claims not launched yet.
+		counted := used
+		for _, c := range inflight {
+			if !c.launched {
+				counted -= gpusPerNode
+			}
+		}
+		want := map[string]any{string(gpu): resource.NewQuantity(counted, resource.DecimalSI).String()}
 		if got, _, _ := unstructured.NestedMap(np.Object, "status", "resources"); fmt.Sprint(got) == fmt.Sprint(want) {
 			return nil
 		}

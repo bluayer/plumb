@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -96,6 +97,32 @@ func TestWatchJoinsEventWithNodeClaim(t *testing.T) {
 	case e := <-ch:
 		t.Fatalf("duplicate or stale event emitted: %+v", e)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// A NodeClaim being launched starts with Launched Unknown (AwaitingReconciliation); only
+// Launched False is a failed launch. Counting the first would make every node a busy
+// NodePool is launching look like a failure.
+func TestLaunchingIsNotAFailure(t *testing.T) {
+	now := time.Now()
+	claim := func(status, reason string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(NodeClaimGVK)
+		u.SetName("gpu-" + status)
+		u.SetUID(types.UID("uid-" + status))
+		_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{"type": ConditionTypeLaunched, "status": status,
+			"reason": reason, "lastTransitionTime": now.Add(-time.Second).UTC().Format(time.RFC3339)}}, "status", "conditions")
+		return u
+	}
+	s := NewSource(nil)
+	if e, ok := s.fromClaim(claim("Unknown", "AwaitingReconciliation"), now); ok {
+		t.Fatalf("a launch under way reported as failed: %+v", e)
+	}
+	if _, ok := s.fromClaim(claim("True", "Launched"), now); ok {
+		t.Fatal("a launched claim reported as failed")
+	}
+	if _, ok := s.fromClaim(claim("False", ReasonLaunchFailed), now); !ok {
+		t.Fatal("Launched False not reported")
 	}
 }
 

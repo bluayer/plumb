@@ -123,6 +123,16 @@ func (s *Source) fresh(ev adapters.CapacityEvent) bool {
 // rememberClaim caches what an ICE event cannot tell: Karpenter deletes the NodeClaim
 // right after publishing the event. Labels win over single-value requirements.
 func (s *Source) rememberClaim(u *unstructured.Unstructured) {
+	vals := claimLabels(u)
+	group, _, _ := unstructured.NestedString(u.Object, "spec", "nodeClassRef", "group")
+	s.mu.Lock()
+	s.claims[u.GetName()] = claimInfo{nodePool: vals[NodePoolLabelKey], group: group}
+	s.mu.Unlock()
+}
+
+// claimLabels are the labels a NodeClaim's node will have, as far as the claim tells:
+// its single-value requirements, then its labels.
+func claimLabels(u *unstructured.Unstructured) map[string]string {
 	vals := map[string]string{}
 	reqs, _, _ := unstructured.NestedSlice(u.Object, "spec", "requirements")
 	for _, r := range reqs {
@@ -135,10 +145,7 @@ func (s *Source) rememberClaim(u *unstructured.Unstructured) {
 	for k, v := range u.GetLabels() {
 		vals[k] = v
 	}
-	group, _, _ := unstructured.NestedString(u.Object, "spec", "nodeClassRef", "group")
-	s.mu.Lock()
-	s.claims[u.GetName()] = claimInfo{nodePool: vals[NodePoolLabelKey], group: group}
-	s.mu.Unlock()
+	return vals
 }
 
 // event starts a CapacityEvent about a NodeClaim, and returns the claim's NodeClass group.
@@ -149,12 +156,15 @@ func (s *Source) event(id string, name string, ts time.Time) (adapters.CapacityE
 	return adapters.CapacityEvent{ID: id, NodePool: info.nodePool, ObservedAt: ts}, info.group
 }
 
-// fromClaim reports a failed launch recorded on the Launched condition.
+// fromClaim reports a failed launch recorded on the Launched condition. Only False is a
+// failure: a new NodeClaim starts Unknown ("AwaitingReconciliation", operatorpkg
+// status/condition_set.go, the version Karpenter v1.14.1 pins) while its launch is
+// under way.
 func (s *Source) fromClaim(u *unstructured.Unstructured, now time.Time) (adapters.CapacityEvent, bool) {
 	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
 	for _, c := range conds {
 		m, ok := c.(map[string]any)
-		if !ok || m["type"] != ConditionTypeLaunched || m["status"] == string(metav1.ConditionTrue) {
+		if !ok || m["type"] != ConditionTypeLaunched || m["status"] != string(metav1.ConditionFalse) {
 			continue
 		}
 		reason, _ := m["reason"].(string)

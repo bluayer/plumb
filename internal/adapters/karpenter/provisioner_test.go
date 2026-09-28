@@ -18,6 +18,7 @@ package karpenter
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -208,6 +209,61 @@ func TestCapacitySubtractsReservations(t *testing.T) {
 	}
 	if rep.Static.Replicas != 0 || rep.Dynamic.Replicas != 3 { // pool: 16 - 8 used - 1 reserved = 7 GPUs, 2 per replica
 		t.Fatalf("static %d dynamic %d", rep.Static.Replicas, rep.Dynamic.Replicas)
+	}
+}
+
+// launchingClaim is a NodeClaim of pool that has launched a node of gpus GPUs; node
+// names its node once registered.
+func launchingClaim(name, pool string, gpus int64, node string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(NodeClaimGVK)
+	u.SetName(name)
+	u.SetLabels(map[string]string{NodePoolLabelKey: pool})
+	_ = unstructured.SetNestedMap(u.Object, map[string]any{"nvidia.com/gpu": fmt.Sprint(gpus), "cpu": "190"}, "status", "allocatable")
+	if node != "" {
+		_ = unstructured.SetNestedField(u.Object, node, "status", "nodeName")
+	}
+	return u
+}
+
+// Nodes a NodePool is launching already count in its status.resources. The workload's
+// own pending replicas that will land on them are arriving, not charged to the pool's
+// headroom a second time; a claim whose node takes pods is just that node.
+func TestCapacityCountsLaunchingNodes(t *testing.T) {
+	registered := gpuNode("n1", "gpu", 8, true)
+	c := newClient(registered, pod("p1", "n1", 8),
+		launchingClaim("gpu-a", "gpu", 4, ""),   // launched, no node yet
+		launchingClaim("gpu-b", "gpu", 4, "n2"), // node registered but not ready
+		gpuNode("n2", "gpu", 4, false),
+		launchingClaim("gpu-c", "gpu", 8, "n1"), // n1 itself: already a node
+		launchingClaim("other-a", "other", 8, ""),
+		nodePool("gpu", map[string]any{"nvidia.com/gpu": "24"}, map[string]any{"nvidia.com/gpu": "16"}))
+	own := adapters.PodShape{Namespace: "inf", Requests: req.PodRequests}
+	r := req
+	r.Reserved = []adapters.Reservation{{Shape: own, Count: 5, Own: true}} // 4 fit on gpu-a and n2, 1 needs a new node
+	rep, err := (&Provisioner{Client: c}).Capacity(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pool: 24 - 16 used - 2 for the one replica left = 6 GPUs, 3 replicas; it has room to
+	// launch a node for that one.
+	if rep.Arriving != 4 || rep.Launchable != 1 || rep.Dynamic.Replicas != 3 || rep.Static.Replicas != 0 {
+		t.Fatalf("arriving %d launchable %d dynamic %d static %d", rep.Arriving, rep.Launchable, rep.Dynamic.Replicas, rep.Static.Replicas)
+	}
+	// Replicas that fit on a node that is there count too: the scheduler binds them next.
+	c = newClient(gpuNode("n1", "gpu", 8, true), launchingClaim("gpu-a", "gpu", 4, ""),
+		nodePool("gpu", map[string]any{"nvidia.com/gpu": "12"}, map[string]any{"nvidia.com/gpu": "12"}))
+	r.Reserved = []adapters.Reservation{{Shape: own, Count: 7, Own: true}} // 4 on n1, 2 on gpu-a, 1 nowhere
+	if rep, _ = (&Provisioner{Client: c}).Capacity(context.Background(), r); rep.Arriving != 6 || rep.Launchable != 0 || rep.Dynamic.Replicas != 0 {
+		t.Fatalf("arriving %d launchable %d dynamic %d", rep.Arriving, rep.Launchable, rep.Dynamic.Replicas)
+	}
+	c = newClient(registered, pod("p1", "n1", 8),
+		launchingClaim("gpu-a", "gpu", 4, ""), launchingClaim("gpu-b", "gpu", 4, "n2"), gpuNode("n2", "gpu", 4, false),
+		nodePool("gpu", map[string]any{"nvidia.com/gpu": "24"}, map[string]any{"nvidia.com/gpu": "16"}))
+	// Another policy's replicas take launching nodes too, but are not this workload's.
+	r.Reserved = []adapters.Reservation{{Shape: own, Count: 2}, {Shape: own, Count: 3, Own: true}}
+	if rep, _ = (&Provisioner{Client: c}).Capacity(context.Background(), r); rep.Arriving != 2 || rep.Dynamic.Replicas != 3 {
+		t.Fatalf("arriving %d dynamic %d", rep.Arriving, rep.Dynamic.Replicas)
 	}
 }
 

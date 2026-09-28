@@ -74,7 +74,7 @@ Read the [architecture](docs/architecture.md), starting with [a shortage, start 
 ## Features
 
 - **Own cluster first, then the fleet, in the order you choose.**
-  - `LocalFirst` (the default): a short cluster uses its own existing nodes, then its own NodePools; only when those cannot add nodes (none registered, limits reached, launches failing; replicas already loading on its own nodes get `after`) or after `after` does it borrow other clusters' idle nodes, then their NodePools.
+  - `LocalFirst` (the default): a short cluster uses its own existing nodes, then its own NodePools; only when those cannot add nodes (none registered, limits reached, launches failing; replicas already loading on its own nodes, or getting nodes it has or is launching, get `after`) or after `after` does it borrow other clusters' idle nodes, then their NodePools.
   - `StaticFirst`: idle existing nodes anywhere in the fleet before any cluster launches new ones.
   - When a cluster keeps failing to launch nodes, the other clusters in its region (they compete for the same cloud capacity) go last for new nodes.
   - Only the NodePools and nodes you register per cluster are Plumb's; the rest of the cluster is left alone.

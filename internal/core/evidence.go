@@ -111,6 +111,9 @@ func observed(in AdaptiveInput) map[string]any {
 		if r.NominatedReplicas > 0 {
 			v["nominatedReplicas"] = r.NominatedReplicas // pending, but the scheduler has made room for them
 		}
+		if r.ArrivingReplicas > 0 {
+			v["arrivingReplicas"] = r.ArrivingReplicas // pending, but they will get a node of its own
+		}
 		v["dynamicRoom"] = any(r.DynamicRoom)
 		if r.DynamicUnbounded {
 			v["dynamicRoom"] = "unbounded"
