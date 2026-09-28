@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -471,5 +472,116 @@ func TestMemberLeavesOutNominatedPending(t *testing.T) {
 	}
 	if r := got.Status.Report; r.PendingReplicas != 3 || r.NominatedReplicas != 2 || r.NeededReplicas != 1 {
 		t.Fatalf("pending %d nominated %d needed %d", r.PendingReplicas, r.NominatedReplicas, r.NeededReplicas)
+	}
+}
+
+// A decision that changed something is written to the decision log, announced as an
+// Event (a warning when writing it failed), with one Event per ready-wait warning and one
+// when a floor is newly kept; the summary in status.fleet is cut to 1024 characters.
+func TestHubAnnounce(t *testing.T) {
+	log, _ := core.OpenLog("")
+	rec := events.NewFakeRecorder(10)
+	h := NewHub(Hub{Identity: "hub", Log: log, Recorder: rec})
+	p := &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto}}
+	res := core.Result{Action: "add_capacity", Phase: v1alpha1.PhaseEscalated, Message: strings.Repeat("x", 2000),
+		Warnings: []string{"b: 1 of 2 replicas on nodes but not ready"}, Held: []string{"b"}}
+	sum := h.announce(context.Background(), p, gathered{}, res, nil, "d1", time.Now(), false, true, errors.New("intent on b: conflict"))
+	if sum.ID != "d1" || sum.Applied || len(sum.Message) != 1024 {
+		t.Fatalf("summary %+v (message %d characters)", sum, len(sum.Message))
+	}
+	var got []string
+	for len(rec.Events) > 0 {
+		got = append(got, strings.Fields(<-rec.Events)[1])
+	}
+	if !slices.Equal(got, []string{"AddCapacity", "ReplicasNotReady", "ReleaseHeld"}) {
+		t.Fatalf("events %v", got)
+	}
+	if r, ok := log.Records[0].(core.Record); len(log.Records) != 1 || !ok || r.DecisionID != "d1" || r.Error == "" || r.Policy != "ns/llm" {
+		t.Fatalf("decision log %+v", log.Records)
+	}
+}
+
+// Each policy with this member reserves the replicas it wants here that are not on a node
+// yet: the Deployment's, or the hub's floor while it is in force (auto, not expired).
+func TestMemberReservations(t *testing.T) {
+	now := time.Now()
+	deployment := func(name string, replicas int32) *appsv1.Deployment {
+		labels := map[string]string{"app": name}
+		return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}, Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(replicas), Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name: "server", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}}}}}}}}
+	}
+	bound := func(name string, i int) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: fmt.Sprint(name, "-", i), Labels: map[string]string{"app": name}},
+			Spec: corev1.PodSpec{NodeName: "n"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	}
+	policy := func(name string, mode v1alpha1.Mode, clusters []string, floor int32, expires time.Time) *v1alpha1.AdaptivePolicy {
+		p := &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}, Spec: v1alpha1.AdaptivePolicySpec{
+			Mode: mode, Workload: v1alpha1.WorkloadRef{Name: name}}}
+		for _, c := range clusters {
+			p.Spec.Clusters = append(p.Spec.Clusters, v1alpha1.ClusterSpec{Name: c, MaxReplicas: 10})
+		}
+		if floor > 0 {
+			p.Status.Intent = &v1alpha1.Intent{Replicas: floor, Expires: metav1.Time{Time: expires}}
+		}
+		return p
+	}
+	objs := []client.Object{
+		// a: floor 4 in force, 2 desired, 1 bound: 3 reserved.
+		deployment("a", 2), bound("a", 0), policy("a", v1alpha1.ModeAuto, []string{"home"}, 4, now.Add(time.Minute)),
+		// b: shadow, so its floor is not served: 2 desired, 2 bound, none reserved.
+		deployment("b", 2), bound("b", 0), bound("b", 1), policy("b", v1alpha1.ModeShadow, []string{"home"}, 5, now.Add(time.Minute)),
+		// c: the floor expired: 3 desired, none bound, 3 reserved.
+		deployment("c", 3), policy("c", v1alpha1.ModeAuto, []string{"home"}, 6, now.Add(-time.Minute)),
+		// d: not a policy with this member.
+		deployment("d", 4), policy("d", v1alpha1.ModeAuto, []string{"remote"}, 0, now),
+	}
+	c := statusClient(t, interceptor.Funcs{}, objs...)
+	m := &Member{Client: c, Name: "home", Adapters: adapters.Cluster{Workloads: &adapters.DeploymentObserver{Client: c}}}
+	got, err := m.reservations(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var counts []string
+	for _, r := range got {
+		counts = append(counts, fmt.Sprint(r.Shape.Labels["app"], "=", r.Count))
+	}
+	if !slices.Equal(counts, []string{"a=3", "c=3"}) {
+		t.Fatalf("reservations %v", counts)
+	}
+}
+
+// The hub reads traffic shares from the first route as percentages of its backends'
+// weights, and says why when it cannot.
+func TestHubWeights(t *testing.T) {
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(adapters.HTTPRouteGVK)
+	route.SetNamespace("ns")
+	route.SetName("llm")
+	if err := unstructured.SetNestedSlice(route.Object, []any{map[string]any{"backendRefs": []any{
+		map[string]any{"name": "svc-a", "weight": int64(3)}, map[string]any{"name": "svc-b", "weight": int64(1)},
+	}}}, "spec", "rules"); err != nil {
+		t.Fatal(err)
+	}
+	c := statusClient(t, interceptor.Funcs{}, route)
+	h := NewHub(Hub{Fleet: &Fleet{members: map[string]*member{"a": {cl: fakeCluster{c: c}}}}})
+	spec := func(clusters []v1alpha1.ClusterSpec, routeCluster string) *v1alpha1.AdaptivePolicy {
+		return &v1alpha1.AdaptivePolicy{Spec: v1alpha1.AdaptivePolicySpec{Clusters: clusters,
+			Traffic: &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: routeCluster, Namespace: "ns", Name: "llm"}}}}}
+	}
+	both := []v1alpha1.ClusterSpec{{Name: "a", Backend: &v1alpha1.BackendRef{Name: "svc-a"}}, {Name: "b", Backend: &v1alpha1.BackendRef{Name: "svc-b"}}}
+	if w, err := h.weights(context.Background(), spec(both, "a")); err != nil || w["a"] != 75 || w["b"] != 25 {
+		t.Fatalf("weights %v, %v", w, err)
+	}
+	if _, err := h.weights(context.Background(), spec(both, "b")); err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Fatalf("route in a member not connected: %v", err)
+	}
+	third := append(slices.Clone(both), v1alpha1.ClusterSpec{Name: "c", Backend: &v1alpha1.BackendRef{Name: "svc-c"}})
+	if _, err := h.weights(context.Background(), spec(third, "a")); err == nil || !strings.Contains(err.Error(), "no backendRef") {
+		t.Fatalf("a cluster without a backend on the route: %v", err)
+	}
+	if w, err := h.weights(context.Background(), &v1alpha1.AdaptivePolicy{}); w != nil || err != nil {
+		t.Fatalf("traffic not managed: %v, %v", w, err)
 	}
 }

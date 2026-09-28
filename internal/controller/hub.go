@@ -216,6 +216,79 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 	}
 	now, hash, auto := time.Now(), SpecHash(p), p.EffectiveMode() == v1alpha1.ModeAuto
 	key := client.ObjectKeyFromObject(p).String()
+	g := h.gather(ctx, p, now, auto)
+	res, adaptive := h.decide(ctx, p, key, hash, g)
+	id := now.UTC().Format("20060102T150405Z") + "-" + strings.ToLower(rand.Text()[:6])
+
+	var errs []error
+	if g.werr != nil {
+		errs = append(errs, g.werr)
+	}
+	if stale, err := h.changedMeanwhile(ctx, p, key, hash, auto, res, adaptive); stale || err != nil {
+		return err
+	}
+	if auto {
+		errs = append(errs, h.apply(ctx, p, res, g.intents, id, now)...)
+	}
+	applied := auto && len(errs) == 0 && res.Action != "none"
+	if h.held == nil {
+		h.held = map[string][]string{}
+	}
+	newlyHeld := len(res.Held) > 0 && !slices.Equal(res.Held, h.held[key])
+	h.held[key] = res.Held
+	changed := res.Action != "none" || res.Phase != g.fs.Phase || len(res.Warnings) > 0 || newlyHeld ||
+		(adaptive != nil && adaptive.Chosen != "" && adaptive.Chosen != adaptive.Executed)
+	joined := errors.Join(errs...)
+
+	tracking, recent := h.followOutcomes(ctx, key, g, now)
+	if res.Action != "none" {
+		tracking = core.Track(tracking, id, res.Action, applied, now, g.before, res.Plans)
+	}
+	next := &v1alpha1.FleetStatus{Hub: h.Identity, Time: metav1.Time{Time: now}, Phase: res.Phase,
+		PhaseSince: metav1.Time{Time: res.PhaseSince}, Clusters: res.Plans, LastDecision: g.fs.LastDecision, Tracking: tracking, Recent: recent,
+		OutOfSync: g.outOfSync}
+	if !res.LastStep.IsZero() {
+		next.LastStep = &metav1.Time{Time: res.LastStep}
+	}
+	escalated := 0.0
+	if res.Phase == v1alpha1.PhaseEscalated {
+		escalated = 1
+	}
+	fleetEscalated.WithLabelValues(key).Set(escalated)
+	fleetOutOfSync.WithLabelValues(key).Set(float64(len(g.outOfSync)))
+	if h.Recorder != nil && len(g.outOfSync) > 0 && !slices.Equal(g.outOfSync, g.fs.OutOfSync) {
+		h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "MembersOutOfSync", "Plan",
+			"ignoring reports from %s: their copy of this policy differs from the hub's", strings.Join(g.outOfSync, ", "))
+	}
+	if res.Action != "none" {
+		hubDecisions.WithLabelValues(key, res.Action, res.Source, fmt.Sprint(applied)).Inc()
+	}
+	if changed {
+		next.LastDecision = h.announce(ctx, p, g, res, adaptive, id, now, applied, newlyHeld, joined)
+	}
+	if err := h.writeFleet(ctx, p, next, changed, now); err != nil {
+		return err
+	}
+	return joined
+}
+
+// gathered is what a hub step reads before deciding: the fleet as the last hub left it,
+// and each member's report and intent, as the planning input.
+type gathered struct {
+	fs        *v1alpha1.FleetStatus
+	in        core.Input
+	intents   map[string]*v1alpha1.Intent
+	reports   map[string]*v1alpha1.ClusterReport
+	before    []v1alpha1.ClusterPlan
+	outOfSync []string
+	werr      error // reading the route weights
+}
+
+// gather reads the fleet status (a new hub's from the most recent member copy), the route
+// weights and every member's copy of the policy, and builds the planning input. Reports
+// that are stale or computed from a different copy of the policy are left out; in shadow
+// mode, which writes no intents, the simulated plan is carried forward instead.
+func (h *Hub) gather(ctx context.Context, p *v1alpha1.AdaptivePolicy, now time.Time, auto bool) gathered {
 	prev := map[string]v1alpha1.ClusterPlan{}
 	fs := p.Status.Fleet
 	if fs == nil || fs.Hub != h.Identity {
@@ -227,12 +300,10 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 	for _, c := range fs.Clusters {
 		prev[c.Name] = c
 	}
+	g := gathered{fs: fs, intents: map[string]*v1alpha1.Intent{}, reports: map[string]*v1alpha1.ClusterReport{}}
 	weights, werr := h.weights(ctx, p)
-	intents := map[string]*v1alpha1.Intent{}
-	reports := map[string]*v1alpha1.ClusterReport{}
+	g.werr = werr
 	var cs []core.Cluster
-	var before []v1alpha1.ClusterPlan
-	var outOfSync []string
 	for _, spec := range p.Spec.Clusters {
 		c := core.Cluster{Spec: spec, Weight: -1}
 		if w, ok := weights[spec.Name]; ok {
@@ -248,11 +319,11 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 					if r.SpecHash == ReportHash(p, spec.Name) {
 						c.Report = r
 					} else {
-						outOfSync = append(outOfSync, spec.Name)
+						g.outOfSync = append(g.outOfSync, spec.Name)
 					}
 				}
 				if in := mp.Status.Intent; in != nil && now.Before(in.Expires.Time) {
-					c.Floor, c.Added, c.Tier, intents[spec.Name] = in.Replicas, in.Added, in.Tier, in
+					c.Floor, c.Added, c.Tier, g.intents[spec.Name] = in.Replicas, in.Added, in.Tier, in
 				}
 			}
 		}
@@ -274,19 +345,27 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 		if t := prev[spec.Name].GainedAt; t != nil {
 			c.GainedAt = t.Time
 		}
-		reports[spec.Name] = c.Report
+		g.reports[spec.Name] = c.Report
 		cs = append(cs, c)
-		before = append(before, core.PlanOf(c, true))
+		g.before = append(g.before, core.PlanOf(c, true))
 	}
-	in := core.Input{Now: now, Config: configFor(p), Clusters: cs, Phase: fs.Phase, PhaseSince: fs.PhaseSince.Time, Hold: map[string]bool{}, Simulated: !auto}
+	g.in = core.Input{Now: now, Config: configFor(p), Clusters: cs, Phase: fs.Phase, PhaseSince: fs.PhaseSince.Time, Hold: map[string]bool{}, Simulated: !auto}
 	for _, c := range cs {
 		if written := h.floorsWritten[c.Spec.Name]; c.Report != nil && !c.Report.Time.After(latest(written, h.since)) {
-			in.Hold[c.Spec.Name] = true
+			g.in.Hold[c.Spec.Name] = true
 		}
 	}
 	if fs.LastStep != nil {
-		in.LastStep = fs.LastStep.Time
+		g.in.LastStep = fs.LastStep.Time
 	}
+	return g
+}
+
+// decide runs the policy's path: the rules, or the adaptive path with Jev or the planner
+// alone as chooser, recorded or carried out. With a ranking model, the rules ask it which
+// cluster takes the missing replicas.
+func (h *Hub) decide(ctx context.Context, p *v1alpha1.AdaptivePolicy, key, hash string, g gathered) (core.Result, *core.AdaptiveRecord) {
+	in := g.in
 	if h.Model != nil {
 		in.RankShadow = h.ModelShadow
 		rank := model.RankWith(ctx, h.Model)
@@ -301,153 +380,123 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 			return probs, err
 		}
 	}
-	var res core.Result
-	var adaptive *core.AdaptiveRecord
-	// Each policy chooses its own path: the rules, or the adaptive path with Jev or the
-	// planner alone as chooser, recorded or carried out.
-	if x := p.Spec.Experimental; x != nil && x.Adaptive != nil && h.Planner != nil && (h.Model != nil || x.Adaptive.Chooser == v1alpha1.ChooserPlanner) {
-		plannerOnly := x.Adaptive.Chooser == v1alpha1.ChooserPlanner
-		ain := core.AdaptiveInput{Input: in, Policy: *x.Adaptive, Metrics: p.Spec.Signals.Metrics, Placement: p.Spec.Placement,
-			Recent: fs.Recent, Proposed: h.proposed(key, hash, now), PlannerOnly: plannerOnly, Trend: h.remember(key, cs, now),
-			Shadow: h.ModelShadow || x.Adaptive.Mode != v1alpha1.AdaptiveApply}
-		if !plannerOnly {
-			ain.Choose = func(state any, instructions string, options map[string]string) (map[string]float64, error) {
-				start := time.Now()
-				probs, err := h.Model.Choose(ctx, state, instructions, options)
-				modelRequests.WithLabelValues(map[bool]string{true: "error", false: "ok"}[err != nil]).Observe(time.Since(start).Seconds())
-				return probs, err
-			}
-		}
-		r, rec := core.Adapt(ain)
-		res, adaptive = r, &rec
-		// A planner plan is one step: once picked it is spent, and the others were
-		// proposed for the state it changes.
-		if slices.ContainsFunc(rec.Candidates, func(c core.Candidate) bool {
-			return c.Source == core.SourcePlanner && (c.ID == rec.Chosen || c.ID == rec.Executed)
-		}) {
-			h.consume(key)
-		}
-		h.plan(key, hash, ain, res)
-	} else {
-		res = core.Plan(in)
+	x := p.Spec.Experimental
+	if x == nil || x.Adaptive == nil || h.Planner == nil || (h.Model == nil && x.Adaptive.Chooser != v1alpha1.ChooserPlanner) {
+		return core.Plan(in), nil
 	}
-	id := now.UTC().Format("20060102T150405Z") + "-" + strings.ToLower(rand.Text()[:6])
+	plannerOnly := x.Adaptive.Chooser == v1alpha1.ChooserPlanner
+	ain := core.AdaptiveInput{Input: in, Policy: *x.Adaptive, Metrics: p.Spec.Signals.Metrics, Placement: p.Spec.Placement,
+		Recent: g.fs.Recent, Proposed: h.proposed(key, hash, in.Now), PlannerOnly: plannerOnly, Trend: h.remember(key, in.Clusters, in.Now),
+		Shadow: h.ModelShadow || x.Adaptive.Mode != v1alpha1.AdaptiveApply}
+	if !plannerOnly {
+		ain.Choose = func(state any, instructions string, options map[string]string) (map[string]float64, error) {
+			start := time.Now()
+			probs, err := h.Model.Choose(ctx, state, instructions, options)
+			modelRequests.WithLabelValues(map[bool]string{true: "error", false: "ok"}[err != nil]).Observe(time.Since(start).Seconds())
+			return probs, err
+		}
+	}
+	res, rec := core.Adapt(ain)
+	// A planner plan is one step: once picked it is spent, and the others were
+	// proposed for the state it changes.
+	if slices.ContainsFunc(rec.Candidates, func(c core.Candidate) bool {
+		return c.Source == core.SourcePlanner && (c.ID == rec.Chosen || c.ID == rec.Executed)
+	}) {
+		h.consume(key)
+	}
+	h.plan(key, hash, ain, res)
+	return res, &rec
+}
 
-	var errs []error
-	if werr != nil {
-		errs = append(errs, werr)
+// changedMeanwhile reports whether the policy changed while a model was being asked: then
+// nothing decided on the old one is carried out, and the next step decides again.
+func (h *Hub) changedMeanwhile(ctx context.Context, p *v1alpha1.AdaptivePolicy, key, hash string, auto bool, res core.Result, adaptive *core.AdaptiveRecord) (bool, error) {
+	if !auto || res.Action == "none" || (adaptive == nil && res.Model == nil) {
+		return false, nil
 	}
-	// A model may have taken a while: carry out nothing decided on a policy that has
-	// changed since it was read. The next step decides again on the new one.
-	if auto && res.Action != "none" && (adaptive != nil || res.Model != nil) {
-		cur := &v1alpha1.AdaptivePolicy{}
-		if err := h.Reader.Get(ctx, client.ObjectKeyFromObject(p), cur); err != nil {
-			return client.IgnoreNotFound(err)
-		}
-		if SpecHash(cur) != hash {
-			log.FromContext(ctx).Info("policy changed during the decision; deciding again", "policy", key, "decision", res.Action)
-			return nil
-		}
+	cur := &v1alpha1.AdaptivePolicy{}
+	if err := h.Reader.Get(ctx, client.ObjectKeyFromObject(p), cur); err != nil {
+		return true, client.IgnoreNotFound(err)
 	}
-	if auto {
-		errs = append(errs, h.apply(ctx, p, res, intents, id, now)...)
+	if SpecHash(cur) != hash {
+		log.FromContext(ctx).Info("policy changed during the decision; deciding again", "policy", key, "decision", res.Action)
+		return true, nil
 	}
-	applied := auto && len(errs) == 0 && res.Action != "none"
-	if h.held == nil {
-		h.held = map[string][]string{}
-	}
-	newlyHeld := len(res.Held) > 0 && !slices.Equal(res.Held, h.held[key])
-	h.held[key] = res.Held
-	changed := res.Action != "none" || res.Phase != fs.Phase || len(res.Warnings) > 0 || newlyHeld ||
-		(adaptive != nil && adaptive.Chosen != "" && adaptive.Chosen != adaptive.Executed)
-	joined := errors.Join(errs...)
+	return false, nil
+}
 
-	// Outcomes: follow earlier decisions with what the members report now, then start
-	// following this one.
-	tracking, outcomes, ready := core.Follow(fs.Tracking, key, in.Clusters, now, h.horizons(), in.Config.ReadyTimeout)
-	recent := fs.Recent
+// followOutcomes follows earlier decisions with what the members report now: it records
+// the checkpoints that fell due and returns the decisions still followed and the recent
+// ones that completed.
+func (h *Hub) followOutcomes(ctx context.Context, key string, g gathered, now time.Time) ([]v1alpha1.TrackedDecision, []v1alpha1.RecentDecision) {
+	tracking, outcomes, ready := core.Follow(g.fs.Tracking, key, g.in.Clusters, now, h.horizons(), g.in.Config.ReadyTimeout)
+	recent := g.fs.Recent
 	for _, o := range outcomes {
 		if err := h.Log.Write(o); err != nil {
 			log.FromContext(ctx).Error(err, "writing decision log")
 		}
 		if o.Final {
-			recent = append(recent, recentOf(o, fs.Tracking))
+			recent = append(recent, recentOf(o, g.fs.Tracking))
 		}
 	}
 	recent = recent[max(len(recent)-5, 0):]
 	for _, d := range ready {
 		timeToReady.WithLabelValues(key).Observe(d.Seconds())
 	}
-	if res.Action != "none" {
-		tracking = core.Track(tracking, id, res.Action, applied, now, before, res.Plans)
+	return tracking, recent
+}
+
+// announce records a decision that changed something: the decision log, Events, and the
+// summary kept in status.fleet.lastDecision.
+func (h *Hub) announce(ctx context.Context, p *v1alpha1.AdaptivePolicy, g gathered, res core.Result, adaptive *core.AdaptiveRecord,
+	id string, now time.Time, applied, newlyHeld bool, joined error) *v1alpha1.DecisionSummary {
+	msg := res.Message
+	if joined != nil {
+		msg += "; " + joined.Error()
 	}
-	next := &v1alpha1.FleetStatus{Hub: h.Identity, Time: metav1.Time{Time: now}, Phase: res.Phase,
-		PhaseSince: metav1.Time{Time: res.PhaseSince}, Clusters: res.Plans, LastDecision: fs.LastDecision, Tracking: tracking, Recent: recent,
-		OutOfSync: outOfSync}
-	if !res.LastStep.IsZero() {
-		next.LastStep = &metav1.Time{Time: res.LastStep}
+	rec := core.Record{Kind: "decision", DecisionID: id, Time: now, Policy: client.ObjectKeyFromObject(p).String(), Hub: h.Identity,
+		Mode: string(p.EffectiveMode()), Reports: g.reports, Before: g.before, After: res.Plans, Phase: res.Phase,
+		Action: res.Action, Source: res.Source, Model: res.Model, Adaptive: adaptive, Message: res.Message, Warnings: res.Warnings, Held: res.Held, Applied: applied,
+		OutOfSync: g.outOfSync}
+	if joined != nil {
+		rec.Error = joined.Error()
 	}
-	escalated := 0.0
-	if res.Phase == v1alpha1.PhaseEscalated {
-		escalated = 1
+	if err := h.Log.Write(rec); err != nil {
+		log.FromContext(ctx).Error(err, "writing decision log")
 	}
-	fleetEscalated.WithLabelValues(key).Set(escalated)
-	fleetOutOfSync.WithLabelValues(key).Set(float64(len(outOfSync)))
-	if h.Recorder != nil && len(outOfSync) > 0 && !slices.Equal(outOfSync, fs.OutOfSync) {
-		h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "MembersOutOfSync", "Plan",
-			"ignoring reports from %s: their copy of this policy differs from the hub's", strings.Join(outOfSync, ", "))
-	}
-	if res.Action != "none" {
-		hubDecisions.WithLabelValues(key, res.Action, res.Source, fmt.Sprint(applied)).Inc()
-	}
-	if changed {
-		msg := res.Message
+	if h.Recorder != nil && res.Action != "none" {
+		kind := corev1.EventTypeNormal
 		if joined != nil {
-			msg += "; " + joined.Error()
+			kind = corev1.EventTypeWarning
 		}
-		next.LastDecision = &v1alpha1.DecisionSummary{ID: id, Action: res.Action, Source: res.Source, Applied: applied,
-			Message: msg[:min(len(msg), 1024)], Time: metav1.Time{Time: now}}
-		rec := core.Record{Kind: "decision", DecisionID: id, Time: now, Policy: client.ObjectKeyFromObject(p).String(), Hub: h.Identity,
-			Mode: string(p.EffectiveMode()), Reports: reports, Before: before, After: res.Plans, Phase: res.Phase,
-			Action: res.Action, Source: res.Source, Model: res.Model, Adaptive: adaptive, Message: res.Message, Warnings: res.Warnings, Held: res.Held, Applied: applied,
-			OutOfSync: outOfSync}
-		if joined != nil {
-			rec.Error = joined.Error()
-		}
-		if err := h.Log.Write(rec); err != nil {
-			log.FromContext(ctx).Error(err, "writing decision log")
-		}
-		if h.Recorder != nil && res.Action != "none" {
-			kind := corev1.EventTypeNormal
-			if joined != nil {
-				kind = corev1.EventTypeWarning
-			}
-			h.Recorder.Eventf(p, nil, kind, reasonFor(res.Action), "Plan", "%s (phase %s, mode %s, applied %t)",
-				cmp.Or(msg, res.Action), res.Phase, p.EffectiveMode(), applied)
-		}
-		for _, w := range res.Warnings {
-			if h.Recorder != nil {
-				h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "ReplicasNotReady", "Plan", "%s", w)
-			}
-		}
-		if newlyHeld && h.Recorder != nil {
-			h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "ReleaseHeld", "Plan",
-				"keeping the floor on %s: no usable report from it (stale, out of sync, or none)", strings.Join(res.Held, ", "))
+		h.Recorder.Eventf(p, nil, kind, reasonFor(res.Action), "Plan", "%s (phase %s, mode %s, applied %t)",
+			cmp.Or(msg, res.Action), res.Phase, p.EffectiveMode(), applied)
+	}
+	for _, w := range res.Warnings {
+		if h.Recorder != nil {
+			h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "ReplicasNotReady", "Plan", "%s", w)
 		}
 	}
-	if !changed && p.Status.Fleet != nil && p.Status.Fleet.Hub == h.Identity && now.Sub(p.Status.Fleet.Time.Time) < FleetHeartbeat &&
-		equality.Semantic.DeepEqual(p.Status.Fleet.Clusters, next.Clusters) && equality.Semantic.DeepEqual(p.Status.Fleet.Tracking, next.Tracking) &&
-		slices.Equal(p.Status.Fleet.OutOfSync, next.OutOfSync) {
-		return joined // nothing new to write
+	if newlyHeld && h.Recorder != nil {
+		h.Recorder.Eventf(p, nil, corev1.EventTypeWarning, "ReleaseHeld", "Plan",
+			"keeping the floor on %s: no usable report from it (stale, out of sync, or none)", strings.Join(res.Held, ", "))
 	}
-	// A diff against the copy just read: fields that go away (tracking done, no last
-	// step) are removed, and nothing else is written.
+	return &v1alpha1.DecisionSummary{ID: id, Action: res.Action, Source: res.Source, Applied: applied,
+		Message: msg[:min(len(msg), 1024)], Time: metav1.Time{Time: now}}
+}
+
+// writeFleet writes next as status.fleet, unless nothing changed since this hub's own
+// last write and the heartbeat is not due. It patches against the copy just read: fields
+// that go away (tracking done, no last step) are removed, and nothing else is written.
+func (h *Hub) writeFleet(ctx context.Context, p *v1alpha1.AdaptivePolicy, next *v1alpha1.FleetStatus, changed bool, now time.Time) error {
+	if f := p.Status.Fleet; !changed && f != nil && f.Hub == h.Identity && now.Sub(f.Time.Time) < FleetHeartbeat &&
+		equality.Semantic.DeepEqual(f.Clusters, next.Clusters) && equality.Semantic.DeepEqual(f.Tracking, next.Tracking) &&
+		slices.Equal(f.OutOfSync, next.OutOfSync) {
+		return nil
+	}
 	orig := p.DeepCopy()
 	p.Status.Fleet = next
-	if err := h.Client.Status().Patch(ctx, p, client.MergeFrom(orig)); err != nil {
-		return err
-	}
-	return joined
+	return h.Client.Status().Patch(ctx, p, client.MergeFrom(orig))
 }
 
 // recentOf summarizes a decision whose last outcome checkpoint just passed.
