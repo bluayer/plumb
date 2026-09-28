@@ -40,6 +40,7 @@ import (
 	"github.com/bluayer/plumb/api/v1alpha1"
 	"github.com/bluayer/plumb/internal/adapters"
 	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 )
 
 const (
@@ -68,7 +69,9 @@ type Hub struct {
 	Fleet    *Fleet
 	Identity string
 	Interval time.Duration
-	Model    *core.SystemOne // nil: rules rank clusters
+	Model    *model.SystemOne // nil: rules rank clusters
+	// Horizons are the outcome checkpoints after a decision; nil: core.Horizons.
+	Horizons []time.Duration
 	// ModelShadow: nothing a model picks is carried out, only recorded in the decision log
 	// (experimental): the ranking model's order, and the adaptive pick of every policy,
 	// whatever its spec.experimental.adaptive.mode.
@@ -286,7 +289,7 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 	}
 	if h.Model != nil {
 		in.RankShadow = h.ModelShadow
-		rank := core.RankWith(ctx, h.Model)
+		rank := model.RankWith(ctx, h.Model)
 		in.Rank = func(cs []core.Cluster) (map[string]float64, error) {
 			start := time.Now()
 			probs, err := rank(cs)
@@ -361,7 +364,7 @@ func (h *Hub) step(ctx context.Context, p *v1alpha1.AdaptivePolicy) error {
 
 	// Outcomes: follow earlier decisions with what the members report now, then start
 	// following this one.
-	tracking, outcomes, ready := core.Follow(fs.Tracking, key, in.Clusters, now, in.Config.ReadyTimeout)
+	tracking, outcomes, ready := core.Follow(fs.Tracking, key, in.Clusters, now, h.horizons(), in.Config.ReadyTimeout)
 	recent := fs.Recent
 	for _, o := range outcomes {
 		if err := h.Log.Write(o); err != nil {
@@ -767,4 +770,11 @@ func timeOf(t *metav1.Time) time.Time {
 		return time.Time{}
 	}
 	return t.Time
+}
+
+func (h *Hub) horizons() []time.Duration {
+	if len(h.Horizons) > 0 {
+		return h.Horizons
+	}
+	return core.Horizons()
 }

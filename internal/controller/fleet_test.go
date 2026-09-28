@@ -30,6 +30,8 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"github.com/bluayer/plumb/api/v1alpha1"
 )
 
 // fleetOf builds a Fleet of in-memory members; down[name] makes a member unreachable.
@@ -105,7 +107,7 @@ func TestQuorumLockPlurality(t *testing.T) {
 		t.Fatal(err)
 	}
 	down["c"].Store(false)
-	stale := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: HubLease}}
+	stale := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: v1alpha1.HubLease}}
 	stale.Spec.HolderIdentity = new(string)
 	*stale.Spec.HolderIdentity = "old/pod"
 	if _, err := f.members["c"].leases.Leases("plumb-system").Create(ctx, stale, metav1.CreateOptions{}); err != nil {
@@ -118,7 +120,7 @@ func TestQuorumLockPlurality(t *testing.T) {
 	if err := q.Update(ctx, record("b/pod")); err != nil {
 		t.Fatal(err)
 	}
-	l, _ := f.members["c"].leases.Leases("plumb-system").Get(ctx, HubLease, metav1.GetOptions{})
+	l, _ := f.members["c"].leases.Leases("plumb-system").Get(ctx, v1alpha1.HubLease, metav1.GetOptions{})
 	if *l.Spec.HolderIdentity != "b/pod" {
 		t.Fatalf("stale member not repaired: %s", *l.Spec.HolderIdentity)
 	}
@@ -134,7 +136,7 @@ func TestElectionFailover(t *testing.T) {
 	run := func(ctx context.Context, id string, led chan<- string) {
 		le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 			Lock: newQuorumLock(id, f), LeaseDuration: 3 * time.Second, RenewDeadline: 2 * time.Second,
-			RetryPeriod: 200 * time.Millisecond, ReleaseOnCancel: true, Name: HubLease,
+			RetryPeriod: 200 * time.Millisecond, ReleaseOnCancel: true, Name: v1alpha1.HubLease,
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(ctx context.Context) {
 					if leading.Add(1) > 1 {

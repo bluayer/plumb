@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package core
+// Package model reaches the experimental models over the network: Jev (System One) and
+// the planner, each through the hosts registered here or under internal/adapters/<cloud>.
+// What is asked, and what is done with the answers, is internal/core's.
+package model
 
 import (
 	"bytes"
@@ -28,6 +31,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/bluayer/plumb/internal/core"
 )
 
 // MaxChoices is the most options one choice question may carry (Jev's limit).
@@ -212,8 +217,8 @@ func (m *SystemOne) choose(ctx context.Context, state any, instructions string, 
 
 // RankWith turns a SystemOne client into a Ranker for the hub: which cluster should take
 // the missing replicas. The state is a compact summary; raw metrics never leave.
-func RankWith(ctx context.Context, m *SystemOne) Ranker {
-	return func(cands []Cluster) (map[string]float64, error) {
+func RankWith(ctx context.Context, m *SystemOne) core.Ranker {
+	return func(cands []core.Cluster) (map[string]float64, error) {
 		type row struct {
 			Region    string `json:"region,omitempty"`
 			Ready     int32  `json:"ready"`
@@ -228,7 +233,7 @@ func RankWith(ctx context.Context, m *SystemOne) Ranker {
 		options := map[string]string{}
 		for _, c := range cands {
 			r := c.Report
-			state[c.Spec.Name] = row{RegionOf(c), r.ReadyReplicas, r.StaticRoom, r.DynamicRoom, r.DynamicUnbounded, r.RecentLaunchFailures, c.Spec.CostRank, c.Spec.MaxReplicas}
+			state[c.Spec.Name] = row{core.RegionOf(c), r.ReadyReplicas, r.StaticRoom, r.DynamicRoom, r.DynamicUnbounded, r.RecentLaunchFailures, c.Spec.CostRank, c.Spec.MaxReplicas}
 			options[c.Spec.Name] = "add replicas in cluster " + c.Spec.Name
 		}
 		return m.Choose(ctx, map[string]any{"clusters": state},

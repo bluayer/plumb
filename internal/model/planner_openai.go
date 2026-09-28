@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package core
+package model
 
 import (
 	"bytes"
@@ -25,6 +25,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/bluayer/plumb/internal/core"
 )
 
 // OpenAI Chat Completions request and response fields follow
@@ -44,7 +46,7 @@ var openAIHTTPClient = &http.Client{CheckRedirect: func(*http.Request, []*http.R
 	return http.ErrUseLastResponse
 }}
 
-func newOpenAIPlanner(o PlannerOptions) (Planner, error) {
+func newOpenAIPlanner(o PlannerOptions) (core.Planner, error) {
 	if o.Model == "" || o.Endpoint == "" {
 		return nil, errors.New("openai planner needs --planner-model and --planner-endpoint (base URL ending in /v1)")
 	}

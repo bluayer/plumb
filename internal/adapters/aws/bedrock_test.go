@@ -24,7 +24,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 )
 
 // The Converse request and response on the wire, as the SDK sends and parses them.
@@ -48,14 +48,14 @@ func TestBedrockPlanner(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	spec, ok := core.LookupPlanner("bedrock")
+	spec, ok := model.LookupPlanner("bedrock")
 	if !ok {
 		t.Fatal("bedrock planner not registered")
 	}
-	if _, err := spec.New(core.PlannerOptions{Region: "us-east-1"}); err == nil {
+	if _, err := spec.New(model.PlannerOptions{Region: "us-east-1"}); err == nil {
 		t.Fatal("a model is required")
 	}
-	p, err := spec.New(core.PlannerOptions{Model: "my-model", Region: "us-east-1", Endpoint: srv.URL})
+	p, err := spec.New(model.PlannerOptions{Model: "my-model", Region: "us-east-1", Endpoint: srv.URL})
 	if err != nil {
 		t.Fatal(err)
 	}

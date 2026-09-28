@@ -36,6 +36,7 @@ import (
 
 	"github.com/bluayer/plumb/api/v1alpha1"
 	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 )
 
 // jevServer answers the choice question with prefer when it is offered, else "rules".
@@ -44,22 +45,22 @@ type jevServer struct {
 	prefer string
 }
 
-func (j jevServer) NewRequest(ctx context.Context, e core.Evaluation) (*http.Request, error) {
+func (j jevServer) NewRequest(ctx context.Context, e model.Evaluation) (*http.Request, error) {
 	b, _ := json.Marshal(e)
 	return http.NewRequestWithContext(ctx, http.MethodPost, j.url, bytes.NewReader(b))
 }
 
 func (jevServer) Output(body []byte) ([]byte, error) { return body, nil }
 
-func newJev(t *testing.T, prefer string) *core.SystemOne { return newJevHook(t, prefer, nil) }
+func newJev(t *testing.T, prefer string) *model.SystemOne { return newJevHook(t, prefer, nil) }
 
 // newJevHook also runs hook (if any) while Jev "thinks", before it answers.
-func newJevHook(t *testing.T, prefer string, hook func()) *core.SystemOne {
+func newJevHook(t *testing.T, prefer string, hook func()) *model.SystemOne {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hook != nil {
 			hook()
 		}
-		var e core.Evaluation
+		var e model.Evaluation
 		_ = json.NewDecoder(r.Body).Decode(&e)
 		pick := "rules"
 		if _, ok := e.Questions["choice"].Criteria[prefer]; ok {
@@ -68,7 +69,7 @@ func newJevHook(t *testing.T, prefer string, hook func()) *core.SystemOne {
 		_, _ = fmt.Fprintf(w, `{"answers": {"choice": {"type": "choice", "choice": %q, "confidence": 0.9, "probabilities": {%q: 0.9}}}}`, pick, pick)
 	}))
 	t.Cleanup(srv.Close)
-	return &core.SystemOne{Provider: jevServer{url: srv.URL, prefer: prefer}, Timeout: time.Second}
+	return &model.SystemOne{Provider: jevServer{url: srv.URL, prefer: prefer}, Timeout: time.Second}
 }
 
 // planner answers with one plan, counts calls and keeps the state it was last asked on.
@@ -131,7 +132,7 @@ func TestHubAdaptive(t *testing.T) {
 		a, b, key := adaptiveFleetWith(t, v1alpha1.Adaptive{Intent: "use idle GPUs first", Mode: tc.mode, Chooser: chooser})
 		log, _ := core.OpenLog("")
 		pl := &planner{}
-		var jev *core.SystemOne
+		var jev *model.SystemOne
 		if !tc.only {
 			jev = newJev(t, "p1")
 		}
@@ -209,7 +210,7 @@ func hashOf(t *testing.T, c client.Reader, key types.NamespacedName) string {
 }
 
 // hubFor builds a hub over the adaptive fleet.
-func hubFor(a, b client.WithWatch, log *core.Log, jev *core.SystemOne, pl core.Planner) *Hub {
+func hubFor(a, b client.WithWatch, log *core.Log, jev *model.SystemOne, pl core.Planner) *Hub {
 	h := NewHub(Hub{Client: a, Reader: a, Identity: "hub", Log: log, Model: jev, Planner: pl, PlannerInterval: time.Hour,
 		Fleet: &Fleet{Self: "a", members: map[string]*member{"a": {cl: fakeCluster{c: a}}, "b": {cl: fakeCluster{c: b}}}}})
 	h.floorsWritten = map[string]time.Time{}
@@ -250,7 +251,7 @@ func TestHubCarriesOutAPlannerPlanOnce(t *testing.T) {
 	for _, only := range []bool{false, true} {
 		a, b, key := adaptiveFleet(t, map[bool]string{false: v1alpha1.ChooserJev, true: v1alpha1.ChooserPlanner}[only])
 		log, _ := core.OpenLog("")
-		var jev *core.SystemOne
+		var jev *model.SystemOne
 		if !only {
 			jev = newJev(t, "p1")
 		}

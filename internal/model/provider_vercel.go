@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package core
+package model
 
 // Jev through Vercel AI Gateway, which serves the same /v1/systemone protocol under
 // https://ai-gateway.vercel.sh/typesafe with an AI Gateway API key and the model id

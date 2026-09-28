@@ -25,15 +25,18 @@ import (
 	"github.com/bluayer/plumb/api/v1alpha1"
 )
 
-// Horizons are the checkpoints after a decision at which its outcome is recorded; Follow
-// adds a last one at the policy's ReadyTimeout when that is later.
-var Horizons = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}
+// Horizons are the checkpoints after a decision at which its outcome is recorded unless
+// the hub is given others; Follow adds a last one at the policy's ReadyTimeout when that
+// is later.
+func Horizons() []time.Duration {
+	return []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}
+}
 
-func checkpoints(until time.Duration) []time.Duration {
-	if until > Horizons[len(Horizons)-1] {
-		return append(slices.Clone(Horizons), until)
+func checkpoints(horizons []time.Duration, until time.Duration) []time.Duration {
+	if until > horizons[len(horizons)-1] {
+		return append(slices.Clone(horizons), until)
 	}
-	return Horizons
+	return horizons
 }
 
 // MaxTracked bounds the decisions followed at once; the oldest is dropped first.
@@ -102,8 +105,8 @@ func Track(tracked []v1alpha1.TrackedDecision, id, action string, applied bool, 
 // outcome checkpoints that fell due, plus how long each floor that became ready took.
 // Decisions past their last checkpoint are dropped; slow-loading workloads are followed
 // at least until readyTimeout.
-func Follow(tracked []v1alpha1.TrackedDecision, policy string, cs []Cluster, now time.Time, readyTimeout time.Duration) ([]v1alpha1.TrackedDecision, []Outcome, []time.Duration) {
-	hs := checkpoints(readyTimeout)
+func Follow(tracked []v1alpha1.TrackedDecision, policy string, cs []Cluster, now time.Time, horizons []time.Duration, readyTimeout time.Duration) ([]v1alpha1.TrackedDecision, []Outcome, []time.Duration) {
+	hs := checkpoints(horizons, readyTimeout)
 	var keep []v1alpha1.TrackedDecision
 	var outcomes []Outcome
 	var ready []time.Duration

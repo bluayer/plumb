@@ -35,12 +35,13 @@ import (
 	"github.com/bluayer/plumb/api/v1alpha1"
 	"github.com/bluayer/plumb/internal/controller"
 	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 )
 
 // fakeJev picks prefer when offered, else holds; it answers in-process.
 type fakeJev struct{ prefer string }
 
-func (j fakeJev) NewRequest(ctx context.Context, e core.Evaluation) (*http.Request, error) {
+func (j fakeJev) NewRequest(ctx context.Context, e model.Evaluation) (*http.Request, error) {
 	pick := "hold"
 	if _, ok := e.Questions["choice"].Criteria[j.prefer]; ok {
 		pick = j.prefer
@@ -107,7 +108,7 @@ func TestAdaptivePlannerAndJev(t *testing.T) {
 
 	planner := &scriptedPlanner{}
 	adaptive := func(o *controller.Options) {
-		o.Model = &core.SystemOne{Provider: fakeJev{prefer: "p1"}, Timeout: time.Second, HTTP: &http.Client{Transport: echo{}}}
+		o.Model = &model.SystemOne{Provider: fakeJev{prefer: "p1"}, Timeout: time.Second, HTTP: &http.Client{Transport: echo{}}}
 		o.Planner, o.PlannerInterval, o.PlannerTimeout = planner, time.Second, 5*time.Second
 	}
 	joinFleet(t, home, remote)
