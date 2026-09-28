@@ -19,6 +19,8 @@ make verify-generate   # fail if DeepCopy, CRD or ClusterRole are stale
 make verify-mod    # fail if go.mod or go.sum is not tidy (all three modules)
 make proto         # regenerate KEDA's external scaler gRPC code (needs protoc)
 make build         # bin/plumb
+make chart         # helm lint and render charts/plumb
+make chart-smoke   # install the chart in a disposable kind cluster and check it runs (needs docker)
 ```
 
 ## Test layers
@@ -31,6 +33,7 @@ Test a change at the cheapest level that can show it:
 | Simulations | `internal/core/sim_test.go` | `Plan` against a crude fleet over hours of simulated time: KEDA (with the HPA's 5-minute scale-in window), node launches, model loading, latency from load. Every step of every run is checked against invariants (limits, no release while short, no traffic to a cluster over its SLO or to borrowed capacity without cause, no traffic taken from a member that serves its share, no traffic bouncing between the same two clusters, no borrowing again right after giving back). A table of named scenarios adds what each is about; 500 seeded random fleets run the invariants over shapes nobody wrote down, also with members that leave out pending replicas their HPA holds, and with pressure read 30% off either way (there only a member failing its users may send back traffic it just took) |
 | Members and hub | `internal/controller/*_test.go` | Reconcilers against fake clients: what is read, written and recorded |
 | End to end | `test/e2e/` | Everything against real API servers and the real scheduler, below |
+| Chart | `hack/chart-smoke.sh` | The chart as installed: an image built from the checkout runs in kind with the chart's arguments, probes and RBAC; the agent reports on a policy and leads a fleet of one; nothing restarts or is denied. The e2e suite runs Plumb in-process, so only this runs the chart's pods |
 
 A behavior change to planning belongs in a scenario (`simScenarios`) as well as a unit test. To look at a failing random run, `go test ./internal/core/ -run 'TestSimulationsRandom/seed_42' -v` prints the steps that led to it.
 
@@ -161,7 +164,7 @@ A Kubernetes library bump may also bump controller-gen's output: run `make gener
 
 ## Pull requests
 
-`Test and lint` runs on every PR commit: unit tests, lint, generated-code checks and module checks. E2E starts after a human with write access approves the current head. Until then, the required `E2E passed` status stays pending; waiting for review is not a test failure. A new commit or revoked approval requires review again. Only the repository owner merges after both required checks pass. Helm checks and the edge image build run after merging to `main`.
+`Test and lint` runs on every PR commit: unit tests, lint, generated-code checks and module checks. So does `Helm chart`: `make chart` and `make chart-smoke`. E2E starts after a human with write access approves the current head. Until then, the required `E2E passed` status stays pending; waiting for review is not a test failure. A new commit or revoked approval requires review again. Only the repository owner merges after both required checks pass. The edge image build runs after merging to `main`.
 
 For their own PR, the owner can submit a review with `Comment` and body `/approve`; GitHub records the reviewed commit. `/unapprove` revokes it. This is a review comment, not a conversation comment. The owner must still pass both required checks.
 
@@ -194,6 +197,6 @@ Fast CI runs on every pull request commit and every push to `main`; PR E2E waits
 - the Helm chart `oci://ghcr.io/bluayer/charts/plumb`, with the chart version and appVersion set to the tag
 - a GitHub release with generated notes, the chart package and the CRD
 
-Every push to `main` validates the Helm chart and publishes the edge image `ghcr.io/bluayer/plumb:main` (and `:sha-<commit>`), from the main build workflow (`edge.yaml`), the only one besides the release that may write packages. Versioned image and Helm chart publishing remains tied to release tags.
+Every push to `main` publishes the edge image `ghcr.io/bluayer/plumb:main` (and `:sha-<commit>`), from the main build workflow (`edge.yaml`), the only one besides the release that may write packages. Versioned image and Helm chart publishing remains tied to release tags.
 
 **First publish.** GHCR links both packages to this repository through `org.opencontainers.image.source` (the Dockerfile label, and `sources` in `Chart.yaml` for the chart), so the workflows' `GITHUB_TOKEN` can keep writing them. A new package may start private: after the first edge image and the first release, check each package's visibility under the owner's Packages (`plumb`, `charts/plumb`) and make it public, or have clusters pull with `imagePullSecrets`.

@@ -2,7 +2,7 @@
 # dependencies clash with the others), where Dependabot keeps it current.
 TOOL := go tool -modfile=$(CURDIR)/hack/tools/go.mod
 
-.PHONY: all test generate proto build lint chart verify verify-generate verify-mod
+.PHONY: all test generate proto build lint chart chart-smoke verify verify-generate verify-mod
 
 all: generate lint test build
 
@@ -33,6 +33,10 @@ lint:
 chart:
 	$(TOOL) helm lint charts/plumb --strict --set clusterName=ci
 	$(TOOL) helm template plumb charts/plumb --set clusterName=ci --set serviceMonitor.enabled=true --set scaler.tlsSecretName=tls >/dev/null
+
+# Installs the chart in a disposable kind cluster and checks that it runs (needs docker).
+chart-smoke:
+	./hack/chart-smoke.sh
 
 # Fails when generated code is stale (as in CI and the pre-commit codegen hook).
 verify-generate: generate

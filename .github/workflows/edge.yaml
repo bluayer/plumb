@@ -1,8 +1,7 @@
 name: Main build
 
 # Every push to main publishes ghcr.io/<owner>/plumb:main and :sha-<commit>, for trying
-# main before a release. Helm checks also run here, after merging. PR workflows
-# never hold packages: write.
+# main before a release. PR workflows never hold packages: write.
 on:
   push:
     branches: [main]
@@ -15,18 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  chart:
-    name: Helm chart
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: hack/tools/go.mod
-          cache-dependency-path: hack/tools/go.sum
-      - name: Lint and render
-        run: make chart
-
   image:
     name: Publish edge image
     runs-on: ubuntu-latest
