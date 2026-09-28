@@ -196,7 +196,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			room := c.pool(at) - s.launched
 			launching := s.launchAt >= 0
 			switch {
-			case s.want > c.nodes+s.launched && room > 0 && c.ice(at) < RecurringICE && !launching:
+			case s.want > c.nodes+s.launched && room > 0 && c.ice(at) < RecurringLaunchFailures && !launching:
 				s.launchAt = at
 			case launching && at-s.launchAt >= simLaunch:
 				s.launched += min(s.want-c.nodes-s.launched, room)
@@ -244,7 +244,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			}
 			cs[i].Report = &v1alpha1.ClusterReport{Time: metav1.Time{Time: now}, DesiredReplicas: s.want, ReadyReplicas: s.ready,
 				PendingReplicas: pending, StaticRoom: max(c.nodes+s.launched-s.want, 0), DynamicRoom: max(room, 0),
-				RecentICE: c.ice(at), Region: c.region, NeededReplicas: need, ShortSince: s.short,
+				RecentLaunchFailures: c.ice(at), Region: c.region, NeededReplicas: need, ShortSince: s.short,
 				Pressure: pressure, Latency: latency, SafePressure: s.safe}
 		}
 		in := Input{Now: now, Config: conf, Clusters: slices.Clone(cs), Phase: phase, PhaseSince: since, LastStep: last}
@@ -578,7 +578,7 @@ var simScenarios = []simScenario{
 		// remote-a in r1 has as much NodePool headroom. remote-a comes after, not never.
 		name: "region with launch failures", demand: flat(20),
 		clusters: []simCluster{
-			{name: "home", weight: 100, nodes: 1, pool: constant(5), ice: constant(RecurringICE), region: "r1", min: 1, initReplica: 1},
+			{name: "home", weight: 100, nodes: 1, pool: constant(5), ice: constant(RecurringLaunchFailures), region: "r1", min: 1, initReplica: 1},
 			{name: "remote-a", pool: constant(5), region: "r1"},
 			{name: "remote-b", pool: constant(5), region: "r2"},
 		},
@@ -674,7 +674,7 @@ func randomScenario(seed uint64) simScenario {
 			c.pool = from(time.Duration(rng.IntN(60))*time.Minute, int32(rng.IntN(6)))
 		}
 		if rng.IntN(4) == 0 {
-			c.ice = from(time.Duration(rng.IntN(60))*time.Minute, RecurringICE)
+			c.ice = from(time.Duration(rng.IntN(60))*time.Minute, RecurringLaunchFailures)
 		}
 		clusters = append(clusters, c)
 	}

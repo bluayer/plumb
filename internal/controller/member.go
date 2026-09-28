@@ -57,8 +57,8 @@ import (
 	"github.com/bluayer/plumb/internal/core"
 )
 
-// ICEWindow is how long launch failures count as recent.
-const ICEWindow = 10 * time.Minute
+// LaunchFailureWindow is how long launch failures count as recent.
+const LaunchFailureWindow = 10 * time.Minute
 
 // Member keeps status.report of every AdaptivePolicy that lists this cluster up to date.
 // It changes nothing in its cluster: what a cluster can handle alone, KEDA and Karpenter
@@ -70,9 +70,9 @@ type Member struct {
 	Prometheus *adapters.Prometheus // nil: no metric signals
 	Interval   time.Duration
 
-	mu      sync.Mutex
-	ice     []adapters.CapacityEvent
-	trigger chan event.GenericEvent
+	mu       sync.Mutex
+	failures []adapters.CapacityEvent
+	trigger  chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=plumb-k8s.github.io,resources=adaptivepolicies,verbs=get;list;watch
@@ -99,8 +99,8 @@ func (m *Member) SetupWithManager(mgr ctrl.Manager) error {
 			select {
 			case ev := <-ch:
 				m.mu.Lock()
-				m.ice = append(slices.DeleteFunc(m.ice, func(e adapters.CapacityEvent) bool {
-					return time.Since(e.ObservedAt) > ICEWindow
+				m.failures = append(slices.DeleteFunc(m.failures, func(e adapters.CapacityEvent) bool {
+					return time.Since(e.ObservedAt) > LaunchFailureWindow
 				}), ev)
 				m.mu.Unlock()
 				select {
@@ -158,16 +158,17 @@ func (m *Member) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesRawSource(source.Channel(m.trigger, all)).Complete(m)
 }
 
-// recentICE counts non-configuration launch failures in the pools within ICEWindow. The
+// recentLaunchFailures counts non-configuration launch failures in the pools within
+// LaunchFailureWindow. The
 // hub reads the count only to judge how far a cluster's dynamic room can be trusted;
 // falling back between capacity types is Karpenter's job (a NodePool that allows several
 // tries the next one on its own).
-func (m *Member) recentICE(pools []string, now time.Time) int32 {
+func (m *Member) recentLaunchFailures(pools []string, now time.Time) int32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var n int32
-	for _, e := range m.ice {
-		if now.Sub(e.ObservedAt) <= ICEWindow && e.Kind != adapters.ErrorKindConfig && (e.NodePool == "" || slices.Contains(pools, e.NodePool)) {
+	for _, e := range m.failures {
+		if now.Sub(e.ObservedAt) <= LaunchFailureWindow && e.Kind != adapters.ErrorKindConfig && (e.NodePool == "" || slices.Contains(pools, e.NodePool)) {
 			n++
 		}
 	}
@@ -261,7 +262,7 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 		}
 		rep.StaticRoom, rep.DynamicRoom, rep.DynamicUnbounded, rep.Region = c.Static.Replicas, c.Dynamic.Replicas, c.DynamicUnbounded, c.Region
 	}
-	rep.RecentICE = m.recentICE(spec.NodePools, now)
+	rep.RecentLaunchFailures = m.recentLaunchFailures(spec.NodePools, now)
 
 	// Each configured signal is one instant query; a failed one leaves its field empty.
 	sig := p.Spec.Signals

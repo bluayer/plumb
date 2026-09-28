@@ -77,10 +77,11 @@ type ClusterSpec struct {
 	// Name is the member cluster: its ClusterProfile name and the --cluster-name of its agent.
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
-	// NodePools are the Karpenter NodePools Plumb may use for the workload here: their
-	// existing nodes count as static capacity and their limits as dynamic capacity. Other
-	// NodePools in the cluster are ignored. Without any, the cluster cannot add nodes as
-	// far as Plumb is concerned.
+	// NodePools are the node pools of the cluster's node autoscaler that Plumb may use for
+	// the workload here (Karpenter NodePools; other autoscalers' node groups once they are
+	// supported): their existing nodes count as static capacity and their limits as
+	// dynamic capacity. Other pools in the cluster are ignored. Without any, the cluster
+	// cannot add nodes as far as Plumb is concerned.
 	// +optional
 	NodePools []string `json:"nodePools,omitempty"`
 	// NodeSelector registers existing nodes that no Karpenter NodePool manages (e.g. a
@@ -397,8 +398,9 @@ type ClusterReport struct {
 	DynamicRoom int32 `json:"dynamicRoom"`
 	// +optional
 	DynamicUnbounded bool `json:"dynamicUnbounded,omitempty"`
-	// RecentICE counts insufficient-capacity launch failures in the last 10 minutes.
-	RecentICE int32 `json:"recentICE"`
+	// RecentLaunchFailures counts node launches in its node pools that failed in the last
+	// 10 minutes for want of capacity or quota (or an unknown reason), not configuration.
+	RecentLaunchFailures int32 `json:"recentLaunchFailures"`
 	// Region is the most common topology.kubernetes.io/region label on the cluster's
 	// nodes; empty when none has it.
 	// +optional

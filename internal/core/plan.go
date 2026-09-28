@@ -34,9 +34,9 @@ import (
 	"github.com/bluayer/plumb/api/v1alpha1"
 )
 
-// RecurringICE is the count of recent capacity errors after which a cluster's dynamic room
-// is treated as unavailable.
-const RecurringICE = 3
+// RecurringLaunchFailures is the count of recent launch failures after which a cluster's
+// dynamic room is treated as unavailable.
+const RecurringLaunchFailures = 3
 
 // Needed is how many more replicas a member needs now: its unschedulable replicas, the
 // replicas its demand needs beyond the desired count, and at least step while saturated.
@@ -448,7 +448,7 @@ func headroom(c Cluster) int32 {
 // dynamicRoom is what the NodePools may still add; recurring launch failures void it.
 func dynamicRoom(c Cluster) int32 {
 	switch {
-	case c.Report.RecentICE >= RecurringICE:
+	case c.Report.RecentLaunchFailures >= RecurringLaunchFailures:
 		return 0
 	case c.Report.DynamicUnbounded:
 		return math.MaxInt32
@@ -469,7 +469,7 @@ func RegionOf(c Cluster) string {
 func failingRegions(cs []Cluster) map[string]bool {
 	out := map[string]bool{}
 	for _, c := range cs {
-		if r := RegionOf(c); r != "" && c.Report != nil && c.Report.RecentICE >= RecurringICE {
+		if r := RegionOf(c); r != "" && c.Report != nil && c.Report.RecentLaunchFailures >= RecurringLaunchFailures {
 			out[r] = true
 		}
 	}
@@ -490,7 +490,7 @@ func rankRules(cands []Cluster) []Cluster {
 		ra, rb := a.Report, b.Report
 		return cmp.Or(
 			cmp.Compare(min(rb.StaticRoom, 1), min(ra.StaticRoom, 1)),
-			cmp.Compare(ra.RecentICE, rb.RecentICE),
+			cmp.Compare(ra.RecentLaunchFailures, rb.RecentLaunchFailures),
 			cmp.Compare(a.Spec.CostRank, b.Spec.CostRank),
 			cmp.Compare(rb.StaticRoom, ra.StaticRoom),
 			cmp.Compare(dynamicRoom(b), dynamicRoom(a)),
