@@ -811,6 +811,15 @@ spec:
                 description: ClusterReport is one member's view of its own cluster,
                   written by its agent.
                 properties:
+                  arrivingReplicas:
+                    description: |-
+                      ArrivingReplicas are pending replicas that will get a node without the fleet: they
+                      fit on its existing nodes (waiting for the scheduler), on nodes its node pools are
+                      launching, or in the room its node pools have left, unless its launches keep
+                      failing. While they cover what it needs, the member is helping itself, like with
+                      replicas loading on its nodes: the hub gives it escalation.after, not earlyAfter.
+                    format: int32
+                    type: integer
                   demand:
                     anyOf:
                     - type: integer

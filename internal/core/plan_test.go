@@ -505,6 +505,15 @@ func TestEscalationWaitsForLoadingReplicas(t *testing.T) {
 	if _, ok := escalation([]Cluster{c}, 0, cfg, t0); !ok {
 		t.Error("not escalated after earlyAfter though the member's replicas have no node")
 	}
+	// Its NodePools are launching nodes for them: those nodes already use up the pools'
+	// limits, so no room is left, but the member is still helping itself.
+	c.Report.ArrivingReplicas = 2
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0); ok {
+		t.Error("escalated after earlyAfter while nodes for the member's replicas are launching")
+	}
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0.Add(2*time.Minute)); !ok {
+		t.Error("not escalated after `after` though the launched nodes never came")
+	}
 }
 
 // A shortage renewed before it escalates, with no floors held, does not pull traffic

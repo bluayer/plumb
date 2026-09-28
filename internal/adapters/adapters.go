@@ -58,6 +58,9 @@ type ResourceRequest struct {
 type Reservation struct {
 	Shape PodShape
 	Count int32
+	// Own marks the requesting workload's own replicas: how many of them will get a node
+	// is reported as CapacityReport.Arriving.
+	Own bool
 }
 
 // CapacityPool is capacity in replicas of the requested pod.
@@ -75,6 +78,11 @@ type CapacityReport struct {
 	Dynamic          CapacityPool
 	DynamicUnbounded bool
 	Region           string // see Region
+	// Arriving is how many of the workload's own reserved replicas fit on nodes that
+	// exist or that its NodePools are launching (which the pools already count as used);
+	// Launchable, how many more its NodePools have room to launch nodes for. Both will
+	// get a node without anyone else's help, the second if launches succeed.
+	Arriving, Launchable int32
 }
 
 // NodeProvisioner reports what a cluster can still host. Plumb only reads it: nodes are

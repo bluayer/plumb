@@ -252,8 +252,9 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 		}
 		rep.ScaleDownHeld = held
 	}
+	rep.RecentLaunchFailures = m.recentLaunchFailures(spec.NodePools, now)
 	if len(wl.PodRequests) > 0 {
-		reserved, err := m.reservations(ctx, now)
+		reserved, err := m.reservations(ctx, client.ObjectKeyFromObject(p), now)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("reservations: %w", err))
 		}
@@ -264,8 +265,12 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 			errs = append(errs, fmt.Errorf("capacity: %w", err))
 		}
 		rep.StaticRoom, rep.DynamicRoom, rep.DynamicUnbounded, rep.Region = c.Static.Replicas, c.Dynamic.Replicas, c.DynamicUnbounded, c.Region
+		arriving := c.Arriving
+		if rep.RecentLaunchFailures < core.RecurringLaunchFailures { // failing launches bring nothing
+			arriving += c.Launchable
+		}
+		rep.ArrivingReplicas = min(arriving, wl.PendingPods) // its reservation also holds a floor not acted on yet
 	}
-	rep.RecentLaunchFailures = m.recentLaunchFailures(spec.NodePools, now)
 
 	// Each configured signal is one instant query; a failed one leaves its field empty.
 	sig := p.Spec.Signals
@@ -314,8 +319,9 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 // included), the replicas it wants here that are not on a node yet: the larger of the
 // Deployment's replicas and the hub's floor, minus the pods already bound. Taking them
 // out before counting room is what keeps two policies from being offered the same
-// capacity, and a floor from being counted as room before KEDA has acted on it.
-func (m *Member) reservations(ctx context.Context, now time.Time) ([]adapters.Reservation, error) {
+// capacity, and a floor from being counted as room before KEDA has acted on it. own is
+// the reporting policy.
+func (m *Member) reservations(ctx context.Context, own client.ObjectKey, now time.Time) ([]adapters.Reservation, error) {
 	list := &v1alpha1.AdaptivePolicyList{}
 	if err := m.Client.List(ctx, list); err != nil {
 		return nil, err
@@ -338,8 +344,8 @@ func (m *Member) reservations(ctx context.Context, now time.Time) ([]adapters.Re
 			want = max(want, in.Replicas)
 		}
 		if n := want - wl.Bound; n > 0 {
-			out = append(out, adapters.Reservation{Count: n, Shape: adapters.PodShape{Namespace: q.WorkloadNamespace(),
-				Labels: wl.PodLabels, Spec: *wl.PodSpec, Requests: wl.PodRequests}})
+			out = append(out, adapters.Reservation{Count: n, Own: client.ObjectKeyFromObject(q) == own, Shape: adapters.PodShape{
+				Namespace: q.WorkloadNamespace(), Labels: wl.PodLabels, Spec: *wl.PodSpec, Requests: wl.PodRequests}})
 		}
 	}
 	return out, nil

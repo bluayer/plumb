@@ -84,9 +84,11 @@ func escalation(cs []Cluster, i int, cfg Config, now time.Time) (dynamic, ok boo
 		return false, false
 	}
 	short := now.Sub(r.ShortSince.Time)
-	// Replicas already on its nodes but not ready yet (loading the model) are the member
-	// helping itself: it gets `after` for them, as it would for its NodePools.
-	early := short >= cfg.EarlyAfter && r.DesiredReplicas-r.ReadyReplicas-r.PendingReplicas <= 0
+	// Replicas already on its nodes but not ready yet (loading the model), and pending ones
+	// that will get a node of its own while they cover what it needs, are the member
+	// helping itself: it gets `after` for them. Its own pending replicas take up its
+	// pools' room, so none left there does not mean it cannot grow.
+	early := short >= cfg.EarlyAfter && r.DesiredReplicas-r.ReadyReplicas-r.PendingReplicas <= 0 && r.NeededReplicas > r.ArrivingReplicas
 	if short >= cfg.After || (dynamicRoom(cs[i]) == 0 && early) {
 		return true, true
 	}

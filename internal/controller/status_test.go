@@ -539,15 +539,15 @@ func TestMemberReservations(t *testing.T) {
 	}
 	c := statusClient(t, interceptor.Funcs{}, objs...)
 	m := &Member{Client: c, Name: "home", Adapters: adapters.Cluster{Workloads: &adapters.DeploymentObserver{Client: c}}}
-	got, err := m.reservations(context.Background(), now)
+	got, err := m.reservations(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c"}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var counts []string
 	for _, r := range got {
-		counts = append(counts, fmt.Sprint(r.Shape.Labels["app"], "=", r.Count))
+		counts = append(counts, fmt.Sprint(r.Shape.Labels["app"], "=", r.Count, map[bool]string{true: " own"}[r.Own]))
 	}
-	if !slices.Equal(counts, []string{"a=3", "c=3"}) {
+	if !slices.Equal(counts, []string{"a=3", "c=3 own"}) {
 		t.Fatalf("reservations %v", counts)
 	}
 }

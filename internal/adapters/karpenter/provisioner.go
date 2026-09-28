@@ -61,15 +61,6 @@ func (p *Provisioner) Capacity(ctx context.Context, req adapters.ResourceRequest
 	if req.PodSpec != nil {
 		shape.Spec = *req.PodSpec
 	}
-	usable := func(n *corev1.Node) bool {
-		// Karpenter taints nodes it is about to remove; they will not keep new pods.
-		for _, t := range n.Spec.Taints {
-			if t.Key == DisruptedTaintKey || t.Key == UnregisteredTaintKey {
-				return false
-			}
-		}
-		return true
-	}
 	selector := labels.SelectorFromSet(req.NodeSelector)
 	filter := func(n *corev1.Node) bool {
 		if !usable(n) || !selector.Matches(labels.Set(n.Labels)) {
@@ -84,23 +75,26 @@ func (p *Provisioner) Capacity(ctx context.Context, req adapters.ResourceRequest
 	if limit <= 0 {
 		limit = 1000
 	}
+	launching, err := p.launching(ctx, nodes.Items, req.NodePools)
+	if err != nil {
+		return rep, err
+	}
 	// Reservations first: each is placed like the scheduler would, as pods bound to the
-	// nodes it lands on; what fits nowhere will need new nodes from the NodePools.
+	// nodes it lands on; then on the nodes the listed NodePools are launching, which the
+	// pools already count as used; what fits nowhere will need new nodes from the pools.
 	placed := slices.Clone(pods.Items)
+	var onLaunching []corev1.Pod
 	var unplaced []adapters.Reservation
 	for _, r := range req.Reserved {
 		rp := adapters.Fit(r.Shape, nodes.Items, placed, usable, r.Count)
-		for node, n := range rp.ByNode {
-			for range n {
-				// Keep the shape's scheduling terms, but carry exactly its effective requests.
-				v := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: r.Shape.Namespace, Labels: r.Shape.Labels}, Spec: *r.Shape.Spec.DeepCopy()}
-				v.Spec.NodeName, v.Spec.InitContainers, v.Spec.Overhead = node, nil, nil
-				v.Spec.Containers = []corev1.Container{{Name: "reserved", Resources: corev1.ResourceRequirements{Requests: r.Shape.Requests}}}
-				placed = append(placed, v)
-			}
+		placed = append(placed, reservedPods(r.Shape, rp)...)
+		lp := adapters.Fit(r.Shape, launching, onLaunching, nil, r.Count-rp.Replicas)
+		onLaunching = append(onLaunching, reservedPods(r.Shape, lp)...)
+		if r.Own {
+			rep.Arriving += rp.Replicas + lp.Replicas
 		}
-		if rest := r.Count - rp.Replicas; rest > 0 {
-			unplaced = append(unplaced, adapters.Reservation{Shape: r.Shape, Count: rest})
+		if rest := r.Count - rp.Replicas - lp.Replicas; rest > 0 {
+			unplaced = append(unplaced, adapters.Reservation{Shape: r.Shape, Count: rest, Own: r.Own})
 		}
 	}
 	pl := adapters.Fit(shape, nodes.Items, placed, filter, limit)
@@ -118,20 +112,19 @@ func (p *Provisioner) Capacity(ctx context.Context, req adapters.ResourceRequest
 	}
 	// Unplaced reservations will use NodePool headroom: charge each to the first listed
 	// pool it can use. ponytail: a reservation whose workload uses a pool outside this
-	// list is charged here anyway, which can only under-report room.
-	charged := map[string]corev1.ResourceList{}
+	// list is charged here anyway, which can only under-report room. The workload's own
+	// are also charged apart, to tell how many of them the pools have room to launch.
+	charged, others := map[string]corev1.ResourceList{}, map[string]corev1.ResourceList{}
+	var own adapters.Reservation
+	ownPool := ""
 	for _, r := range unplaced {
 		for _, name := range req.NodePools {
 			if poolIncompatible(pools[name], r.Shape.Spec) == "" {
-				if charged[name] == nil {
-					charged[name] = corev1.ResourceList{}
-				}
-				for res, q := range r.Shape.Requests {
-					total := q.DeepCopy()
-					total.Mul(int64(r.Count))
-					cur := charged[name][res]
-					cur.Add(total)
-					charged[name][res] = cur
+				charge(charged, name, r)
+				if r.Own {
+					own, ownPool = r, name
+				} else {
+					charge(others, name, r)
 				}
 				break
 			}
@@ -149,8 +142,126 @@ func (p *Provisioner) Capacity(ctx context.Context, req adapters.ResourceRequest
 		}
 		rep.DynamicUnbounded = rep.DynamicUnbounded || unbounded
 		rep.Dynamic.Replicas += n
+		if name == ownPool {
+			// The own replicas' shape is the requested one: each takes one replica of room.
+			before, _, err := poolHeadroom(np, req.PodRequests, others[name])
+			if err != nil {
+				return rep, err
+			}
+			rep.Launchable = own.Count
+			if !unbounded {
+				rep.Launchable = min(own.Count, before-n)
+			}
+		}
 	}
 	return rep, nil
+}
+
+// charge adds what r's unplaced replicas request to pool's entry in m.
+func charge(m map[string]corev1.ResourceList, pool string, r adapters.Reservation) {
+	if m[pool] == nil {
+		m[pool] = corev1.ResourceList{}
+	}
+	for res, q := range r.Shape.Requests {
+		total := q.DeepCopy()
+		total.Mul(int64(r.Count))
+		cur := m[pool][res]
+		cur.Add(total)
+		m[pool][res] = cur
+	}
+}
+
+// usable: Karpenter taints nodes it is about to remove, and nodes not registered yet;
+// neither takes new pods.
+func usable(n *corev1.Node) bool {
+	for _, t := range n.Spec.Taints {
+		if t.Key == DisruptedTaintKey || t.Key == UnregisteredTaintKey {
+			return false
+		}
+	}
+	return true
+}
+
+// takesPods: the node is Ready, and neither Karpenter nor the node lifecycle controller
+// still keeps pods off it (it removes the not-ready taint shortly after Ready).
+func takesPods(n *corev1.Node) bool {
+	if !usable(n) {
+		return false
+	}
+	for _, t := range n.Spec.Taints {
+		if t.Key == corev1.TaintNodeNotReady || t.Key == corev1.TaintNodeUnreachable {
+			return false
+		}
+	}
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// reservedPods are the pods a placement of reserved replicas stands for: the shape's
+// scheduling terms, with exactly its effective requests.
+func reservedPods(shape adapters.PodShape, pl adapters.Placement) []corev1.Pod {
+	var out []corev1.Pod
+	for node, n := range pl.ByNode {
+		for range n {
+			v := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: shape.Namespace, Labels: shape.Labels}, Spec: *shape.Spec.DeepCopy()}
+			v.Spec.NodeName, v.Spec.InitContainers, v.Spec.Overhead = node, nil, nil
+			v.Spec.Containers = []corev1.Container{{Name: "reserved", Resources: corev1.ResourceRequirements{Requests: shape.Requests}}}
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// launching is the nodes the listed NodePools are launching: their NodeClaims that have
+// capacity but no usable node yet, as nodes with the claim's labels, taints and
+// allocatable. Karpenter counts a claim in its pool's status.resources from launch on
+// (v1.14.1 pkg/controllers/state/statenode.go Capacity, cluster.go
+// updateNodePoolResources), so pending replicas that will land there must not be charged
+// to the pool's headroom again.
+func (p *Provisioner) launching(ctx context.Context, nodes []corev1.Node, pools []string) ([]corev1.Node, error) {
+	if len(pools) == 0 {
+		return nil, nil
+	}
+	claims := &unstructured.UnstructuredList{}
+	claims.SetGroupVersionKind(NodeClaimGVK)
+	if err := p.Client.List(ctx, claims); err != nil {
+		return nil, fmt.Errorf("listing nodeclaims: %w", err)
+	}
+	byName := map[string]*corev1.Node{}
+	for i := range nodes {
+		byName[nodes[i].Name] = &nodes[i]
+	}
+	var out []corev1.Node
+	for _, u := range claims.Items {
+		labels := claimLabels(&u)
+		if u.GetDeletionTimestamp() != nil || !slices.Contains(pools, labels[NodePoolLabelKey]) {
+			continue
+		}
+		alloc, err := resourceMap(&u, "status", "allocatable")
+		if err != nil || len(alloc) == 0 {
+			continue // not launched yet: the pool does not count it either
+		}
+		name, _, _ := unstructured.NestedString(u.Object, "status", "nodeName")
+		if n := byName[name]; n != nil && takesPods(n) {
+			continue // its node takes pods now, and is among the nodes
+		}
+		taints, _, _ := unstructured.NestedSlice(u.Object, "spec", "taints")
+		n := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "nodeclaim/" + u.GetName(), Labels: labels},
+			Status: corev1.NodeStatus{Allocatable: alloc, Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}}
+		for _, t := range taints {
+			m, _ := t.(map[string]any)
+			key, _ := m["key"].(string)
+			value, _ := m["value"].(string)
+			effect, _ := m["effect"].(string)
+			n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{Key: key, Value: value, Effect: corev1.TaintEffect(effect)})
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 // poolHeadroom is how many replicas fit under the pool's limits (spec.limits minus

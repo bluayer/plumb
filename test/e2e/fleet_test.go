@@ -949,6 +949,39 @@ func TestFleetLaunchFailuresBorrowEarly(t *testing.T) {
 	}
 }
 
+// Home's NodePool has exactly the room its peak needs (the S4 run on AWS). While its
+// nodes launch, they count against the pool's limit, so no room is left, and each new
+// NodeClaim starts with Launched Unknown. Neither is a reason to borrow: the replicas
+// are arriving, the launches have not failed, and the fleet waits `after` (60s) while
+// home grows by itself.
+func TestFleetHomeGrowsToItsPoolLimit(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 50, 10) // 5 replicas wanted, 2 fit on home's node
+	pool := fmt.Sprintf("e2e-%d", time.Now().UnixNano()%100000)
+	k := f.h.karpenter(pool, "on-demand", 3, 1, 15*time.Second, time.Minute)
+	spec := f.spec()
+	spec.Clusters[0].NodePools = []string{pool}
+	f.start(spec)
+	f.keda()
+	arriving := false
+	eventually(t, 45*time.Second, "home's replicas ready on its own nodes", func() bool {
+		r := f.h.get().Status.Report
+		if r == nil {
+			return false
+		}
+		arriving = arriving || r.ArrivingReplicas == 3
+		if r.RecentLaunchFailures > 0 {
+			t.Fatalf("launches under way counted as failures: %+v", r)
+		}
+		if n := intent(f.r); n > 0 {
+			t.Fatalf("borrowed %d on remote while home's nodes were launching", n)
+		}
+		return r.ReadyReplicas == 5
+	})
+	if !arriving || k.nodes() != 3 {
+		t.Fatalf("arriving seen %v, nodes launched %d", arriving, k.nodes())
+	}
+}
+
 // The policy steers a second route, in remote. It is removed once the split has settled
 // and comes back with stale weights: the hub brings it to the settled split though the
 // first route does not move, so no ordinary traffic step can hide a missing pass.
