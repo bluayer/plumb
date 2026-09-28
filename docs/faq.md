@@ -39,7 +39,7 @@ Yes, without double-booking: each member takes other policies' promised but unpl
 
 ## Can one workload come before another?
 
-Give its pods a higher `priorityClassName`. Plumb does not rank policies; within each cluster the scheduler does, by preempting lower-priority pods. The workload that lost its place reports a shortage and borrows capacity in other clusters as usual. The pods that preempted wait for the victims to drain (`status.nominatedNodeName`); the member reports them as `nominatedReplicas`, not as a shortage, so nothing is borrowed for replicas that already have a place.
+Give its pods a higher `priorityClassName`. Plumb does not rank policies; within each cluster the scheduler does, by preempting lower-priority pods. The workload that lost its place reports a shortage and borrows capacity in other clusters as usual. The pods that preempted wait for the victims to drain (`status.nominatedNodeName`); the member reports them as `nominatedReplicas`, not as a shortage, so nothing is borrowed for replicas that already have a place. If you turn on the `NominatedNodeNameForExpectation` feature gate, do it on Kubernetes 1.35 or later (where it is on by default): as an alpha in 1.34 it also lets other components set `nominatedNodeName`, which could hide a shortage.
 
 ## How do I stop Plumb immediately?
 
