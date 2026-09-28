@@ -81,7 +81,9 @@ type Member struct {
 // +kubebuilder:rbac:groups=karpenter.sh,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=karpenter.sh,resources=nodeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes;pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
+// Core events: Karpenter's are read; the manager's leader election writes its own with the
+// core/v1 recorder (controller-runtime v0.25.1 pkg/leaderelection/leader_election.go).
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
