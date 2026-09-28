@@ -873,6 +873,13 @@ spec:
                       cluster needs now.
                     format: int32
                     type: integer
+                  nominatedReplicas:
+                    description: |-
+                      NominatedReplicas are pending replicas the scheduler has already placed on a node
+                      (status.nominatedNodeName), waiting for the pods it preempted there to exit. They are
+                      not counted in NeededReplicas.
+                    format: int32
+                    type: integer
                   pendingReplicas:
                     format: int32
                     type: integer

@@ -27,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -56,6 +57,7 @@ func (o *DeploymentObserver) Observe(ctx context.Context, namespace, name string
 	if err := o.Client.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
 		return w, err
 	}
+	nodes := map[string]bool{}
 	for _, p := range pods.Items {
 		switch {
 		case p.DeletionTimestamp != nil || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed:
@@ -63,6 +65,20 @@ func (o *DeploymentObserver) Observe(ctx context.Context, namespace, name string
 			w.Bound++
 		case p.Status.Phase == corev1.PodPending:
 			w.PendingPods++
+			// Only kube-scheduler sets it, from Kubernetes 1.35 (KEP-5278; before, other
+			// components could too): the node is only trusted if it exists.
+			if n := p.Status.NominatedNodeName; n != "" {
+				if _, seen := nodes[n]; !seen {
+					err := o.Client.Get(ctx, client.ObjectKey{Name: n}, &corev1.Node{})
+					if err != nil && !apierrors.IsNotFound(err) {
+						return w, err
+					}
+					nodes[n] = err == nil
+				}
+				if nodes[n] {
+					w.Nominated++
+				}
+			}
 		}
 	}
 	return w, nil

@@ -37,6 +37,10 @@ Another member takes over within about 15 seconds. With no hub at all, floors ex
 
 Yes, without double-booking: each member takes other policies' promised but unplaced replicas out of its room before reporting it. See [shared capacity](architecture.md#shared-capacity).
 
+## Can one workload come before another?
+
+Give its pods a higher `priorityClassName`. Plumb does not rank policies; within each cluster the scheduler does, by preempting lower-priority pods. The workload that lost its place reports a shortage and borrows capacity in other clusters as usual. The pods that preempted wait for the victims to drain (`status.nominatedNodeName`); the member reports them as `nominatedReplicas`, not as a shortage, so nothing is borrowed for replicas that already have a place.
+
 ## How do I stop Plumb immediately?
 
 Set `spec.mode: shadow` in every copy of the policy. Scalers stop serving floors at once, and the hub stops writing weights. Route weights stay where they are.

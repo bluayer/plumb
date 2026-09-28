@@ -438,3 +438,38 @@ func TestMemberLeavesOutHeldPending(t *testing.T) {
 		t.Fatalf("pending replicas no longer held are not a shortage: %+v", r)
 	}
 }
+
+// Replicas the scheduler has made room for by preempting lower-priority pods are reported
+// as nominated and not counted as needed; the rest of the pending ones are.
+func TestMemberLeavesOutNominatedPending(t *testing.T) {
+	labels := map[string]string{"app": "llm"}
+	objs := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](4), Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}}}},
+		&v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: v1alpha1.AdaptivePolicySpec{
+			Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"}, Clusters: []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 10}}}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gpu-1"}},
+	}
+	for i, nominated := range []string{"", "gpu-1", "gpu-1", ""} {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: fmt.Sprint("llm-", i), Labels: labels},
+			Status: corev1.PodStatus{Phase: corev1.PodPending, NominatedNodeName: nominated}}
+		if i == 0 {
+			pod.Spec.NodeName, pod.Status.Phase = "gpu-1", corev1.PodRunning
+		}
+		objs = append(objs, pod)
+	}
+	c := statusClient(t, interceptor.Funcs{}, objs...)
+	m := &Member{Client: c, Name: "home", Adapters: adapters.Cluster{Workloads: &adapters.DeploymentObserver{Client: c}}, Interval: time.Minute}
+	key := types.NamespacedName{Namespace: "ns", Name: "llm"}
+	if _, err := m.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatal(err)
+	}
+	got := &v1alpha1.AdaptivePolicy{}
+	if err := c.Get(context.Background(), key, got); err != nil {
+		t.Fatal(err)
+	}
+	if r := got.Status.Report; r.PendingReplicas != 3 || r.NominatedReplicas != 2 || r.NeededReplicas != 1 {
+		t.Fatalf("pending %d nominated %d needed %d", r.PendingReplicas, r.NominatedReplicas, r.NeededReplicas)
+	}
+}

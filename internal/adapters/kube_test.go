@@ -20,10 +20,12 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -234,5 +236,25 @@ func TestScaleDownHeld(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Errorf("%s: %v, %v; want %v", tc.name, got, err, tc.want)
 		}
+	}
+}
+
+// A pending pod the scheduler nominated to an existing node (it preempted pods there) is
+// counted as nominated; one nominated to a node that does not exist is not.
+func TestObserveNominated(t *testing.T) {
+	labels := map[string]string{"app": "llm"}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: appsv1.DeploymentSpec{
+		Replicas: ptr.To[int32](4), Selector: &metav1.LabelSelector{MatchLabels: labels},
+		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}}}}
+	pod := func(name, node, nominated string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name, Labels: labels},
+			Spec: corev1.PodSpec{NodeName: node}, Status: corev1.PodStatus{Phase: corev1.PodPending, NominatedNodeName: nominated}}
+	}
+	n := node("n1", "z1", 4, nil)
+	c := fake.NewClientBuilder().WithObjects(dep, &n, pod("bound", "n1", ""), pod("waiting", "", "n1"),
+		pod("waiting-too", "", "n1"), pod("gone", "", "n9"), pod("plain", "", "")).Build()
+	w, err := (&DeploymentObserver{Client: c}).Observe(context.Background(), "ns", "llm")
+	if err != nil || w.Bound != 1 || w.PendingPods != 4 || w.Nominated != 2 {
+		t.Fatalf("bound %d pending %d nominated %d: %v", w.Bound, w.PendingPods, w.Nominated, err)
 	}
 }

@@ -30,6 +30,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1013,4 +1014,131 @@ func TestPolicyRejectsBadDurations(t *testing.T) {
 			t.Errorf("window %q, after %q: created %t, want %t (%v)", tc.window, tc.after, err == nil, tc.ok, err)
 		}
 	}
+}
+
+// holdFinalizer keeps a pod terminating: KWOK deletes pods at once, while a model server
+// drains its requests for its grace period.
+const holdFinalizer = "plumb-e2e/hold"
+
+// Two workloads share home's 4 GPUs, "hi" with a higher PriorityClass than "lo"; remote
+// has 2 idle GPUs. hi grows from 2 to 4: the scheduler preempts lo's pods, and hi's new
+// pods wait, nominated to home's node, while lo's drain. They are not hi's shortage: the
+// hub borrows remote's GPUs for lo, which lost its place, and nothing for hi.
+func TestFleetPreemptionBorrowsForTheDisplaced(t *testing.T) {
+	if remote == nil {
+		t.Skip("needs PLUMB_E2E_REMOTE_KUBECONFIG")
+	}
+	ctx := context.Background()
+	h := newEnv(t, home)
+	r := envFor(t, remote, h.scenario)
+	for _, e := range []*env{h, r} {
+		for name, v := range map[string]int32{"hi": 1000, "lo": 100} {
+			pc := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: h.scenario + "-" + name}, Value: v}
+			if err := e.cl.c.Create(ctx, pc); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.cl.c.Delete(context.Background(), pc) })
+		}
+		// Let every held pod go at the end, so the namespace can be deleted.
+		t.Cleanup(func() {
+			pods := &corev1.PodList{}
+			_ = e.cl.c.List(context.Background(), pods, client.InNamespace(e.ns))
+			for _, p := range pods.Items {
+				if len(p.Finalizers) > 0 {
+					p.Finalizers = nil
+					_ = e.cl.c.Update(context.Background(), &p)
+				}
+			}
+		})
+	}
+	h.node("a", "z1", 4)
+	r.node("a", "z1", 2)
+	h.waitNodesReady()
+	r.waitNodesReady()
+	sec := func(s int) metav1.Duration { return metav1.Duration{Duration: time.Duration(s) * time.Second} }
+	for _, name := range []string{"hi", "lo"} {
+		labels := map[string]string{"app": name}
+		for _, e := range []*env{h, r} {
+			spec := e.podSpec(1)
+			spec.PriorityClassName = h.scenario + "-" + name
+			n := int32(0)
+			if e == h {
+				n = 2
+			}
+			d := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.ns}, Spec: appsv1.DeploymentSpec{
+				Replicas: &n, Selector: &metav1.LabelSelector{MatchLabels: labels},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels, Finalizers: []string{holdFinalizer}}, Spec: spec}}}
+			if err := e.cl.c.Create(ctx, d); err != nil {
+				t.Fatal(err)
+			}
+		}
+		spec := v1alpha1.AdaptivePolicySpec{Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: name},
+			Clusters:   []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 10, NodeSelector: kwokNodes}, {Name: "remote", MaxReplicas: 10, NodeSelector: kwokNodes}},
+			Capacity:   v1alpha1.CapacityPolicy{Step: 2},
+			Escalation: v1alpha1.EscalationPolicy{After: sec(60), EarlyAfter: sec(3), CalmFor: sec(600), Cooldown: sec(1), ReadyTimeout: sec(120)},
+		}
+		for _, e := range []*env{h, r} {
+			if err := e.cl.c.Create(ctx, &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e.ns}, Spec: spec}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	joinFleet(t, home, remote)
+	startMember(t, home, "home", nil, time.Second)
+	startMember(t, remote, "remote", nil, time.Second)
+	floor := func(e *env, name string) int32 {
+		p := &v1alpha1.AdaptivePolicy{}
+		if err := e.cl.c.Get(ctx, client.ObjectKey{Namespace: e.ns, Name: name}, p); err != nil || p.Status.Intent == nil {
+			return 0
+		}
+		return p.Status.Intent.Replicas
+	}
+	// Play KEDA on remote, and let preempted pods drain for 20s.
+	const drain = 20 * time.Second
+	loop(t, 500*time.Millisecond, func(ctx context.Context) error {
+		for _, name := range []string{"hi", "lo"} {
+			d := &appsv1.Deployment{}
+			if err := r.cl.c.Get(ctx, client.ObjectKey{Namespace: r.ns, Name: name}, d); err == nil && *d.Spec.Replicas != floor(r, name) {
+				r.scale(name, floor(r, name))
+			}
+		}
+		pods := &corev1.PodList{}
+		if err := h.cl.c.List(ctx, pods, client.InNamespace(h.ns)); err != nil {
+			return err
+		}
+		for _, p := range pods.Items {
+			if p.DeletionTimestamp != nil && time.Since(p.DeletionTimestamp.Time) >= drain && len(p.Finalizers) > 0 {
+				p.Finalizers = nil
+				_ = h.cl.c.Update(ctx, &p)
+			}
+		}
+		return nil
+	})
+	eventually(t, 30*time.Second, "both policies reporting", func() bool {
+		return h.policy("hi").Status.Report != nil && h.policy("lo").Status.Report != nil
+	})
+	h.scale("hi", 4)
+	eventually(t, 15*time.Second, "hi's new pods nominated to home's node", func() bool {
+		r := h.policy("hi").Status.Report
+		return r != nil && r.NominatedReplicas == 2 && r.NeededReplicas == 0
+	})
+	// lo, displaced, borrows remote's 2 GPUs well within the drain; hi borrows nothing.
+	eventually(t, 15*time.Second, "lo's floor on remote", func() bool { return floor(r, "lo") == 2 })
+	for end := time.Now().Add(drain); time.Now().Before(end); time.Sleep(time.Second) {
+		if f := floor(r, "hi"); f != 0 {
+			t.Fatalf("remote's GPUs borrowed for hi, whose pods only wait for lo's to drain: floor %d", f)
+		}
+	}
+	eventually(t, 15*time.Second, "hi's 4 replicas on home once lo's pods are gone", func() bool {
+		d := &appsv1.Deployment{}
+		return h.cl.c.Get(ctx, client.ObjectKey{Namespace: h.ns, Name: "hi"}, d) == nil && d.Status.ReadyReplicas == 4
+	})
+}
+
+// policy is the policy called name in e.
+func (e *env) policy(name string) *v1alpha1.AdaptivePolicy {
+	e.t.Helper()
+	p := &v1alpha1.AdaptivePolicy{}
+	_ = e.cl.c.Get(context.Background(), client.ObjectKey{Namespace: e.ns, Name: name}, p)
+	return p
 }

@@ -392,6 +392,11 @@ type ClusterReport struct {
 	// counted in NeededReplicas.
 	// +optional
 	ScaleDownHeld bool `json:"scaleDownHeld,omitempty"`
+	// NominatedReplicas are pending replicas the scheduler has already placed on a node
+	// (status.nominatedNodeName), waiting for the pods it preempted there to exit. They are
+	// not counted in NeededReplicas.
+	// +optional
+	NominatedReplicas int32 `json:"nominatedReplicas,omitempty"`
 	// StaticRoom is how many more replicas fit on existing nodes.
 	StaticRoom int32 `json:"staticRoom"`
 	// DynamicRoom is how many more replicas the NodePools may add, unless DynamicUnbounded.
