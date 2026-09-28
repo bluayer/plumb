@@ -81,9 +81,10 @@ make e2e-down
   ```
   api/v1alpha1/          AdaptivePolicy types
   cmd/plumb/             `plumb agent`, `plumb scaler`, `plumb suggest`, `plumb version`
-  internal/core/         plan.go (the rules), adaptive.go and planner.go (the experimental adaptive path and planner registry), model.go (System One client and provider registry), provider_*.go (one file per model host), log.go (decision log)
+  internal/core/         planning only, no network: plan.go (Plan and its types), capacity.go (escalation, allocation, release), traffic.go (relief and return), adaptive.go, validate.go, evidence.go and planner.go (the experimental adaptive path: choice, plan validation, what the models see, the planner's prompt), outcome.go, log.go (decision log)
+  internal/model/        model hosts: jev.go (System One client and provider registry), provider_*.go (one file per model host), planner.go (planner registry), planner_openai.go
   internal/controller/   member.go (reports, reservations, wiring), fleet.go (ClusterProfiles, quorum lock, election), hub.go, metrics.go
-  internal/adapters/     provider-neutral interfaces, placement simulation, Prometheus, Gateway API
+  internal/adapters/     provider-neutral interfaces, workload.go (Deployment and HPA), placement.go (placement simulation), Prometheus, Gateway API
   internal/adapters/karpenter/  Karpenter v1 on any cloud; cloud providers register what their cloud adds
   internal/adapters/aws/ karpenter.go (EC2 error codes, launch reasons, node labels), bedrock.go (planner on Bedrock)
   internal/scaler/       KEDA external scaler (externalscaler/ holds KEDA's .proto)
@@ -97,7 +98,7 @@ make e2e-down
 
 ## Model providers
 
-The ranking model (TypeSafe Jev) is experimental: off by default, and in `shadow` mode (recorded, not used) until `--model-mode=apply`. It can be served from different hosts. Each host is a provider: one file, `internal/core/provider_<name>.go`, that registers itself:
+The ranking model (TypeSafe Jev) is experimental: off by default, and in `shadow` mode (recorded, not used) until `--model-mode=apply`. It can be served from different hosts. Each host is a provider: one file, `internal/model/provider_<name>.go`, that registers itself:
 
 ```go
 func init() {
@@ -113,14 +114,14 @@ func (p myHost) NewRequest(ctx context.Context, e Evaluation) (*http.Request, er
 func (myHost) Output(body []byte) ([]byte, error)
 ```
 
-It is then selectable with `--model-provider=myhost` (Helm: `model.provider`). A provider only handles the wire format. Timeouts, the circuit breaker, validation of the answers, the https rule and "a hosted default is only called with a key" apply to every provider unchanged. Copy the request and response shapes from the host's documentation or source, cite it in a comment, and test them against an `httptest` server as `model_test.go` does. A host that already speaks `/v1/systemone` needs no new code: use `typesafe` with `--model-url`, or give it a name and defaults by registering a spec that reuses the TypeSafe wire format, as `provider_vercel.go` does in a few lines.
+It is then selectable with `--model-provider=myhost` (Helm: `model.provider`). A provider only handles the wire format. Timeouts, the circuit breaker, validation of the answers, the https rule and "a hosted default is only called with a key" apply to every provider unchanged. Copy the request and response shapes from the host's documentation or source, cite it in a comment, and test them against an `httptest` server as `jev_test.go` does. A host that already speaks `/v1/systemone` needs no new code: use `typesafe` with `--model-url`, or give it a name and defaults by registering a spec that reuses the TypeSafe wire format, as `provider_vercel.go` does in a few lines.
 
 ### Planner providers
 
-The experimental planner (the model proposing plans for `spec.experimental.adaptive`) plugs in the same way: one file whose `init` calls `core.RegisterPlanner`, selectable with `--planner-provider`. A planner host only carries a request: it gets a system prompt, the request (JSON) and the answer's JSON schema, and returns the model's answer as JSON. Prompt, schema, parsing, validation and the background scheduling are shared. A host that needs a cloud SDK lives under `internal/adapters/<cloud>/` (Bedrock: `internal/adapters/aws/bedrock.go`); a generic HTTP host can live in `internal/core/` (OpenAI-compatible Chat Completions: `internal/core/planner_openai.go`). Test the wire format against an `httptest` server as those providers do.
+The experimental planner (the model proposing plans for `spec.experimental.adaptive`) plugs in the same way: one file whose `init` calls `model.RegisterPlanner`, selectable with `--planner-provider`. A planner host only carries a request: it gets a system prompt, the request (JSON) and the answer's JSON schema, and returns the model's answer as JSON. Prompt, schema, parsing, validation and the background scheduling are shared. A host that needs a cloud SDK lives under `internal/adapters/<cloud>/` (Bedrock: `internal/adapters/aws/bedrock.go`); a generic HTTP host lives in `internal/model/` (OpenAI-compatible Chat Completions: `internal/model/planner_openai.go`). Test the wire format against an `httptest` server as those providers do.
 
 ```go
-func init() { core.RegisterPlanner("myhost", core.PlannerSpec{New: newMyHost}) }
+func init() { model.RegisterPlanner("myhost", model.PlannerSpec{New: newMyHost}) }
 
 func (p *myHost) Propose(ctx context.Context, system, request string, schema map[string]any) (json.RawMessage, error)
 ```

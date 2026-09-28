@@ -615,13 +615,12 @@ func TestFleetEscalationToStaticCapacity(t *testing.T) {
 // step at a time, gives remote's floor back once it carries none, and home's last. The
 // capacity decision's outcome is joined to what followed.
 func TestFleetReturnGrowsHomeFirst(t *testing.T) {
-	saved := core.Horizons // outcome checkpoints, shortened for the test
-	core.Horizons = []time.Duration{2 * time.Second, 20 * time.Second}
-	t.Cleanup(func() { core.Horizons = saved })
 	f := newFleet(t, 2, 4, 2, 40, 10)
 	spec := f.spec()
-	spec.Escalation.ReadyTimeout = seconds(20) // no later than the last checkpoint, which it would extend
-	f.start(spec)
+	spec.Escalation.ReadyTimeout = seconds(20)  // no later than the last checkpoint, which it would extend
+	f.start(spec, func(o *controller.Options) { // outcome checkpoints, shortened for the test
+		o.Horizons = []time.Duration{2 * time.Second, 20 * time.Second}
+	})
 	f.keda()
 	f.balanced()
 
@@ -720,7 +719,7 @@ func TestScalerFencing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: controller.HubLease, Namespace: fleetNS}}
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.HubLease, Namespace: fleetNS}}
 	_ = home.c.Delete(ctx, lease) // whatever an earlier test's hub left
 	holder := func(id string, renewed time.Duration) {
 		t.Helper()

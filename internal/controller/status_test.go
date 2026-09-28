@@ -106,7 +106,7 @@ func TestHubRetriesRouteAfterPartialWrite(t *testing.T) {
 		Traffic:  &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: "a", Namespace: "ns", Name: "first"}, {Cluster: "a", Namespace: "ns", Name: "second"}}},
 	}}
 	holder, duration, renew := "hub", int32(60), metav1.NewMicroTime(time.Now())
-	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: HubLease},
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: v1alpha1.HubLease},
 		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew}}
 	h := NewHub(Hub{Identity: holder, Fleet: &Fleet{Namespace: "plumb-system", members: map[string]*member{
 		"a": {cl: fakeCluster{c: c}, leases: k8sfake.NewClientset(lease).CoordinationV1()},
@@ -144,7 +144,7 @@ func TestHubLeavesEquivalentRouteRatioAlone(t *testing.T) {
 		Traffic:  &v1alpha1.TrafficPolicy{Routes: []v1alpha1.RouteRef{{Cluster: "a", Namespace: "ns", Name: "route"}}},
 	}}
 	holder, duration, renew := "hub", int32(60), metav1.NewMicroTime(time.Now())
-	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: HubLease},
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: "plumb-system", Name: v1alpha1.HubLease},
 		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &duration, RenewTime: &renew}}
 	h := NewHub(Hub{Identity: holder, Fleet: &Fleet{Namespace: "plumb-system", members: map[string]*member{
 		"a": {cl: fakeCluster{c: c}, leases: k8sfake.NewClientset(lease).CoordinationV1()},

@@ -35,7 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/bluayer/plumb/api/v1alpha1"
-	"github.com/bluayer/plumb/internal/controller"
 	"github.com/bluayer/plumb/internal/scaler/externalscaler"
 )
 
@@ -125,13 +124,13 @@ func (s *Server) Floor(ctx context.Context, ref *externalscaler.ScaledObjectRef)
 		return 0, nil
 	}
 	lease := &coordinationv1.Lease{}
-	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: controller.HubLease}, lease); err != nil {
+	if err := s.Reader.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: v1alpha1.HubLease}, lease); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			return 0, nil
 		}
 		return 0, status.Errorf(codes.Unavailable, "reading hub lease: %v", err)
 	}
-	if controller.HubHolder(lease, now) != in.Hub { // fencing: a deposed hub's intent is void
+	if v1alpha1.HubHolder(lease, now) != in.Hub { // fencing: a deposed hub's intent is void
 		return 0, nil
 	}
 	if s.Cluster != "" {

@@ -32,7 +32,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/bluayer/plumb/api/v1alpha1"
-	"github.com/bluayer/plumb/internal/controller"
 	"github.com/bluayer/plumb/internal/scaler/externalscaler"
 )
 
@@ -48,7 +47,7 @@ func policy(mode v1alpha1.Mode, hub string, expires time.Time) *v1alpha1.Adaptiv
 }
 
 func lease(holder string, renewed time.Time) *coordinationv1.Lease {
-	return &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: controller.HubLease, Namespace: "plumb-system"},
+	return &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.HubLease, Namespace: "plumb-system"},
 		Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder, RenewTime: &metav1.MicroTime{Time: renewed},
 			LeaseDurationSeconds: ptr.To[int32](15)}}
 }

@@ -44,14 +44,14 @@ func TestOutcomeFollowsADecision(t *testing.T) {
 
 	// 40s: b still has 4 ready. Nothing is due.
 	b.Report.Time = metav1.Time{Time: t0.Add(40 * time.Second)}
-	tracked, outs, ready := Follow(tracked, "ns/llm", cs, t0.Add(40*time.Second), 0)
+	tracked, outs, ready := Follow(tracked, "ns/llm", cs, t0.Add(40*time.Second), Horizons(), 0)
 	if len(outs) != 0 || len(ready) != 0 {
 		t.Fatalf("early outcome %+v %v", outs, ready)
 	}
 
 	// 70s: b reported 6 ready at 65s; the 1m checkpoint is due. A second decision follows.
 	cs[1].Report.ReadyReplicas, cs[1].Report.Time = 6, metav1.Time{Time: t0.Add(65 * time.Second)}
-	tracked, outs, ready = Follow(tracked, "ns/llm", cs, t0.Add(70*time.Second), 0)
+	tracked, outs, ready = Follow(tracked, "ns/llm", cs, t0.Add(70*time.Second), Horizons(), 0)
 	if len(ready) != 1 || ready[0] != 65*time.Second || len(outs) != 1 {
 		t.Fatalf("ready %v outcomes %+v", ready, outs)
 	}
@@ -64,7 +64,7 @@ func TestOutcomeFollowsADecision(t *testing.T) {
 	// 16m: d1's two remaining checkpoints and d2's first two are written; d1 is done, d2
 	// waits for its 15m checkpoint.
 	cs[1].Report = nil // b stopped reporting
-	tracked, outs, _ = Follow(tracked, "ns/llm", cs, t0.Add(16*time.Minute), 0)
+	tracked, outs, _ = Follow(tracked, "ns/llm", cs, t0.Add(16*time.Minute), Horizons(), 0)
 	if len(outs) != 4 || !outs[1].Final || outs[1].FollowedBy[0] != "d2 shift_traffic" || !outs[1].Clusters["b"].Stale {
 		t.Fatalf("outcomes %+v", outs)
 	}
@@ -81,7 +81,7 @@ func TestOutcomeOfShadowDecision(t *testing.T) {
 	tracked := Track(nil, "d1", "add_capacity", false, t0, before, after)
 	b := member("b", 1, 0, 8, 0) // one ready replica, created by someone else
 	b.Report.Time = metav1.Time{Time: t0.Add(3 * time.Second)}
-	_, outs, ready := Follow(tracked, "ns/llm", []Cluster{b}, t0.Add(70*time.Second), 0)
+	_, outs, ready := Follow(tracked, "ns/llm", []Cluster{b}, t0.Add(70*time.Second), Horizons(), 0)
 	if len(ready) != 0 || len(outs) != 1 || outs[0].Applied || len(outs[0].ReadyAfterSeconds) != 0 {
 		t.Fatalf("ready %v outcomes %+v", ready, outs)
 	}

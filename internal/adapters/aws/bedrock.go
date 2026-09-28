@@ -29,6 +29,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 )
 
 // The planner on Amazon Bedrock, through the Converse API (aws-sdk-go-v2
@@ -38,7 +39,7 @@ import (
 // answer. Credentials and region come from the SDK's default chain (IRSA or EKS Pod
 // Identity in a cluster); PlannerOptions.Region and Endpoint override them.
 func init() {
-	core.RegisterPlanner("bedrock", core.PlannerSpec{New: NewBedrockPlanner})
+	model.RegisterPlanner("bedrock", model.PlannerSpec{New: NewBedrockPlanner})
 }
 
 // bedrockTool is the name of the tool the model answers through.
@@ -51,7 +52,7 @@ type bedrockPlanner struct {
 
 // NewBedrockPlanner reads Model (a Bedrock model or inference profile id, required),
 // Region and Endpoint.
-func NewBedrockPlanner(o core.PlannerOptions) (core.Planner, error) {
+func NewBedrockPlanner(o model.PlannerOptions) (core.Planner, error) {
 	if o.Model == "" {
 		return nil, errors.New("bedrock: --planner-model is required")
 	}

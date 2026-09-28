@@ -59,6 +59,7 @@ import (
 	"github.com/bluayer/plumb/internal/adapters/karpenter"
 	"github.com/bluayer/plumb/internal/controller"
 	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 	"github.com/bluayer/plumb/internal/scaler"
 	"github.com/bluayer/plumb/internal/scaler/externalscaler"
 )
@@ -112,15 +113,15 @@ func checkModelURL(flag, raw string) error {
 // newRanker connects the named model provider (experimental); nil means rules rank. The key comes from
 // PLUMB_MODEL_API_KEY, else the provider's own variable. A provider's default (hosted)
 // endpoint is only called with a key: the fleet summary leaves the cluster by opt-in.
-func newRanker(provider, url, model string, timeout time.Duration) (*core.SystemOne, error) {
+func newRanker(provider, url, modelName string, timeout time.Duration) (*model.SystemOne, error) {
 	if provider == "" {
 		return nil, nil
 	}
-	spec, ok := core.LookupProvider(provider)
+	spec, ok := model.LookupProvider(provider)
 	if !ok {
-		return nil, fmt.Errorf("--model-provider %q: known providers are %s", provider, strings.Join(core.Providers(), ", "))
+		return nil, fmt.Errorf("--model-provider %q: known providers are %s", provider, strings.Join(model.Providers(), ", "))
 	}
-	o := core.ProviderOptions{URL: cmp.Or(url, spec.URL), Model: cmp.Or(model, spec.Model), APIKey: os.Getenv("PLUMB_MODEL_API_KEY")}
+	o := model.ProviderOptions{URL: cmp.Or(url, spec.URL), Model: cmp.Or(modelName, spec.Model), APIKey: os.Getenv("PLUMB_MODEL_API_KEY")}
 	if o.APIKey == "" && spec.KeyEnv != "" {
 		o.APIKey = os.Getenv(spec.KeyEnv)
 	}
@@ -139,17 +140,17 @@ func newRanker(provider, url, model string, timeout time.Duration) (*core.System
 		return nil, err
 	}
 	ctrl.Log.Info("ranking model", "provider", provider, "url", o.URL, "model", o.Model)
-	return &core.SystemOne{Provider: p, Timeout: timeout, HTTP: &http.Client{Timeout: timeout}}, nil
+	return &model.SystemOne{Provider: p, Timeout: timeout, HTTP: &http.Client{Timeout: timeout}}, nil
 }
 
 // newPlanner connects the named planner host (experimental); nil means none.
-func newPlanner(provider string, o core.PlannerOptions) (core.Planner, error) {
+func newPlanner(provider string, o model.PlannerOptions) (core.Planner, error) {
 	if provider == "" {
 		return nil, nil
 	}
-	spec, ok := core.LookupPlanner(provider)
+	spec, ok := model.LookupPlanner(provider)
 	if !ok {
-		return nil, fmt.Errorf("--planner-provider %q: known providers are %s", provider, strings.Join(core.Planners(), ", "))
+		return nil, fmt.Errorf("--planner-provider %q: known providers are %s", provider, strings.Join(model.Planners(), ", "))
 	}
 	if o.Endpoint != "" {
 		if err := checkModelURL("--planner-endpoint", o.Endpoint); err != nil {
@@ -181,12 +182,12 @@ func runAgent(ctx context.Context, args []string) error {
 	ns := namespaceFlag(fs)
 	providers := fs.String("clusterprofile-provider-file", "", "ClusterProfile access providers (KEP-5339); empty: a fleet of one")
 	promURL := fs.String("prometheus-url", "", "this cluster's Prometheus, for spec.signals; empty: no metric signals")
-	modelProvider := fs.String("model-provider", "", "experimental: host serving a model that ranks clusters ("+strings.Join(core.Providers(), ", ")+`); "" for rules only`)
+	modelProvider := fs.String("model-provider", "", "experimental: host serving a model that ranks clusters ("+strings.Join(model.Providers(), ", ")+`); "" for rules only`)
 	modelMode := fs.String("model-mode", "shadow", "experimental: shadow only records what a model picks (the ranking, and every policy's adaptive pick); apply carries out the ranking, and the adaptive pick of policies with spec.experimental.adaptive.mode=apply")
 	modelURL := fs.String("model-url", "", "model endpoint; empty: the provider's default")
 	modelName := fs.String("model", "", "model name; empty: the provider's default")
 	modelTimeout := fs.Duration("model-timeout", time.Second, "per-call model timeout; the rules decide on expiry")
-	plannerProvider := fs.String("planner-provider", "", "experimental: host serving the model that proposes plans for spec.experimental.adaptive ("+strings.Join(core.Planners(), ", ")+`); "" for none`)
+	plannerProvider := fs.String("planner-provider", "", "experimental: host serving the model that proposes plans for spec.experimental.adaptive ("+strings.Join(model.Planners(), ", ")+`); "" for none`)
 	plannerModel := fs.String("planner-model", "", "planner model id (Bedrock or an OpenAI-compatible server)")
 	plannerRegion := fs.String("planner-region", "", "planner region; empty: the provider's default (for Bedrock, the AWS SDK's)")
 	plannerEndpoint := fs.String("planner-endpoint", "", "planner endpoint: Bedrock override or OpenAI-compatible base URL ending in /v1")
@@ -215,7 +216,7 @@ func runAgent(ctx context.Context, args []string) error {
 	if ranker != nil {
 		ctrl.Log.Info("the ranking model is experimental", "mode", *modelMode)
 	}
-	planner, err := newPlanner(*plannerProvider, core.PlannerOptions{Model: *plannerModel, Region: *plannerRegion, Endpoint: *plannerEndpoint, ResponseFormat: *plannerResponseFormat})
+	planner, err := newPlanner(*plannerProvider, model.PlannerOptions{Model: *plannerModel, Region: *plannerRegion, Endpoint: *plannerEndpoint, ResponseFormat: *plannerResponseFormat})
 	if err != nil {
 		return err
 	}
@@ -296,7 +297,7 @@ func runScaler(ctx context.Context, args []string) error {
 	// caches only the hub Lease.
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: *metricsAddr},
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{&coordinationv1.Lease{}: {
-			Namespaces: map[string]cache.Config{*ns: {}}, Field: fields.OneTermEqualSelector("metadata.name", controller.HubLease)}}}})
+			Namespaces: map[string]cache.Config{*ns: {}}, Field: fields.OneTermEqualSelector("metadata.name", v1alpha1.HubLease)}}}})
 	if err != nil {
 		return err
 	}

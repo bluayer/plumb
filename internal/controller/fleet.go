@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -44,11 +43,6 @@ import (
 
 	"github.com/bluayer/plumb/api/v1alpha1"
 )
-
-// HubLease is the coordination.k8s.io/v1 Lease every member keeps in its namespace. The
-// hub holds it on a majority of members; each member reads its own copy to check that
-// an intent comes from the current hub.
-const HubLease = "plumb-hub"
 
 // Leader election timing, the client-go and kube-controller-manager defaults.
 const (
@@ -215,8 +209,8 @@ func (f *Fleet) Holds(ctx context.Context, name, identity string) bool {
 	if m == nil {
 		return false
 	}
-	l, err := m.leases.Leases(f.Namespace).Get(ctx, HubLease, metav1.GetOptions{})
-	return err == nil && HubHolder(l, time.Now()) == identity
+	l, err := m.leases.Leases(f.Namespace).Get(ctx, v1alpha1.HubLease, metav1.GetOptions{})
+	return err == nil && v1alpha1.HubHolder(l, time.Now()) == identity
 }
 
 // quorumLock is a client-go resourcelock.Interface over the members' hub Leases: the
@@ -257,7 +251,7 @@ func (q *quorumLock) voters() (map[string]*resourcelock.LeaseLock, int) {
 		l := q.locks[name]
 		if l == nil || l.Client != m.leases {
 			l = &resourcelock.LeaseLock{Client: m.leases, LockConfig: resourcelock.ResourceLockConfig{Identity: q.id},
-				LeaseMeta: metav1.ObjectMeta{Namespace: q.fleet.Namespace, Name: HubLease}}
+				LeaseMeta: metav1.ObjectMeta{Namespace: q.fleet.Namespace, Name: v1alpha1.HubLease}}
 			q.locks[name], q.found[name] = l, false
 		}
 		out[name] = l
@@ -324,7 +318,7 @@ func (q *quorumLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRecor
 		return nil, nil, fmt.Errorf("%d of %d members reachable, need %d: %w", reached, len(voters), quorum, err)
 	}
 	if len(records) == 0 {
-		return nil, nil, apierrors.NewNotFound(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, HubLease)
+		return nil, nil, apierrors.NewNotFound(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, v1alpha1.HubLease)
 	}
 	best := plurality(records)
 	raw, err := json.Marshal(best)
@@ -391,7 +385,9 @@ func (q *quorumLock) Update(ctx context.Context, ler resourcelock.LeaderElection
 
 func (q *quorumLock) RecordEvent(string) {}
 func (q *quorumLock) Identity() string   { return q.id }
-func (q *quorumLock) Describe() string   { return q.fleet.Namespace + "/" + HubLease + " (fleet quorum)" }
+func (q *quorumLock) Describe() string {
+	return q.fleet.Namespace + "/" + v1alpha1.HubLease + " (fleet quorum)"
+}
 
 // Elector runs fleet-wide leader election under the member's own (local) leader
 // election, and runs lead while this member is the hub.
@@ -409,7 +405,7 @@ func (e *Elector) Start(ctx context.Context) error {
 	}
 	for ctx.Err() == nil {
 		le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-			Lock: newQuorumLock(e.Identity, e.Fleet), Name: HubLease, ReleaseOnCancel: true,
+			Lock: newQuorumLock(e.Identity, e.Fleet), Name: v1alpha1.HubLease, ReleaseOnCancel: true,
 			LeaseDuration: LeaseDuration, RenewDeadline: RenewDeadline, RetryPeriod: RetryPeriod,
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: e.Lead,
@@ -423,17 +419,4 @@ func (e *Elector) Start(ctx context.Context) error {
 		le.Run(ctx) // returns when leadership is lost; stand again
 	}
 	return nil
-}
-
-// HubHolder reads this member's copy of the hub Lease: the identity it names, if the
-// lease has not expired.
-func HubHolder(l *coordinationv1.Lease, now time.Time) string {
-	s := l.Spec
-	if s.HolderIdentity == nil || s.RenewTime == nil || s.LeaseDurationSeconds == nil {
-		return ""
-	}
-	if now.After(s.RenewTime.Add(time.Duration(*s.LeaseDurationSeconds) * time.Second)) {
-		return ""
-	}
-	return *s.HolderIdentity
 }

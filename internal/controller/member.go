@@ -55,6 +55,7 @@ import (
 	"github.com/bluayer/plumb/api/v1alpha1"
 	"github.com/bluayer/plumb/internal/adapters"
 	"github.com/bluayer/plumb/internal/core"
+	"github.com/bluayer/plumb/internal/model"
 )
 
 // LaunchFailureWindow is how long launch failures count as recent.
@@ -432,14 +433,15 @@ type Options struct {
 	// NewCluster builds another member's client and cache from its ClusterProfile.
 	NewCluster  func(*rest.Config) (cluster.Cluster, error)
 	Prometheus  *adapters.Prometheus
-	Model       *core.SystemOne
+	Model       *model.SystemOne
 	ModelShadow bool
 	// Planner proposes plans for spec.experimental.adaptive; see Hub.
 	Planner         core.Planner
 	PlannerInterval time.Duration
 	PlannerTimeout  time.Duration
 	Log             *core.Log
-	Interval        time.Duration // member reports
+	Horizons        []time.Duration // outcome checkpoints; nil: core.Horizons
+	Interval        time.Duration   // member reports
 	HubInterval     time.Duration
 }
 
@@ -450,7 +452,7 @@ func Setup(mgr ctrl.Manager, o Options) (*Hub, error) {
 		return nil, err
 	}
 	hub := NewHub(Hub{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Identity: o.Identity, Interval: o.HubInterval, Model: o.Model, ModelShadow: o.ModelShadow, Log: o.Log,
-		Planner: o.Planner, PlannerInterval: o.PlannerInterval, PlannerTimeout: o.PlannerTimeout,
+		Planner: o.Planner, PlannerInterval: o.PlannerInterval, PlannerTimeout: o.PlannerTimeout, Horizons: o.Horizons,
 		Recorder: mgr.GetEventRecorder("plumb-hub")})
 	hub.Fleet = &Fleet{Self: o.Name, Namespace: o.Namespace, Local: mgr, Access: o.Access, NewCluster: o.NewCluster, Changed: hub.Wake}
 	if err := hub.Fleet.SetupWithManager(mgr); err != nil {

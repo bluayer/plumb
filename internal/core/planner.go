@@ -21,8 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
-	"slices"
 )
 
 // Planner is a host serving a language model that proposes plans (experimental). It only
@@ -30,44 +28,12 @@ import (
 // schema and its parsing are Plumb's, the same for every host, and every proposed plan is
 // validated before Jev may pick it.
 //
-// To add a host, write a file with an init function that calls RegisterPlanner (hosts
-// that need a cloud SDK live in internal/adapters/<cloud>/).
+// Hosts are in internal/model, registered with model.RegisterPlanner (hosts that need a
+// cloud SDK live in internal/adapters/<cloud>/).
 type Planner interface {
 	// Propose sends the system prompt and the request, and returns the model's answer as
 	// JSON following schema.
 	Propose(ctx context.Context, system, request string, schema map[string]any) (json.RawMessage, error)
-}
-
-// PlannerOptions configure a planner host; each host documents which it reads.
-type PlannerOptions struct {
-	Model, Region, Endpoint, APIKey, ResponseFormat string
-}
-
-// PlannerSpec describes a registered planner host.
-type PlannerSpec struct {
-	New func(PlannerOptions) (Planner, error)
-}
-
-var planners = map[string]PlannerSpec{}
-
-// RegisterPlanner makes a planner host selectable by name (--planner-provider). Call it
-// from an init function; registering a name twice panics.
-func RegisterPlanner(name string, s PlannerSpec) {
-	if _, dup := planners[name]; dup || name == "" || s.New == nil {
-		panic(fmt.Sprintf("planner %q registered twice or incomplete", name))
-	}
-	planners[name] = s
-}
-
-// LookupPlanner returns a registered planner host.
-func LookupPlanner(name string) (PlannerSpec, bool) {
-	s, ok := planners[name]
-	return s, ok
-}
-
-// Planners lists the registered planner hosts, sorted.
-func Planners() []string {
-	return slices.Sorted(maps.Keys(planners))
 }
 
 // plannerSystem is the planner's system prompt, but for its last part (plannerAlternatives
