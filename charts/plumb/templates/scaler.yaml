@@ -13,7 +13,7 @@ spec:
     spec:
       serviceAccountName: {{ include "plumb.name" . }}-scaler
       {{- include "plumb.podSecurityContext" . | nindent 6 }}
-      {{- include "plumb.podScheduling" (list . .Values.scaler) | nindent 6 }}
+      {{- include "plumb.podScheduling" (list . .Values.scaler "scaler") | trim | nindent 6 }}
       containers:
         - name: scaler
           image: {{ include "plumb.image" . }}

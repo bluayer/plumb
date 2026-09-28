@@ -81,7 +81,7 @@ agent:
     limits: {memory: 512Mi}
   nodeSelector: {}
   tolerations: []
-  affinity: {}
+  affinity: {}     # empty: prefer spreading the replicas over nodes
   priorityClassName: ""
 
 scaler:
@@ -94,7 +94,7 @@ scaler:
     limits: {memory: 256Mi}
   nodeSelector: {}
   tolerations: []
-  affinity: {}
+  affinity: {}     # empty: prefer spreading the replicas over nodes
   priorityClassName: ""
 
 # Scrape /metrics with the Prometheus Operator.

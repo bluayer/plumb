@@ -118,6 +118,8 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 
 ## Helm values
 
+`charts/plumb/values.schema.json` checks values on `helm install`, `upgrade` and `template`: an unknown key (a typo), a wrong type, a duration that is not a Go duration (`30s`, `2m`), `model.mode` other than `shadow`/`apply`, or `planner.provider: openai` without `planner.endpoint` is rejected before anything is installed.
+
 | Value | Default | Description |
 |---|---|---|
 | `clusterName` | required | This member's name |
@@ -146,7 +148,8 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `scaler.tlsSecretName` | `""` | `kubernetes.io/tls` Secret to serve gRPC over TLS |
 | `serviceMonitor.enabled` | `false` | Create Prometheus Operator ServiceMonitors for both components |
 | `image.repository` / `image.tag` | `ghcr.io/bluayer/plumb` / appVersion | Image |
-| `*.resources`, `*.nodeSelector`, `*.tolerations`, `*.affinity`, `*.priorityClassName`, `imagePullSecrets` | — | Standard pod settings for `agent` and `scaler` |
+| `*.resources`, `*.nodeSelector`, `*.tolerations`, `*.priorityClassName`, `imagePullSecrets` | — | Standard pod settings for `agent` and `scaler` |
+| `*.affinity` | `{}` | Empty: each component's replicas prefer different nodes, so one node failing does not take both down; on a single node they still schedule. Set it to replace that |
 
 ## Command-line flags
 

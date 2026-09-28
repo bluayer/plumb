@@ -1,0 +1,311 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Plumb chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clusterName"
+  ],
+  "properties": {
+    "global": {
+      "type": "object",
+      "description": "Helm's global values, unused"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": [
+            "string",
+            "number"
+          ],
+          "description": "Empty: the chart's appVersion"
+        },
+        "pullPolicy": {
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "clusterName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "This member's name. Required"
+    },
+    "prometheusURL": {
+      "type": "string"
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Empty: rules only; a registered provider (typesafe, cloudflare, vercel)"
+        },
+        "mode": {
+          "enum": [
+            "shadow",
+            "apply"
+          ]
+        },
+        "url": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+          "description": "A Go duration such as 30s, 2m or 1h30m"
+        },
+        "apiKeySecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Secret name; empty: none"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "planner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Empty: none; a registered planner (bedrock, openai)"
+        },
+        "model": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "responseFormat": {
+          "enum": [
+            "",
+            "text",
+            "json_schema"
+          ]
+        },
+        "apiKeySecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Secret name; empty: none"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "interval": {
+          "type": "string",
+          "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+          "description": "A Go duration such as 30s, 2m or 1h30m"
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+          "description": "A Go duration such as 30s, 2m or 1h30m"
+        }
+      },
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "openai"
+          }
+        },
+        "required": [
+          "provider"
+        ]
+      },
+      "then": {
+        "properties": {
+          "endpoint": {
+            "minLength": 1,
+            "description": "required for openai"
+          }
+        }
+      }
+    },
+    "accessProviders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "execConfig"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "execConfig": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resources": {
+          "type": "object",
+          "description": "corev1.ResourceRequirements"
+        },
+        "nodeSelector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "affinity": {
+          "type": "object",
+          "description": "corev1.Affinity; empty: prefer spreading replicas across nodes"
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
+        "interval": {
+          "type": "string",
+          "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+          "description": "A Go duration such as 30s, 2m or 1h30m"
+        },
+        "hubInterval": {
+          "type": "string",
+          "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+          "description": "A Go duration such as 30s, 2m or 1h30m"
+        },
+        "decisionLog": {
+          "type": "string",
+          "minLength": 1,
+          "description": "JSONL path; - is stdout"
+        },
+        "serviceAccountAnnotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "scaler": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resources": {
+          "type": "object",
+          "description": "corev1.ResourceRequirements"
+        },
+        "nodeSelector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "affinity": {
+          "type": "object",
+          "description": "corev1.Affinity; empty: prefer spreading replicas across nodes"
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
+        "tlsSecretName": {
+          "type": "string"
+        }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "interval": {
+          "type": "string",
+          "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$",
+          "description": "A Go duration such as 30s, 2m or 1h30m"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

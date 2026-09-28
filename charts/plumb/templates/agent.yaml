@@ -26,7 +26,7 @@ spec:
     spec:
       serviceAccountName: {{ include "plumb.name" . }}-agent
       {{- include "plumb.podSecurityContext" . | nindent 6 }}
-      {{- include "plumb.podScheduling" (list . .Values.agent) | nindent 6 }}
+      {{- include "plumb.podScheduling" (list . .Values.agent "agent") | trim | nindent 6 }}
       containers:
         - name: agent
           image: {{ include "plumb.image" . }}
