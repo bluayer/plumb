@@ -718,7 +718,7 @@ func observed(in AdaptiveInput) map[string]any {
 			continue
 		}
 		v["desiredReplicas"], v["readyReplicas"], v["pendingReplicas"] = r.DesiredReplicas, r.ReadyReplicas, r.PendingReplicas
-		v["shortBy"], v["staticRoom"], v["recentLaunchFailures"] = r.NeededReplicas, r.StaticRoom, r.RecentICE
+		v["shortBy"], v["staticRoom"], v["recentLaunchFailures"] = r.NeededReplicas, r.StaticRoom, r.RecentLaunchFailures
 		if r.ScaleDownHeld {
 			v["scaleDownHeld"] = true // its pending replicas are about to go, not missing
 		}

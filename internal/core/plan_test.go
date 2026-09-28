@@ -342,7 +342,7 @@ func TestPlanPlacement(t *testing.T) {
 	}
 	for name, exhaust := range map[string]func(*v1alpha1.ClusterReport){
 		"at its NodePool limits": func(r *v1alpha1.ClusterReport) { r.DynamicRoom = 0 },
-		"launches failing":       func(r *v1alpha1.ClusterReport) { r.RecentICE = RecurringICE },
+		"launches failing":       func(r *v1alpha1.ClusterReport) { r.RecentLaunchFailures = RecurringLaunchFailures },
 	} {
 		in = Input{Now: t0, Config: cfg, Clusters: cs()}
 		exhaust(in.Clusters[0].Report)
@@ -431,7 +431,7 @@ func TestPlanAwaitsReady(t *testing.T) {
 func TestPlanRegionWithLaunchFailures(t *testing.T) {
 	cs := func() []Cluster {
 		a := short(member("a", 10, 0, 0, 100), 6, 45*time.Second)
-		a.Report.RecentICE = RecurringICE
+		a.Report.RecentLaunchFailures = RecurringLaunchFailures
 		b, c := member("b", 2, 0, 8, 0), member("c", 2, 0, 8, 0)
 		c.Spec.CostRank = 10 // the rules prefer b otherwise
 		a.Report.Region, b.Report.Region, c.Report.Region = "r1", "r1", "r2"
@@ -443,7 +443,7 @@ func TestPlanRegionWithLaunchFailures(t *testing.T) {
 	}
 
 	healthy := cs()
-	healthy[0].Report.RecentICE = 0
+	healthy[0].Report.RecentLaunchFailures = 0
 	healthy[0].Report.DynamicRoom = 0 // still escalates early: it cannot add nodes itself
 	if f := floors(Plan(Input{Now: t0, Config: cfg, Clusters: healthy})); f["b"] != 6 || f["c"] != 4 {
 		t.Fatalf("no failures, rules order: %v", f)

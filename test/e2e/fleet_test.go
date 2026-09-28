@@ -356,7 +356,7 @@ func TestMemberReportsLaunchFailures(t *testing.T) {
 	e.ice("gpu", "spot", aws.CodeInsufficientInstanceCapacity, 3)
 	eventually(t, 30*time.Second, "3 recent launch failures in the report", func() bool {
 		r := e.get().Status.Report
-		return r != nil && r.RecentICE >= 3
+		return r != nil && r.RecentLaunchFailures >= 3
 	})
 	time.Sleep(2 * time.Second) // another reconcile
 	if err := e.cl.c.Get(context.Background(), client.ObjectKey{Name: "gpu"}, np); err != nil {

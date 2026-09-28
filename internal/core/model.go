@@ -220,7 +220,7 @@ func RankWith(ctx context.Context, m *SystemOne) Ranker {
 			Static    int32  `json:"staticRoom"`
 			Dynamic   int32  `json:"dynamicRoom"`
 			Unbounded bool   `json:"dynamicUnbounded,omitempty"`
-			ICE       int32  `json:"recentICE"`
+			Failures  int32  `json:"recentLaunchFailures"`
 			Cost      int32  `json:"costRank"`
 			Max       int32  `json:"maxReplicas"`
 		}
@@ -228,7 +228,7 @@ func RankWith(ctx context.Context, m *SystemOne) Ranker {
 		options := map[string]string{}
 		for _, c := range cands {
 			r := c.Report
-			state[c.Spec.Name] = row{RegionOf(c), r.ReadyReplicas, r.StaticRoom, r.DynamicRoom, r.DynamicUnbounded, r.RecentICE, c.Spec.CostRank, c.Spec.MaxReplicas}
+			state[c.Spec.Name] = row{RegionOf(c), r.ReadyReplicas, r.StaticRoom, r.DynamicRoom, r.DynamicUnbounded, r.RecentLaunchFailures, c.Spec.CostRank, c.Spec.MaxReplicas}
 			options[c.Spec.Name] = "add replicas in cluster " + c.Spec.Name
 		}
 		return m.Choose(ctx, map[string]any{"clusters": state},
