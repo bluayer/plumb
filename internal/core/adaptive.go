@@ -722,6 +722,9 @@ func observed(in AdaptiveInput) map[string]any {
 		if r.ScaleDownHeld {
 			v["scaleDownHeld"] = true // its pending replicas are about to go, not missing
 		}
+		if r.NominatedReplicas > 0 {
+			v["nominatedReplicas"] = r.NominatedReplicas // pending, but the scheduler has made room for them
+		}
 		v["dynamicRoom"] = any(r.DynamicRoom)
 		if r.DynamicUnbounded {
 			v["dynamicRoom"] = "unbounded"

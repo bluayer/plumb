@@ -241,7 +241,7 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 	if err != nil {
 		errs = append(errs, fmt.Errorf("workload: %w", err))
 	}
-	rep.DesiredReplicas, rep.ReadyReplicas, rep.PendingReplicas = wl.Replicas, wl.Ready, wl.PendingPods
+	rep.DesiredReplicas, rep.ReadyReplicas, rep.PendingReplicas, rep.NominatedReplicas = wl.Replicas, wl.Ready, wl.PendingPods, wl.Nominated
 	if wl.PendingPods > 0 {
 		held, err := m.Adapters.Workloads.ScaleDownHeld(ctx, p.WorkloadNamespace(), p.Spec.Workload.Name, wl.Replicas)
 		if err != nil {
@@ -297,8 +297,9 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 	}
 	// Saturated, or slower than the latency objective: short by at least a step.
 	short := above(rep.Saturation, sig.SaturationThreshold) || above(rep.Latency, sig.LatencySLO)
-	// Pending replicas its HPA holds only for its scale-down window are not missing.
-	pending := wl.PendingPods
+	// Pending replicas its HPA holds only for its scale-down window are not missing, nor
+	// are the ones the scheduler has made room for by preempting lower-priority pods.
+	pending := wl.PendingPods - wl.Nominated
 	if rep.ScaleDownHeld {
 		pending = 0
 	}

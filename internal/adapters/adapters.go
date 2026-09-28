@@ -103,6 +103,10 @@ type Workload struct {
 	Ready       int32
 	Bound       int32 // pods on a node, not being deleted
 	PendingPods int32
+	// Nominated are pending pods the scheduler has placed on an existing node
+	// (status.nominatedNodeName): waiting for pods it preempted there to exit, or about to
+	// be bound. They are not missing.
+	Nominated   int32
 	PodRequests corev1.ResourceList
 	PodLabels   map[string]string
 	PodSpec     *corev1.PodSpec
