@@ -25,7 +25,7 @@
 
 ---
 
-## Why Plumb
+## About
 
 Scaling inference is not scaling a web application.
 
@@ -45,6 +45,42 @@ Plumb never creates or deletes nodes or pods, and never edits the provisioner's 
 
 - a replica floor for the workload's autoscaler (a KEDA external scaler today)
 - HTTPRoute backend weights
+
+## Why Plumb
+
+These results come from a small inference workload tested on real GPUs using two EKS clusters. The main cluster (*home*) was in `us-east-1`, and the remote cluster in `us-east-2`. Both used g5.4xlarge nodes, each with one A10G, serving Qwen2.5-1.5B with vLLM. Requests arrived at home. Without Plumb, all requests stayed there; Plumb's rules path could use remote capacity and shift traffic to it.
+
+Both setups received the same seeded, time-compressed BurstGPT arrival pattern at the same time, request for request: 4,620 requests over a 2-minute warm-up, a 20-minute peak, and 30 minutes of post-peak observation. Prompts were synthetic, with approximately 128–512 input tokens and 64–256 output tokens. Home starts with one replica, and KEDA can request up to three. A request meets the SLO when it completes successfully and its first token arrives within 2 seconds. For reference, holding three replicas in each cluster from the start kept 99.98–100% of requests within the SLO.
+
+### Remote has an idle GPU
+
+Home needs more serving capacity and can request new GPU nodes. Remote has an idle GPU but no model replica running on it.
+
+| Remote has an idle GPU | Without Plumb (KEDA + Karpenter only) | With Plumb | Δ |
+|---|---:|---:|---:|
+| Requests meeting the SLO | 57.4% | **93.2%** | **+35.8 pp** |
+| TTFT p95 (whole run) | 45.2s | **4.3s** | **−90.5%** |
+| Time in SLO violation | 520s | **170s** | **−67.3%** |
+
+### Home can't add GPUs; remote keeps one replica on standby
+
+Home's GPU launch requests fail with insufficient-capacity errors (ICE). Remote starts with one replica whose model is loaded and ready to serve, receiving no traffic initially.
+
+| Home blocked by actual EC2 capacity shortages | Without Plumb (KEDA + Karpenter only) | With Plumb | Δ |
+|---|---:|---:|---:|
+| Requests meeting the SLO | 42.2% | **79.5%** | **+37.3 pp** |
+| TTFT p95 (whole run) | 47.0s | **11.3s** | **−76.1%** |
+| Time in SLO violation | 690s | **340s** | **−50.7%** |
+
+### Home can't get GPUs; remote has none
+
+Home cannot add GPU nodes, and remote starts with none. Remote must provision a GPU node and load the model before serving requests. The time to obtain usable capacity still depends on node startup time and GPU availability in the destination region. By trying other clusters as well, Plumb can improve the chance of finding available capacity.
+
+| Nothing ready in remote | Without Plumb (KEDA + Karpenter only) | With Plumb | Δ |
+|---|---:|---:|---:|
+| Requests meeting the SLO | 42.5% | **63.0%** | **+20.5 pp** |
+| TTFT p95 (whole run) | 45.4s | **39.4s** | **−13.2%** |
+| Time in SLO violation | 680s | **480s** | **−29.4%** |
 
 ## How it works
 
