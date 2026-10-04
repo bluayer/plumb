@@ -949,6 +949,26 @@ func TestFleetLaunchFailuresBorrowEarly(t *testing.T) {
 	}
 }
 
+// One launch fails for lack of capacity and nothing else is launched: the room left in
+// home's NodePool brings nothing, so the fleet steps in after earlyAfter instead of
+// waiting for failures to recur (the second S4 run on AWS waited about 4 minutes).
+func TestFleetOneLaunchFailureBorrowsEarly(t *testing.T) {
+	f := newFleet(t, 2, 4, 2, 40, 10)
+	pool := fmt.Sprintf("e2e-%d", time.Now().UnixNano()%100000)
+	k := f.h.karpenter(pool, "on-demand", 8, 2, 40*time.Second, 10*time.Second) // the next ICE comes after 40s
+	k.failing.Store(true)
+	spec := f.spec()
+	spec.Clusters[0].NodePools = []string{pool}
+	f.start(spec)
+	f.keda()
+	start := time.Now()
+	eventually(t, 30*time.Second, "an intent on remote before a second failure (40s) and `after` (60s)", func() bool { return intent(f.r) == 2 })
+	t.Logf("borrowed after %v", time.Since(start).Round(time.Second))
+	if r := f.h.get().Status.Report; r.RecentLaunchFailures != 1 || r.DynamicRoom == 0 {
+		t.Fatalf("want one failure with room left in the pool: %+v", r)
+	}
+}
+
 // Home's NodePool has exactly the room its peak needs (the S4 run on AWS). While its
 // nodes launch, they count against the pool's limit, so no room is left, and each new
 // NodeClaim starts with Launched Unknown. Neither is a reason to borrow: the replicas

@@ -161,17 +161,16 @@ func (m *Member) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesRawSource(source.Channel(m.trigger, all)).Complete(m)
 }
 
-// recentLaunchFailures counts non-configuration launch failures in the pools within
-// LaunchFailureWindow. The
-// hub reads the count only to judge how far a cluster's dynamic room can be trusted;
-// falling back between capacity types is Karpenter's job (a NodePool that allows several
-// tries the next one on its own).
-func (m *Member) recentLaunchFailures(pools []string, now time.Time) int32 {
+// launchFailures counts non-configuration launch failures in the pools observed after
+// since. The hub reads the count within LaunchFailureWindow only to judge how far a
+// cluster's dynamic room can be trusted; falling back between capacity types is
+// Karpenter's job (a NodePool that allows several tries the next one on its own).
+func (m *Member) launchFailures(pools []string, since time.Time) int32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var n int32
 	for _, e := range m.failures {
-		if now.Sub(e.ObservedAt) <= LaunchFailureWindow && e.Kind != adapters.ErrorKindConfig && (e.NodePool == "" || slices.Contains(pools, e.NodePool)) {
+		if !e.ObservedAt.Before(since) && e.Kind != adapters.ErrorKindConfig && (e.NodePool == "" || slices.Contains(pools, e.NodePool)) {
 			n++
 		}
 	}
@@ -252,7 +251,7 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 		}
 		rep.ScaleDownHeld = held
 	}
-	rep.RecentLaunchFailures = m.recentLaunchFailures(spec.NodePools, now)
+	rep.RecentLaunchFailures = m.launchFailures(spec.NodePools, now.Add(-LaunchFailureWindow))
 	if len(wl.PodRequests) > 0 {
 		reserved, err := m.reservations(ctx, client.ObjectKeyFromObject(p), now)
 		if err != nil {
@@ -265,8 +264,11 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 			errs = append(errs, fmt.Errorf("capacity: %w", err))
 		}
 		rep.StaticRoom, rep.DynamicRoom, rep.DynamicUnbounded, rep.Region = c.Static.Replicas, c.Dynamic.Replicas, c.DynamicUnbounded, c.Region
+		// Room left in its pools counts only while no launch has failed since the shortage
+		// began: after one, Karpenter is either launching again (those nodes are in
+		// Arriving) or has nothing left to try there.
 		arriving := c.Arriving
-		if rep.RecentLaunchFailures < core.RecurringLaunchFailures { // failing launches bring nothing
+		if prev := p.Status.Report; prev == nil || prev.ShortSince == nil || m.launchFailures(spec.NodePools, prev.ShortSince.Time) == 0 {
 			arriving += c.Launchable
 		}
 		rep.ArrivingReplicas = min(arriving, wl.PendingPods) // its reservation also holds a floor not acted on yet

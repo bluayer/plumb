@@ -282,8 +282,9 @@ type EscalationPolicy struct {
 	// +optional
 	After metav1.Duration `json:"after,omitempty"`
 	// EarlyAfter replaces After when waiting cannot help or is not wanted: the short
-	// cluster's own NodePools cannot add capacity (none listed, at their limits, or
-	// launches keep failing), or, with StaticFirst, another cluster has idle static room
+	// cluster's own NodePools cannot add capacity (none listed, at their limits, launches
+	// keep failing, or a launch failed and nothing is launching for its pending replicas),
+	// or, with StaticFirst, another cluster has idle static room
 	// (then only that static room is used early).
 	// +kubebuilder:default="30s"
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="a duration such as 0s, 30s, 2m or 1h30m"
@@ -399,8 +400,8 @@ type ClusterReport struct {
 	NominatedReplicas int32 `json:"nominatedReplicas,omitempty"`
 	// ArrivingReplicas are pending replicas that will get a node without the fleet: they
 	// fit on its existing nodes (waiting for the scheduler), on nodes its node pools are
-	// launching, or in the room its node pools have left, unless its launches keep
-	// failing. While they cover what it needs, the member is helping itself, like with
+	// launching, or in the room its node pools have left, unless a launch failed since the
+	// shortage began. While they cover what it needs, the member is helping itself, like with
 	// replicas loading on its nodes: the hub gives it escalation.after, not earlyAfter.
 	// +optional
 	ArrivingReplicas int32 `json:"arrivingReplicas,omitempty"`

@@ -475,6 +475,68 @@ func TestMemberLeavesOutNominatedPending(t *testing.T) {
 	}
 }
 
+// fixedCapacity is a provisioner that reports the same capacity every time.
+type fixedCapacity adapters.CapacityReport
+
+func (f fixedCapacity) Capacity(context.Context, adapters.ResourceRequest) (adapters.CapacityReport, error) {
+	return adapters.CapacityReport(f), nil
+}
+
+// Pending replicas the home cluster's pools have room for count as arriving until a launch
+// fails during the shortage; after that, only nodes actually being launched do, so the
+// hub can step in after earlyAfter rather than wait for recurring failures.
+func TestMemberArrivingAfterLaunchFailure(t *testing.T) {
+	labels := map[string]string{"app": "llm"}
+	shortSince := time.Now().Add(-time.Minute)
+	objs := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](3), Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}}}}}}}},
+		&v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: v1alpha1.AdaptivePolicySpec{
+			Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"}, Clusters: []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 10, NodePools: []string{"gpu"}}}},
+			Status: v1alpha1.AdaptivePolicyStatus{Report: &v1alpha1.ClusterReport{ShortSince: &metav1.Time{Time: shortSince}}}},
+	}
+	for i := range 3 {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: fmt.Sprint("llm-", i), Labels: labels}, Status: corev1.PodStatus{Phase: corev1.PodPending}}
+		if i == 0 {
+			pod.Spec.NodeName, pod.Status.Phase = "gpu-1", corev1.PodRunning
+		}
+		objs = append(objs, pod)
+	}
+	key := types.NamespacedName{Namespace: "ns", Name: "llm"}
+	for _, tc := range []struct {
+		name      string
+		failedAt  time.Time
+		arriving  int32
+		launching int32
+	}{
+		{"no failure", time.Time{}, 2, 0},
+		{"failure before the shortage", shortSince.Add(-time.Minute), 2, 0},
+		{"failure during the shortage", shortSince.Add(time.Second), 0, 0},
+		{"failure, then a node launching", shortSince.Add(time.Second), 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := statusClient(t, interceptor.Funcs{}, objs...)
+			m := &Member{Client: c, Name: "home", Interval: time.Minute, Adapters: adapters.Cluster{Workloads: &adapters.DeploymentObserver{Client: c},
+				Provisioner: fixedCapacity{Arriving: tc.launching, Launchable: 2 - tc.launching}}}
+			if !tc.failedAt.IsZero() {
+				m.failures = []adapters.CapacityEvent{{NodePool: "gpu", Kind: adapters.ErrorKindCapacity, ObservedAt: tc.failedAt}}
+			}
+			if _, err := m.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			got := &v1alpha1.AdaptivePolicy{}
+			if err := c.Get(context.Background(), key, got); err != nil {
+				t.Fatal(err)
+			}
+			if r := got.Status.Report; r.ArrivingReplicas != tc.arriving {
+				t.Fatalf("arriving %d, want %d (pending %d)", r.ArrivingReplicas, tc.arriving, r.PendingReplicas)
+			}
+		})
+	}
+}
+
 // A decision that changed something is written to the decision log, announced as an
 // Event (a warning when writing it failed), with one Event per ready-wait warning and one
 // when a floor is newly kept; the summary in status.fleet is cut to 1024 characters.

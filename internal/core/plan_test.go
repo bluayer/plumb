@@ -514,6 +514,15 @@ func TestEscalationWaitsForLoadingReplicas(t *testing.T) {
 	if _, ok := escalation([]Cluster{c}, 0, cfg, t0.Add(2*time.Minute)); !ok {
 		t.Error("not escalated after `after` though the launched nodes never came")
 	}
+	// A launch failed and nothing is launching: room left in its pools brings nothing.
+	c.Report.ArrivingReplicas, c.Report.DynamicRoom, c.Report.RecentLaunchFailures = 0, 3, 1
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0); !ok {
+		t.Error("not escalated after earlyAfter though its launch failed and nothing is launching")
+	}
+	c.Report.ArrivingReplicas = 2 // Karpenter launches again
+	if _, ok := escalation([]Cluster{c}, 0, cfg, t0); ok {
+		t.Error("escalated after earlyAfter while a node for its replicas is launching again")
+	}
 }
 
 // A shortage renewed before it escalates, with no floors held, does not pull traffic
