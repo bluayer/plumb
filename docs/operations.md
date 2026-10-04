@@ -22,6 +22,7 @@ Each item says what goes wrong when it is off. Check them for every workload (po
 - [ ] **Every query is scoped to the one model** (e.g. vLLM's `model_name` label). A query over all models makes one model's load look like another's.
 - [ ] **Queries return exactly one sample**, from the member's own Prometheus (`--prometheus-url`). A failing query shows in the `Ready` condition; that signal is then ignored.
 - [ ] **`latencySLO` / `errorRateSLO` are set** if traffic is managed: a cluster over them never gains traffic.
+- [ ] **`demand` and `capacity.replicaCapacity` are set.** Without them a shortage is counted from unschedulable replicas and grows a `step` at a time while saturated; the load's actual need is never computed, and traffic weights follow ready replicas alone. See [the vLLM example](configuration.md#specsignals).
 - [ ] **`pressure` is set** if traffic is managed. It is how the hub knows home can take borrowed traffic back (`status.report.safePressure`); without it, traffic returns on time alone.
 
 **Outside Plumb**
