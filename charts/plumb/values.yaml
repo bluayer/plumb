@@ -68,7 +68,7 @@ accessProviders: []
 
 agent:
   replicas: 2        # one is elected per cluster; the other takes over on failure
-  interval: 30s      # member reports
+  interval: 10s      # member reports; the hub waits for fresh ones before each traffic step
   hubInterval: 10s   # hub planning, while this member is the hub
   # Decision log. "-" writes JSONL to stdout for a log shipper.
   decisionLog: "-"

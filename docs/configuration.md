@@ -139,7 +139,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `planner.timeout` | `1m` | Per-call timeout |
 | `accessProviders` | `[]` | KEP-5339 providers used to reach other members |
 | `agent.replicas` | `2` | One is elected per cluster |
-| `agent.interval` | `30s` | Member report interval |
+| `agent.interval` | `10s` | Member report interval. The hub moves traffic a step only after both members have reported since the last one, so this also paces traffic steps. Each report runs the policy's Prometheus queries and writes the policy's status once |
 | `agent.hubInterval` | `10s` | Hub planning interval |
 | `agent.decisionLog` | `-` | JSONL decision log path; `-` is stdout |
 | `agent.extraVolumes` / `agent.extraVolumeMounts` | `[]` | E.g. for access-provider plugin binaries |
@@ -163,7 +163,7 @@ Every policy is one workload, usually one model, so each gets its own timing. Se
 | `--prometheus-url` | `""` | Prometheus for `spec.signals` |
 | `--model-provider`, `--model-mode`, `--model-url`, `--model`, `--model-timeout` | see Helm values | The experimental ranking model |
 | `--planner-provider`, `--planner-model`, `--planner-region`, `--planner-endpoint`, `--planner-response-format`, `--planner-interval`, `--planner-timeout` | see Helm values | The experimental planner |
-| `--interval` / `--hub-interval` | `30s` / `10s` | Report and planning intervals |
+| `--interval` / `--hub-interval` | `10s` / `10s` | Report and planning intervals |
 | `--decision-log` | `-` | Decision log path |
 | `--leader-elect` | `true` | Elect one agent per cluster |
 | `--metrics-bind-address` / `--health-probe-bind-address` | `:8080` / `:8081` | Endpoints |
