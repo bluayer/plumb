@@ -58,6 +58,20 @@ Each member evaluates these against its own Prometheus (`--prometheus-url`). Eac
 
 Unschedulable replicas always count, with or without signals. Signals are read, never acted on directly: Plumb turns them into floors and cluster weights only. A query returning NaN or ±Inf is an error, not a value. vLLM metric names above are from vLLM's `vllm/v1/metrics/loggers.py`.
 
+**Set `demand` with `capacity.replicaCapacity`.** Without them a member knows how many replicas it is short only from unschedulable replicas, plus one `capacity.step` at a time while saturated or over its latency SLO; how many replicas the load needs is never computed. Traffic weights then follow ready replicas alone (and pressure for relief). For vLLM, count the requests in flight and give the number one replica serves within the SLO:
+
+```yaml
+signals:
+  demand: sum(vllm:num_requests_running{model_name="llama"}) + sum(vllm:num_requests_waiting{model_name="llama"})
+  saturation: avg(vllm:num_requests_waiting{model_name="llama"})   # queued per replica
+  saturationThreshold: "0.5"
+  pressure: avg(vllm:num_requests_waiting{model_name="llama"})
+capacity:
+  replicaCapacity: "10"   # requests one replica serves at once within latencySLO; measure it per model and GPU
+```
+
+With these, a member running 1 replica with 35 requests in flight reports that it needs `ceil(35 / 10) − 1 = 3` more, rather than one `step` at a time; the hub still adds at most `capacity.step` per step.
+
 ### `spec.experimental.adaptive`
 
 Experimental; its fields may change between releases. Each policy chooses on its own: policies without this section follow the rules, and each one with it sets its own chooser and mode, so one fleet can run some workloads on the rules and others on the adaptive path. It takes effect only on agents run with `--planner-provider`, plus `--model-provider` for `chooser: jev`; otherwise the policy follows the rules.
