@@ -76,6 +76,7 @@ make e2e-down
 | `TestFleetDynamicCapacity` | The other member has only a NodePool: the floor is taken as new nodes, Karpenter launches them for the pending replicas, and traffic follows |
 | `TestFleetOwnNodePoolFirst` | A member whose NodePool can grow gets `after` to launch its own nodes and borrows nothing |
 | `TestFleetLaunchFailuresBorrowEarly` | A member whose launches keep failing borrows after `earlyAfter`, not `after` |
+| `TestFleetOneLaunchFailureBorrowsEarly` | One launch fails and nothing else is launched: the room left in the member's NodePool brings nothing, so it borrows after `earlyAfter` without waiting for failures to recur |
 | `TestFleetHomeGrowsToItsPoolLimit` | A member whose NodePool has exactly the room its peak needs borrows nothing while its nodes launch: they use up the pool's limit and start with Launched Unknown, but its replicas are arriving and no launch has failed (the S4 run on AWS) |
 
 ## Conventions

@@ -196,7 +196,7 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			room := c.pool(at) - s.launched
 			launching := s.launchAt >= 0
 			switch {
-			case s.want > c.nodes+s.launched && room > 0 && c.ice(at) < RecurringLaunchFailures && !launching:
+			case s.want > c.nodes+s.launched && room > 0 && c.ice(at) == 0 && !launching:
 				s.launchAt = at
 			case launching && at-s.launchAt >= simLaunch:
 				s.launched += min(s.want-c.nodes-s.launched, room)
@@ -216,11 +216,11 @@ func simulate(t *testing.T, sc simScenario) *simRun {
 			}
 			pending := max(s.want-c.nodes-s.launched, 0)
 			// The member's pending replicas take up its pools' room first (nodes being
-			// launched count as used, as Karpenter counts them); while launches succeed,
-			// those replicas are arriving.
+			// launched count as used, as Karpenter counts them). They are arriving while a
+			// launch is under way, or, with no launch failed, while the pools have room.
 			covered := min(pending, max(room, 0))
 			arriving := covered
-			if c.ice(at) >= RecurringLaunchFailures {
+			if c.ice(at) > 0 && s.launchAt < 0 {
 				arriving = 0
 			}
 			var pressure, latency *resource.Quantity
@@ -479,6 +479,30 @@ var simScenarios = []simScenario{
 					t.Fatalf("borrowed %s after the shortage while home's nodes were launching: %+v", s.at-shortAt, s)
 				}
 			}
+		},
+	},
+	{
+		// One launch failed in home's NodePool and nothing is launching: the room left there
+		// brings nothing. The fleet steps in after earlyAfter, without waiting for failures
+		// to recur.
+		name: "home's launch failed once", clusters: []simCluster{
+			{name: "home", weight: 100, nodes: 1, pool: constant(5), ice: constant(1), min: 1, initReplica: 1},
+			{name: "remote", nodes: 5},
+		}, demand: flat(20),
+		check: func(t *testing.T, r *simRun) {
+			shortAt := time.Duration(-1)
+			for _, s := range r.steps {
+				if s.short && shortAt < 0 {
+					shortAt = s.at
+				}
+				if strings.Contains(s.action, "add_capacity") {
+					if s.at-shortAt >= 120*time.Second {
+						t.Fatalf("borrowed only %s after the shortage, at `after`", s.at-shortAt)
+					}
+					return
+				}
+			}
+			t.Fatal("never borrowed")
 		},
 	},
 	{

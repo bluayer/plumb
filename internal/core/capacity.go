@@ -74,8 +74,9 @@ func AwaitReady(cs []Cluster, cfg Config, now time.Time) (released, warnings []s
 // escalation says whether member i's shortage is the fleet's now, and whether other
 // clusters may add nodes for it (dynamic) or only lend existing ones. The member's own
 // existing nodes and NodePools come first: its scheduler, KEDA and Karpenter use them
-// without the hub. The fleet steps in once they cannot help (no NodePool room, or
-// launches keep failing) for EarlyAfter, or after After whatever they report. With
+// without the hub. The fleet steps in once they cannot help (no NodePool room, launches
+// keep failing, or a launch failed and nothing is launching for its pending replicas)
+// for EarlyAfter, or after After whatever they report. With
 // StaticFirst, idle static room elsewhere is lent after EarlyAfter even while the member
 // could still add nodes of its own.
 func escalation(cs []Cluster, i int, cfg Config, now time.Time) (dynamic, ok bool) {
@@ -89,7 +90,11 @@ func escalation(cs []Cluster, i int, cfg Config, now time.Time) (dynamic, ok boo
 	// helping itself: it gets `after` for them. Its own pending replicas take up its
 	// pools' room, so none left there does not mean it cannot grow.
 	early := short >= cfg.EarlyAfter && r.DesiredReplicas-r.ReadyReplicas-r.PendingReplicas <= 0 && r.NeededReplicas > r.ArrivingReplicas
-	if short >= cfg.After || (dynamicRoom(cs[i]) == 0 && early) {
+	// Its pools cannot help when they have no room, or when launches failed and its pending
+	// replicas are not getting nodes (the member stops counting the pools' room as
+	// arriving once a launch fails during the shortage).
+	stalled := r.RecentLaunchFailures > 0 && r.ArrivingReplicas < r.PendingReplicas-r.NominatedReplicas
+	if short >= cfg.After || ((dynamicRoom(cs[i]) == 0 || stalled) && early) {
 		return true, true
 	}
 	if cfg.StaticFirst && early && staticRoomBesides(cs, i) > 0 {
