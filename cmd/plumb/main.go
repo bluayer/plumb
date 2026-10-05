@@ -194,7 +194,7 @@ func runAgent(ctx context.Context, args []string) error {
 	plannerResponseFormat := fs.String("planner-response-format", "", "OpenAI-compatible planner response format: text (default) or json_schema")
 	plannerInterval := fs.Duration("planner-interval", 2*time.Minute, "at most one planner call per policy per interval, only while a member is short, the fleet is not Steady, or its load is climbing")
 	plannerTimeout := fs.Duration("planner-timeout", time.Minute, "per-call planner timeout; the call runs in the background")
-	interval := fs.Duration("interval", 30*time.Second, "member report interval")
+	interval := fs.Duration("interval", 10*time.Second, "member report interval")
 	hubInterval := fs.Duration("hub-interval", 10*time.Second, "hub planning interval")
 	logPath := fs.String("decision-log", "-", "decision log JSONL path, - for stdout")
 	metricsAddr := fs.String("metrics-bind-address", ":8080", "metrics endpoint")
