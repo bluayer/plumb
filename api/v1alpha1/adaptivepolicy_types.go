@@ -389,8 +389,9 @@ type ClusterReport struct {
 	ReadyReplicas   int32  `json:"readyReplicas"`
 	PendingReplicas int32  `json:"pendingReplicas"`
 	// ScaleDownHeld: the workload's HPA holds replicas its metrics no longer ask for (its
-	// scale-down stabilization window). Its pending replicas are about to go and are not
-	// counted in NeededReplicas.
+	// scale-down stabilization window). That many of its pending replicas are about to go
+	// and are not counted in NeededReplicas; all of them when the HPA's recommendation
+	// cannot be read back from its status.
 	// +optional
 	ScaleDownHeld bool `json:"scaleDownHeld,omitempty"`
 	// NominatedReplicas are pending replicas the scheduler has already placed on a node

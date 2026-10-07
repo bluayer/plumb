@@ -939,8 +939,9 @@ spec:
                   scaleDownHeld:
                     description: |-
                       ScaleDownHeld: the workload's HPA holds replicas its metrics no longer ask for (its
-                      scale-down stabilization window). Its pending replicas are about to go and are not
-                      counted in NeededReplicas.
+                      scale-down stabilization window). That many of its pending replicas are about to go
+                      and are not counted in NeededReplicas; all of them when the HPA's recommendation
+                      cannot be read back from its status.
                     type: boolean
                   shortSince:
                     description: ShortSince is when NeededReplicas became positive.
