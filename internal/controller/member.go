@@ -244,12 +244,13 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 		errs = append(errs, fmt.Errorf("workload: %w", err))
 	}
 	rep.DesiredReplicas, rep.ReadyReplicas, rep.PendingReplicas, rep.NominatedReplicas = wl.Replicas, wl.Ready, wl.PendingPods, wl.Nominated
+	var held int32
 	if wl.PendingPods > 0 {
-		held, err := m.Adapters.Workloads.ScaleDownHeld(ctx, p.WorkloadNamespace(), p.Spec.Workload.Name, wl.Replicas)
+		held, err = m.Adapters.Workloads.ScaleDownHeld(ctx, p.WorkloadNamespace(), p.Spec.Workload.Name, wl.Replicas, wl.Bound+wl.PendingPods)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("autoscaler: %w", err))
 		}
-		rep.ScaleDownHeld = held
+		rep.ScaleDownHeld = held > 0
 	}
 	rep.RecentLaunchFailures = m.launchFailures(spec.NodePools, now.Add(-LaunchFailureWindow))
 	if len(wl.PodRequests) > 0 {
@@ -308,11 +309,9 @@ func (m *Member) observe(ctx context.Context, p *v1alpha1.AdaptivePolicy, spec *
 	// Saturated, or slower than the latency objective: short by at least a step.
 	short := above(rep.Saturation, sig.SaturationThreshold) || above(rep.Latency, sig.LatencySLO)
 	// Pending replicas its HPA holds only for its scale-down window are not missing, nor
-	// are the ones the scheduler has made room for by preempting lower-priority pods.
-	pending := wl.PendingPods - wl.Nominated
-	if rep.ScaleDownHeld {
-		pending = 0
-	}
+	// are the ones the scheduler has made room for by preempting lower-priority pods. The
+	// rest of the pending ones are: its metrics still ask for them.
+	pending := max(wl.PendingPods-wl.Nominated-held, 0)
 	rep.NeededReplicas = core.Needed(wl.Replicas, pending, demand, short, cmp.Or(p.Spec.Capacity.Step, 2))
 	return rep, errs
 }

@@ -440,6 +440,67 @@ func TestMemberLeavesOutHeldPending(t *testing.T) {
 	}
 }
 
+// The HPA holds 3 replicas for its scale-down window, 1 ready and 2 pending, and its
+// metric (an average of 8 per replica) asks for fewer. Only the replicas it holds beyond
+// what its metric asks for are left out: asking for 1, no pending one is missing; asking
+// for 2, one is.
+func TestMemberCountsPendingTheHPAStillAsksFor(t *testing.T) {
+	labels := map[string]string{"app": "llm"}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: appsv1.DeploymentSpec{
+		Replicas: ptr.To[int32](3), Selector: &metav1.LabelSelector{MatchLabels: labels},
+		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}}}}
+	objs := []client.Object{dep, &v1alpha1.AdaptivePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "llm"}, Spec: v1alpha1.AdaptivePolicySpec{
+		Mode: v1alpha1.ModeAuto, Workload: v1alpha1.WorkloadRef{Name: "llm"}, Clusters: []v1alpha1.ClusterSpec{{Name: "home", MaxReplicas: 10}}}}}
+	for i := range 3 {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: fmt.Sprint("llm-", i), Labels: labels},
+			Status: corev1.PodStatus{Phase: corev1.PodPending}}
+		if i == 0 {
+			pod.Spec.NodeName, pod.Status.Phase = "n", corev1.PodRunning
+		}
+		objs = append(objs, pod)
+	}
+	metric := autoscalingv2.MetricIdentifier{Name: "s0-prometheus"}
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "keda-hpa-llm"},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MaxReplicas: 10,
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "llm"},
+			Metrics: []autoscalingv2.MetricSpec{{Type: autoscalingv2.ExternalMetricSourceType, External: &autoscalingv2.ExternalMetricSource{
+				Metric: metric, Target: autoscalingv2.MetricTarget{Type: autoscalingv2.AverageValueMetricType, AverageValue: ptr.To(resource.MustParse("8"))}}}}},
+		Status: autoscalingv2.HorizontalPodAutoscalerStatus{DesiredReplicas: 3, CurrentReplicas: 3, Conditions: []autoscalingv2.HorizontalPodAutoscalerCondition{
+			{Type: autoscalingv2.ScalingActive, Status: corev1.ConditionTrue, Reason: "ValidMetricFound"},
+			{Type: autoscalingv2.AbleToScale, Status: corev1.ConditionTrue, Reason: adapters.ScaleDownStabilized}}}}
+	c := statusClient(t, interceptor.Funcs{}, append(objs, hpa)...)
+	m := &Member{Client: c, Name: "home", Adapters: adapters.Cluster{Workloads: &adapters.DeploymentObserver{Client: c}}, Interval: time.Minute}
+	key := types.NamespacedName{Namespace: "ns", Name: "llm"}
+	report := func(average string) *v1alpha1.ClusterReport {
+		t.Helper()
+		hpa.Status.CurrentMetrics = []autoscalingv2.MetricStatus{{Type: autoscalingv2.ExternalMetricSourceType, External: &autoscalingv2.ExternalMetricStatus{
+			Metric: metric, Current: autoscalingv2.MetricValueStatus{AverageValue: ptr.To(resource.MustParse(average))}}}}
+		if err := c.Update(context.Background(), hpa); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		got := &v1alpha1.AdaptivePolicy{}
+		if err := c.Get(context.Background(), key, got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Status.Report
+	}
+	// 5 over 3 pods, rounded up as the HPA writes it: it asks for 1.
+	if r := report("1667m"); !r.ScaleDownHeld || r.PendingReplicas != 2 || r.NeededReplicas != 0 || r.ShortSince != nil || r.Error != "" {
+		t.Fatalf("pending replicas the HPA no longer asks for read as missing: %+v", r)
+	}
+	// 15 over 3 pods: it asks for 2, one more than is ready.
+	if r := report("5"); !r.ScaleDownHeld || r.NeededReplicas != 1 || r.ShortSince == nil || r.Error != "" {
+		t.Fatalf("a pending replica the HPA still asks for is not a shortage: %+v", r)
+	}
+	// 16 over 3 pods: exactly 2, not 3.
+	if r := report("5334m"); r.NeededReplicas != 1 {
+		t.Fatalf("a total the target divides read as one replica more: %+v", r)
+	}
+}
+
 // Replicas the scheduler has made room for by preempting lower-priority pods are reported
 // as nominated and not counted as needed; the rest of the pending ones are.
 func TestMemberLeavesOutNominatedPending(t *testing.T) {
