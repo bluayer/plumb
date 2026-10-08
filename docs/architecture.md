@@ -100,7 +100,7 @@ A shortage is first its own cluster's to solve; the fleet is the fallback. `spec
 - **With `StaticFirst`**, other members' idle existing nodes are lent after `earlyAfter` even while the member could still add nodes. Before `after`, only static room is used; other members' NodePools wait until the member's own can't help.
 - **Given back in reverse:** other members' dynamic floors first, then static ones.
 
-**Regions.** Clusters in one region compete for the same cloud capacity. While any member keeps failing to launch nodes, the other members in its region go last for new nodes: other regions' dynamic room is used first. Their existing nodes are not affected. A cluster's region is `spec.clusters[].region`, else the `topology.kubernetes.io/region` label its member finds on its nodes; clusters without one are never grouped.
+**Regions.** Clusters in one region compete for the same cloud capacity. While any member keeps failing to launch nodes, or once a launch failed for a member the fleet is stepping in for, the other members in its region go last for new nodes: other regions' dynamic room is used first. Their existing nodes are not affected. A cluster's region is `spec.clusters[].region`, else the `topology.kubernetes.io/region` label its member finds on its nodes; clusters without one are never grouped.
 
 **Only what you register counts.** In each member, the listed `nodePools` (their nodes and limits) and the nodes no NodePool manages that match `nodeSelector`. Other NodePools and nodes count for nothing, though other policies' replicas on them are still placed first when working out contention. Plumb does not change where pods go: the pod template should keep the workload on the registered nodes.
 

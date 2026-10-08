@@ -166,7 +166,7 @@ func addCapacity(res *Result, in Input, cs []Cluster, short map[int]bool) (strin
 	// Static before dynamic is a rule, whatever the ranking: the ranking only orders
 	// clusters within a tier. So is the region rule: new nodes come from regions without
 	// recurring launch failures first.
-	failing := failingRegions(cs)
+	failing := failingRegions(cs, short)
 	for _, tier := range []int32{TierStatic, TierDynamic} {
 		static := tier == TierStatic
 		tierOrder := order
@@ -253,11 +253,17 @@ func RegionOf(c Cluster) string {
 }
 
 // failingRegions are the regions where a member, short or not, keeps failing to launch
-// nodes: the others there compete for the same cloud capacity.
-func failingRegions(cs []Cluster) map[string]bool {
+// nodes, or where a member the fleet steps in for failed to launch even once: the others
+// there compete for the same cloud capacity, and a shortage that met it already is no time
+// to try that capacity first.
+func failingRegions(cs []Cluster, short map[int]bool) map[string]bool {
 	out := map[string]bool{}
-	for _, c := range cs {
-		if r := RegionOf(c); r != "" && c.Report != nil && c.Report.RecentLaunchFailures >= RecurringLaunchFailures {
+	for i, c := range cs {
+		if c.Report == nil {
+			continue
+		}
+		_, s := short[i]
+		if r := RegionOf(c); r != "" && (c.Report.RecentLaunchFailures >= RecurringLaunchFailures || (s && c.Report.RecentLaunchFailures > 0)) {
 			out[r] = true
 		}
 	}

@@ -92,8 +92,8 @@ type ClusterSpec struct {
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 	// Region is where this cluster gets new nodes from: clusters in one region compete for
-	// the same cloud capacity, so when one keeps failing to launch nodes, the others there
-	// go last for new nodes. Default: the cluster's topology.kubernetes.io/region node
+	// the same cloud capacity, so when one keeps failing to launch nodes, or a short one
+	// failed once, the others there go last for new nodes. Default: the cluster's topology.kubernetes.io/region node
 	// label, as its member reports it.
 	// +kubebuilder:validation:MaxLength=63
 	// +optional
