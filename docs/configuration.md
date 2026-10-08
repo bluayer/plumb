@@ -32,7 +32,7 @@ Validation rules:
 | `name` | required | The member's ClusterProfile name and its agent's `--cluster-name` |
 | `nodePools` | `[]` | The node pools of the cluster's node autoscaler that Plumb may use here (today Karpenter NodePools): their existing nodes are static capacity, their limits dynamic capacity. Other pools in the cluster are ignored. Without any, the cluster cannot add nodes as far as Plumb is concerned |
 | `nodeSelector` | — | Registers nodes no NodePool manages (e.g. a reserved node group) as static capacity, and narrows the NodePools' nodes to those that match. Without it, only the listed NodePools' nodes count |
-| `region` | the nodes' `topology.kubernetes.io/region` | Where the cluster gets new nodes from. Clusters in one region compete for the same cloud capacity: while a member keeps failing to launch nodes, the others in its region go last for new nodes (see [placement](architecture.md#placement)). Set it where nodes lack the label, e.g. to a datacenter name |
+| `region` | the nodes' `topology.kubernetes.io/region` | Where the cluster gets new nodes from. Clusters in one region compete for the same cloud capacity: while a member keeps failing to launch nodes, or once a short member's launch failed, the others in its region go last for new nodes (see [placement](architecture.md#placement)). Set it where nodes lack the label, e.g. to a datacenter name |
 | `maxReplicas` | required | Ceiling for the floor the hub may set here |
 | `costRank` | `0` | Tie-breaker; lower is preferred |
 | `replicaCapacity` | `spec.capacity.replicaCapacity` | Demand one replica serves here, for clusters with faster or slower GPUs |

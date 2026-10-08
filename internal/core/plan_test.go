@@ -425,8 +425,9 @@ func TestPlanAwaitsReady(t *testing.T) {
 	}
 }
 
-// Clusters in a region where a member keeps failing to launch nodes compete for the same
-// cloud capacity: they go last for new nodes, not out. Existing nodes are not affected.
+// Clusters in a region where a member keeps failing to launch nodes, or where the short
+// member failed to launch once, compete for the same cloud capacity: they go last for new
+// nodes, not out. Existing nodes are not affected.
 // spec.clusters[].region overrides what the member reports.
 func TestPlanRegionWithLaunchFailures(t *testing.T) {
 	cs := func() []Cluster {
@@ -447,6 +448,22 @@ func TestPlanRegionWithLaunchFailures(t *testing.T) {
 	healthy[0].Report.DynamicRoom = 0 // still escalates early: it cannot add nodes itself
 	if f := floors(Plan(Input{Now: t0, Config: cfg, Clusters: healthy})); f["b"] != 6 || f["c"] != 4 {
 		t.Fatalf("no failures, rules order: %v", f)
+	}
+
+	// One failure is enough when it is the short member's own: its shortage already met the
+	// region's limit. Elsewhere it is not: Karpenter may have tried another type there.
+	once := cs()
+	once[0].Report.RecentLaunchFailures, once[0].Report.DynamicRoom = 1, 0
+	if f := floors(Plan(Input{Now: t0, Config: cfg, Clusters: once})); f["c"] != 6 || f["b"] != 4 {
+		t.Fatalf("short member's own launch failed once, region not last: %v", f)
+	}
+	bystander := cs()
+	bystander[0].Report.RecentLaunchFailures, bystander[0].Report.DynamicRoom = 0, 0
+	d := member("d", 2, 0, 0, 0) // no room, so not a candidate itself
+	d.Report.Region, d.Report.RecentLaunchFailures = "r1", 1
+	bystander = append(bystander, d)
+	if f := floors(Plan(Input{Now: t0, Config: cfg, Clusters: bystander})); f["b"] != 6 || f["c"] != 4 {
+		t.Fatalf("one failure on a cluster not short moved its region last: %v", f)
 	}
 
 	moved := cs()
